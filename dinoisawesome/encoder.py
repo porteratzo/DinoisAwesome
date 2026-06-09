@@ -1,3 +1,6 @@
+"""DINO ViT encoder wrapper: loads a pretrained backbone from torch hub and
+exposes CLS and patch-level intermediate-layer features."""
+
 from __future__ import annotations
 
 import contextlib
@@ -50,6 +53,18 @@ class ExtractorOutput:
 
 
 def _resolve_device(device: str | torch.device | None) -> torch.device:
+    """Resolve a device specifier to a concrete ``torch.device``.
+
+    If *device* is ``None``, auto-selects the first available accelerator in
+    priority order: CUDA → Intel XPU → CPU.
+
+    Args:
+        device: A device string (``"cuda"``, ``"cuda:1"``, ``"cpu"``), an
+                existing ``torch.device``, or ``None`` for auto-detection.
+
+    Returns:
+        A ``torch.device`` instance.
+    """
     if device is not None:
         return torch.device(device)
     if torch.cuda.is_available():
@@ -118,7 +133,8 @@ class DinoEncoder(nn.Module):
             transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
         ])
 
-    def _autocast_ctx(self):
+    def _autocast_ctx(self) -> contextlib.AbstractContextManager:
+        """Return a bfloat16 autocast context manager when AMP is enabled, or a no-op."""
         if self.amp:
             return torch.autocast(device_type=self.device.type, dtype=torch.bfloat16)
         return contextlib.nullcontext()
@@ -126,7 +142,21 @@ class DinoEncoder(nn.Module):
     def _to_tensor_batch(
         self, images: torch.Tensor | Image.Image | np.ndarray | list
     ) -> torch.Tensor:
-        """Normalise varied image inputs to a (B, 3, H, W) float tensor on device."""
+        """Normalise varied image inputs to a ``(B, 3, H, W)`` float tensor on device.
+
+        Accepts a pre-processed float tensor, a single PIL/numpy image, or a list
+        of PIL/numpy images.  When ``amp=False`` and a ``model_dtype`` is set, the
+        tensor is cast to that dtype before returning.
+
+        Args:
+            images: One of:
+                - ``torch.Tensor`` of shape ``(B, 3, H, W)`` — used as-is (moved to device).
+                - ``PIL.Image.Image`` or ``np.ndarray`` (H, W, 3) uint8 — preprocessed.
+                - ``list`` of the above single-image types.
+
+        Returns:
+            Float tensor of shape ``(B, 3, H, W)`` on ``self.device``.
+        """
         if isinstance(images, torch.Tensor):
             x = images.to(device=self.device)
         else:

@@ -1,3 +1,6 @@
+"""Feature gallery: build, persist, and query DINO patch/CLS embeddings backed
+by pandas DataFrames (metadata) and memory-mapped numpy arrays (vectors)."""
+
 from __future__ import annotations
 
 import json
@@ -28,17 +31,53 @@ class GalleryConfig:
     schema_version: str = "1.0"
 
     def layer_idx(self, block_idx: int) -> int:
+        """Return the 0-based position of *block_idx* in the stored layer axis.
+
+        Args:
+            block_idx: Transformer block number (as stored in ``block_indices``).
+
+        Returns:
+            Index into the L-axis of the stored numpy arrays.
+
+        Raises:
+            ValueError: If *block_idx* is not in ``block_indices``.
+        """
         return self.block_indices.index(block_idx)
 
     def save(self, path: Path) -> None:
+        """Serialise the config to a JSON file at *path*.
+
+        Args:
+            path: Destination file path.  Parent directory must already exist.
+        """
         path.write_text(json.dumps(asdict(self), indent=2))
 
     @classmethod
     def load(cls, path: Path) -> GalleryConfig:
+        """Deserialise a :class:`GalleryConfig` from a JSON file.
+
+        Args:
+            path: Path to a JSON file previously written by :meth:`save`.
+
+        Returns:
+            A fully populated :class:`GalleryConfig` instance.
+        """
         return cls(**json.loads(path.read_text()))
 
     @classmethod
     def from_encoder(cls, encoder: DinoEncoder) -> GalleryConfig:
+        """Create a :class:`GalleryConfig` from a live :class:`DinoEncoder`.
+
+        Derives all fields (model name, patch size, embed dim, block indices,
+        etc.) directly from the encoder so the config always matches the
+        embeddings it describes.
+
+        Args:
+            encoder: The encoder whose settings should be recorded.
+
+        Returns:
+            A new :class:`GalleryConfig` with a UTC ``created_at`` timestamp.
+        """
         layers = encoder.layers
         if isinstance(layers, int):
             n = len(encoder.backbone.blocks)
@@ -99,6 +138,19 @@ class Gallery:
     _EMB_DIR      = "embeddings"
 
     def __init__(self, root: Path | str) -> None:
+        """Load an existing gallery from *root*.
+
+        Reads the config JSON, both parquet index files, and opens the CLS
+        embedding array as a memory-mapped numpy file (no full copy into RAM).
+
+        Args:
+            root: Directory that contains ``gallery_config.json``,
+                  ``patches.parquet``, ``cls_tokens.parquet``,
+                  ``cls_tokens.npy``, and the ``embeddings/`` sub-directory.
+
+        Raises:
+            FileNotFoundError: If any required file is missing from *root*.
+        """
         self.root       = Path(root)
         self.config     = GalleryConfig.load(self.root / self._CONFIG_FILE)
         self.patches    = pd.read_parquet(self.root / self._PATCHES_FILE)
@@ -202,7 +254,19 @@ class Gallery:
         image_ids: list[str] | None = None,
         split: str | None = None,
     ) -> pd.DataFrame:
-        """Return a filtered view of patches, preserving original index."""
+        """Return a filtered view of the patches DataFrame, preserving the original index.
+
+        All supplied filters are applied with logical AND.
+
+        Args:
+            has_labels: Keep only patches that have *all* of these labels.
+            any_labels: Keep only patches that have *at least one* of these labels.
+            image_ids:  Restrict to patches belonging to these image IDs.
+            split:      Restrict to patches whose ``split`` column equals this value.
+
+        Returns:
+            A (possibly empty) sub-DataFrame of ``self.patches``.
+        """
         df = self.patches
         if has_labels:
             for lbl in has_labels:
@@ -216,10 +280,19 @@ class Gallery:
         return df
 
     def load_embeddings(self, df: pd.DataFrame, block_idx: int | None = None) -> np.ndarray:
-        """Load patch embeddings for rows in df as float32 (N, D).
+        """Load patch embeddings for the rows in *df* as a float32 array of shape ``(N, D)``.
 
-        Opens each image's npy file once via mmap and does a vectorised spatial
-        lookup — no full-file reads for sparse patch subsets.
+        Opens each image's ``.npy`` file once via mmap and performs a vectorised
+        spatial lookup — only the requested patches are copied into memory.
+
+        Args:
+            df:        Sub-DataFrame of ``self.patches`` whose rows should be loaded.
+                       Must contain ``image_id``, ``row``, and ``col`` columns.
+            block_idx: Transformer block to extract (must be in ``config.block_indices``).
+                       Defaults to the last stored block.
+
+        Returns:
+            float32 array of shape ``(N, D)`` where N is ``len(df)``.
         """
         if block_idx is None:
             block_idx = self.config.block_indices[-1]
@@ -239,7 +312,19 @@ class Gallery:
     def load_cls_embeddings(
         self, image_ids: list[str] | None = None, block_idx: int | None = None
     ) -> tuple[list[str], np.ndarray]:
-        """Return (ids, float32 (N, D)) CLS embeddings from the single npy array."""
+        """Return CLS embeddings for a subset of images as ``(ids, embs)``.
+
+        Reads directly from the memory-mapped ``cls_tokens.npy`` array without
+        opening per-image files.
+
+        Args:
+            image_ids: Restrict to these image IDs.  ``None`` returns all images.
+            block_idx: Transformer block to extract.  Defaults to the last stored block.
+
+        Returns:
+            A tuple ``(ids, embs)`` where *ids* is a list of image ID strings and
+            *embs* is a float32 array of shape ``(N, D)``.
+        """
         df = self.cls_tokens
         if image_ids is not None:
             df = df[df["image_id"].isin(image_ids)]
@@ -253,9 +338,21 @@ class Gallery:
         image_ids: list[str] | None = None,
         split: str | None = None,
     ) -> pd.DataFrame:
-        """Top-k images by CLS cosine similarity. No patch files are opened.
+        """Return the top-*k* images ranked by CLS cosine similarity.
 
-        Returns a sub-DataFrame of cls_tokens with a "similarity" column added.
+        No per-image ``.npy`` files are opened; only the single CLS array is used.
+
+        Args:
+            query:     1-D float32 query vector of length D.
+            k:         Maximum number of results to return.
+            block_idx: Transformer block to use for CLS embeddings.
+                       Defaults to the last stored block.
+            image_ids: Pre-filter to this set of image IDs before ranking.
+            split:     Pre-filter to this split value before ranking.
+
+        Returns:
+            Sub-DataFrame of ``self.cls_tokens`` (up to *k* rows) with an extra
+            ``"similarity"`` column, sorted descending by similarity.
         """
         df = self.cls_tokens
         if split is not None:
@@ -280,9 +377,25 @@ class Gallery:
         image_ids: list[str] | None = None,
         split: str | None = None,
     ) -> pd.DataFrame:
-        """Top-k patches by cosine similarity, with optional pre-filtering.
+        """Return the top-*k* patches ranked by cosine similarity, with optional pre-filtering.
 
-        Returns a sub-DataFrame of patches with a "similarity" column added.
+        Applies :meth:`filter` first, then loads embeddings only for the surviving
+        patches before ranking — useful for restricting search to labelled subsets
+        or a specific split.
+
+        Args:
+            query:      1-D float32 query vector of length D.
+            k:          Maximum number of results to return.
+            block_idx:  Transformer block to use for patch embeddings.
+                        Defaults to the last stored block.
+            has_labels: Pre-filter — keep only patches with *all* of these labels.
+            any_labels: Pre-filter — keep only patches with *any* of these labels.
+            image_ids:  Pre-filter — restrict to patches from these image IDs.
+            split:      Pre-filter — restrict to this split value.
+
+        Returns:
+            Sub-DataFrame of ``self.patches`` (up to *k* rows) with an extra
+            ``"similarity"`` column, sorted descending by similarity.
         """
         df = self.filter(has_labels=has_labels, any_labels=any_labels,
                          image_ids=image_ids, split=split)
@@ -295,7 +408,17 @@ class Gallery:
         return result.reset_index(drop=True)
 
     def add_labels(self, subset: pd.DataFrame, labels: list[str], save: bool = True) -> None:
-        """Add labels to patches in subset (index must align with self.patches).
+        """Add *labels* to every patch in *subset*, merging with existing labels.
+
+        The index of *subset* must align with ``self.patches`` (i.e. *subset*
+        should be a filtered view of ``self.patches``, not a copy with a reset index).
+
+        Args:
+            subset: Rows of ``self.patches`` to label.
+            labels: Labels to add; duplicates are silently ignored.
+            save:   If ``True``, flush the updated parquet file to disk immediately.
+                    Pass ``False`` when batching many labelling operations and call
+                    :meth:`_save_metadata` once when done.
 
         Example::
 
@@ -309,7 +432,16 @@ class Gallery:
             self._save_metadata()
 
     def remove_labels(self, subset: pd.DataFrame, labels: list[str], save: bool = True) -> None:
-        """Remove labels from patches in subset."""
+        """Remove *labels* from every patch in *subset*.
+
+        Labels not present on a patch are silently ignored.  The index of *subset*
+        must align with ``self.patches``.
+
+        Args:
+            subset: Rows of ``self.patches`` to update.
+            labels: Labels to remove.
+            save:   If ``True``, flush the updated parquet file to disk immediately.
+        """
         remove = set(labels)
         for idx in subset.index:
             self.patches.at[idx, "labels"] = [
@@ -381,7 +513,17 @@ class Gallery:
         label_map: dict[int, list[str]],
         reduce: Literal["center", "majority"] = "center",
     ) -> None:
-        """Apply label_from_mask across many images, writing parquet once."""
+        """Apply :meth:`label_from_mask` across many images, writing parquet once.
+
+        Equivalent to calling :meth:`label_from_mask` with ``save=False`` for each
+        image and then flushing once — more efficient than one write per image.
+
+        Args:
+            masks:     ``{image_id: mask}`` mapping.  Each mask follows the same
+                       shape rules as in :meth:`label_from_mask`.
+            label_map: Passed through to each :meth:`label_from_mask` call.
+            reduce:    Patch-reduction strategy; see :meth:`label_from_mask`.
+        """
         for image_id, mask in masks.items():
             self.label_from_mask(image_id, mask, label_map, reduce=reduce, save=False)
         self._save_metadata()
@@ -389,12 +531,23 @@ class Gallery:
     # private helpers
 
     def _get_cls_embs(self, df: pd.DataFrame, block_idx: int | None) -> np.ndarray:
+        """Slice CLS embeddings for the rows in *df* from the in-memory array.
+
+        Args:
+            df:        Sub-DataFrame of ``self.cls_tokens``; its integer index is
+                       used to index into ``self._cls_array``.
+            block_idx: Transformer block to extract.  Defaults to the last stored block.
+
+        Returns:
+            float32 array of shape ``(N, D)``.
+        """
         if block_idx is None:
             block_idx = self.config.block_indices[-1]
         layer = np.asarray(self._cls_array[:, self.config.layer_idx(block_idx), :])
         return layer[df.index.to_numpy()]
 
     def _save_metadata(self) -> None:
+        """Flush ``self.patches`` and ``self.cls_tokens`` to their parquet files on disk."""
         self.patches.to_parquet(self.root / self._PATCHES_FILE, index=False)
         self.cls_tokens.to_parquet(self.root / self._CLS_META, index=False)
 
@@ -402,7 +555,21 @@ class Gallery:
 def _cosine_topk(
     embs: np.ndarray, query: np.ndarray, k: int
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return (sorted_positions, similarities) for the top-k rows in embs."""
+    """Compute cosine similarity between *query* and every row of *embs*, return the top *k*.
+
+    Uses ``argpartition`` for an O(N) partial sort followed by a sort of the
+    top-*k* slice, so it is efficient even for large galleries.
+
+    Args:
+        embs:  float32 array of shape ``(N, D)`` — the gallery embeddings.
+        query: 1-D float array of length D — the query vector.
+        k:     Number of results to return (clamped to ``len(embs)``).
+
+    Returns:
+        A tuple ``(positions, similarities)`` where *positions* is an int64 array
+        of row indices into *embs* and *similarities* is a float32 array of the
+        corresponding cosine similarity scores, both sorted descending.
+    """
     q    = query.ravel().astype(np.float32)
     sims = (embs @ q) / (np.linalg.norm(embs, axis=1) * np.linalg.norm(q) + 1e-8)
     k    = min(k, len(embs))
@@ -414,7 +581,22 @@ def _cosine_topk(
 def _reduce_mask_to_grid(
     mask: np.ndarray, grid_h: int, grid_w: int, patch_size: int, reduce: str
 ) -> np.ndarray:
-    """Reduce a pixel-space mask to (grid_h, grid_w) patch resolution."""
+    """Reduce a pixel-space mask to ``(grid_h, grid_w)`` patch resolution.
+
+    Args:
+        mask:       Integer array of shape ``(image_size, image_size)``.
+        grid_h:     Number of patch rows (``image_size // patch_size``).
+        grid_w:     Number of patch columns (``image_size // patch_size``).
+        patch_size: Pixel width/height of each patch.
+        reduce:     ``"center"`` — sample each patch's centre pixel (fast);
+                    ``"majority"`` — take the mode of all pixels in the patch region.
+
+    Returns:
+        Integer array of shape ``(grid_h, grid_w)``.
+
+    Raises:
+        ValueError: If *reduce* is not ``"center"`` or ``"majority"``.
+    """
     if reduce == "center":
         ys = np.arange(grid_h) * patch_size + patch_size // 2
         xs = np.arange(grid_w) * patch_size + patch_size // 2
