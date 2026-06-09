@@ -4,7 +4,7 @@ import json
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -482,6 +482,156 @@ class Gallery:
         if save:
             self._save_metadata()
 
+    # ------------------------------------------------------------------
+    # Mask-based labeling
+    # ------------------------------------------------------------------
+
+    def label_from_mask(
+        self,
+        image_id: str,
+        mask: np.ndarray,
+        label_map: dict[int, list[str]],
+        reduce: Literal["center", "majority"] = "center",
+        save: bool = True,
+    ) -> None:
+        """Label patches of one image using a spatial mask.
+
+        Args:
+            image_id:   Must exist in the gallery.
+            mask:       Integer or bool array.  Two shapes are accepted:
+                        - ``(image_size, image_size)`` pixel-space mask, reduced to
+                          patch-grid resolution via ``reduce``.
+                        - ``(grid_h, grid_w)`` already at patch resolution, used as-is.
+            label_map:  Maps each mask value to the list of labels to add to the
+                        matching patches.  Values absent from the map are ignored.
+                        Example — semantic segmentation::
+
+                            {0: ["background"],
+                             1: ["class_cat", "foreground"],
+                             2: ["class_dog", "foreground"]}
+
+                        Example — binary foreground mask::
+
+                            {1: ["foreground"]}
+
+            reduce:     Strategy for collapsing a pixel-space mask to patch resolution.
+                        ``"center"``   — value at each patch's centre pixel (fast).
+                        ``"majority"`` — most common value in the patch's pixel region.
+            save:       Write updated patches.parquet to disk when done.
+                        Pass ``save=False`` when labeling many images in a loop;
+                        call ``gallery._save_metadata()`` once afterwards, or use
+                        :meth:`label_from_masks` which handles this automatically.
+        """
+        ps     = self.config.patch_size
+        grid_h = self.config.image_size // ps
+        grid_w = self.config.image_size // ps
+
+        mask = np.asarray(mask)
+        if mask.dtype == bool:
+            mask = mask.view(np.uint8)
+
+        H, W = mask.shape[:2]
+        if (H, W) == (grid_h, grid_w):
+            patch_mask = mask
+        elif (H, W) == (self.config.image_size, self.config.image_size):
+            patch_mask = _reduce_mask_to_grid(mask, grid_h, grid_w, ps, reduce)
+        else:
+            raise ValueError(
+                f"mask shape {mask.shape} must be either "
+                f"({self.config.image_size}, {self.config.image_size}) [pixel-space] "
+                f"or ({grid_h}, {grid_w}) [patch-grid]"
+            )
+
+        img_patches = self.patches[self.patches["image_id"] == image_id]
+        if img_patches.empty:
+            raise ValueError(f"image_id {image_id!r} not found in gallery")
+
+        # Vectorised: look up the mask value for every patch in this image at once
+        rows = img_patches["row"].values.astype(int)
+        cols = img_patches["col"].values.astype(int)
+        patch_values = patch_mask[rows, cols]  # (N_patches,)
+
+        for mask_val, labels in label_map.items():
+            hit_positions = np.where(patch_values == mask_val)[0]
+            if hit_positions.size == 0:
+                continue
+            self.add_labels(img_patches.iloc[hit_positions], labels, save=False)
+
+        if save:
+            self._save_metadata()
+
+    def label_from_masks(
+        self,
+        masks: dict[str, np.ndarray],
+        label_map: dict[int, list[str]],
+        reduce: Literal["center", "majority"] = "center",
+    ) -> None:
+        """Label patches across many images at once, saving parquet once at the end.
+
+        Args:
+            masks:      ``{image_id: mask}`` — each mask follows the same shape
+                        and value conventions as :meth:`label_from_mask`.
+            label_map:  Shared value→labels mapping applied to every image.
+            reduce:     Reduction strategy for pixel-space masks.
+
+        Example::
+
+            gallery.label_from_masks(
+                masks={"img_001": seg_mask_001, "img_002": seg_mask_002},
+                label_map={0: ["background"], 1: ["class_cat"], 2: ["class_dog"]},
+            )
+        """
+        for image_id, mask in masks.items():
+            self.label_from_mask(image_id, mask, label_map, reduce=reduce, save=False)
+        self._save_metadata()
+
     def _save_metadata(self) -> None:
         self.patches.to_parquet(self.root / self._PATCHES_FILE, index=False)
         self.cls_tokens.to_parquet(self.root / self._CLS_META, index=False)
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+def _reduce_mask_to_grid(
+    mask: np.ndarray,
+    grid_h: int,
+    grid_w: int,
+    patch_size: int,
+    reduce: str,
+) -> np.ndarray:
+    """Reduce a pixel-space mask (image_size, image_size) to (grid_h, grid_w).
+
+    Args:
+        mask:       Integer or uint8 array of shape (image_size, image_size).
+        grid_h/w:   Target patch-grid dimensions.
+        patch_size: Pixels per patch side.
+        reduce:     ``"center"`` — sample the centre pixel of each patch region.
+                    ``"majority"`` — most common value in each patch region.
+
+    Returns:
+        Integer ndarray of shape (grid_h, grid_w).
+    """
+    if reduce == "center":
+        # One vectorised gather: sample the centre pixel of every patch
+        ys = np.arange(grid_h) * patch_size + patch_size // 2
+        xs = np.arange(grid_w) * patch_size + patch_size // 2
+        return mask[np.ix_(ys, xs)]
+
+    elif reduce == "majority":
+        # Reshape into patch blocks then find the mode of each block
+        # Crop to the exact grid footprint first (handles any rounding)
+        cropped = mask[: grid_h * patch_size, : grid_w * patch_size]
+        # (grid_h, patch_size, grid_w, patch_size) → per-patch pixel arrays
+        blocks = cropped.reshape(grid_h, patch_size, grid_w, patch_size)
+        out = np.empty((grid_h, grid_w), dtype=mask.dtype)
+        for r in range(grid_h):
+            for c in range(grid_w):
+                region = blocks[r, :, c, :].ravel()
+                # bincount is faster than np.unique for non-negative integers
+                out[r, c] = np.bincount(region.astype(np.intp)).argmax()
+        return out
+
+    else:
+        raise ValueError(f"reduce must be 'center' or 'majority', got {reduce!r}")
