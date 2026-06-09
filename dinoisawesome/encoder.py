@@ -1,6 +1,6 @@
 import contextlib
 from dataclasses import dataclass
-from typing import Literal, Optional, Union
+from typing import Literal, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -11,25 +11,26 @@ from torchvision import transforms
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
 
-# Patch size is 14 for all DINO ViT variants
-_PATCH_SIZE = 14
+# DINOv2 uses 14×14 patches; DINOv3 uses 16×16 patches
+_PATCH_SIZES: dict[str, int] = {
+    "v2": 14,
+    "v3": 16,
+}
 
-# Hub repos — add v3 entry once it lands on torch hub
 _HUB_REPOS: dict[str, str] = {
     "v2": "facebookresearch/dinov2",
     "v3": "facebookresearch/dinov3",
 }
 
-# torch hub model names per (version, size)
 _MODEL_NAMES: dict[tuple[str, str], str] = {
     ("v2", "small"): "dinov2_vits14",
     ("v2", "base"):  "dinov2_vitb14",
     ("v2", "large"): "dinov2_vitl14",
     ("v2", "giant"): "dinov2_vitg14",
-    ("v3", "small"): "dinov3_vits14",
-    ("v3", "base"):  "dinov3_vitb14",
-    ("v3", "large"): "dinov3_vitl14",
-    ("v3", "giant"): "dinov3_vitg14",
+    ("v3", "small"): "dinov3_vits16",
+    ("v3", "base"):  "dinov3_vitb16",
+    ("v3", "large"): "dinov3_vitl16",
+    ("v3", "giant"): "dinov3_vitg16",
 }
 
 
@@ -37,8 +38,13 @@ _MODEL_NAMES: dict[tuple[str, str], str] = {
 class ExtractorOutput:
     """Output of a single forward pass through DinoEncoder.
 
-    cls:     (B, D)        — CLS token embedding
-    patches: (B, H, W, D)  — patch embeddings in (y, x) / (height, width) order
+    Single layer (layers=1, default):
+        cls:     (B, D)           — CLS token embedding
+        patches: (B, H, W, D)    — patch embeddings, y-first (height × width)
+
+    Multiple layers (layers=N>1 or layers=[i,j,...]):
+        cls:     (B, L, D)        — one CLS per layer
+        patches: (B, L, H, W, D) — one spatial grid per layer
     """
 
     cls: torch.Tensor
@@ -61,12 +67,16 @@ class DinoEncoder(nn.Module):
     Args:
         version:  "v2" or "v3".
         size:     "small" | "base" | "large" | "giant".
-        img_size: Square input resolution (must be divisible by 14).
+        img_size: Square input resolution. Must be divisible by the patch size
+                  (14 for v2, 16 for v3).
+        layers:   Which transformer blocks to extract.
+                  - int  → last `n` blocks  (e.g. 1 = last block only)
+                  - list → explicit 0-based block indices (e.g. [8, 9, 10, 11])
+                  Can be overridden per-call in forward().
         device:   "cuda" / "cuda:N", "xpu" / "xpu:N", "cpu", or None for auto.
-        amp:      Enable torch.autocast during inference (bfloat16 on the
-                  resolved device type).
-        dtype:    Cast model weights to this dtype (e.g. torch.bfloat16 or
-                  torch.float16).  None keeps default float32.
+        amp:      Enable torch.autocast (bfloat16) during inference.
+        dtype:    Cast model weights to this dtype (e.g. torch.bfloat16).
+                  None keeps default float32.
     """
 
     def __init__(
@@ -74,21 +84,29 @@ class DinoEncoder(nn.Module):
         version: Literal["v2", "v3"] = "v2",
         size: Literal["small", "base", "large", "giant"] = "base",
         img_size: int = 224,
+        layers: Union[int, list[int]] = 1,
         device: Optional[Union[str, torch.device]] = None,
         amp: bool = False,
         dtype: Optional[torch.dtype] = None,
     ) -> None:
         super().__init__()
 
-        if img_size % _PATCH_SIZE != 0:
-            raise ValueError(f"img_size must be divisible by {_PATCH_SIZE}, got {img_size}")
+        patch_size = _PATCH_SIZES[version]
+        if img_size % patch_size != 0:
+            raise ValueError(
+                f"img_size must be divisible by {patch_size} for DINO {version}, got {img_size}"
+            )
 
         self.version = version
         self.size = size
         self.img_size = img_size
+        self.layers = layers
         self.amp = amp
         self.model_dtype = dtype
         self.device = _resolve_device(device)
+        self.patch_size = patch_size
+        self.grid_h = img_size // patch_size
+        self.grid_w = img_size // patch_size
 
         hub_repo = _HUB_REPOS[version]
         model_name = _MODEL_NAMES[(version, size)]
@@ -97,9 +115,6 @@ class DinoEncoder(nn.Module):
         if dtype is not None:
             backbone = backbone.to(dtype=dtype)
         self.backbone = backbone.to(self.device)
-
-        self.grid_h = img_size // _PATCH_SIZE
-        self.grid_w = img_size // _PATCH_SIZE
 
         self.preprocess = transforms.Compose([
             transforms.Resize(img_size, interpolation=transforms.InterpolationMode.BICUBIC),
@@ -148,30 +163,50 @@ class DinoEncoder(nn.Module):
     def forward(
         self,
         images: Union[torch.Tensor, Image.Image, np.ndarray, list],
+        layers: Optional[Union[int, list[int]]] = None,
     ) -> ExtractorOutput:
-        """Extract CLS and patch features.
+        """Extract CLS and patch features via get_intermediate_layers.
 
         Args:
-            images: One of:
-                - PIL Image or list of PIL Images
-                - numpy array (H, W, 3) uint8 or list thereof
-                - pre-processed float tensor (B, 3, H, W) already on any device
+            images: PIL Image / list of PIL Images, numpy (H,W,3) uint8 array /
+                    list thereof, or a pre-processed float tensor (B, 3, H, W).
+            layers: Override the encoder's default layer selection for this call.
+                    int  → last `n` blocks; list[int] → explicit block indices.
 
         Returns:
-            ExtractorOutput with:
-                cls     — (B, D)
-                patches — (B, H, W, D) in (y, x) / (height, width) order
+            ExtractorOutput:
+                Single layer  → cls (B, D),        patches (B, H, W, D)
+                Multiple      → cls (B, L, D),     patches (B, L, H, W, D)
+            Patches are in (y, x) / (height, width) spatial order.
         """
+        n = layers if layers is not None else self.layers
+        single = isinstance(n, int) and n == 1
+
         x = self._to_tensor_batch(images)
+        B = x.shape[0]
 
         with self._autocast_ctx():
-            out = self.backbone.forward_features(x)
+            # returns tuple of L elements; each element is (patch_tokens, cls_token)
+            # when return_class_token=True
+            raw = self.backbone.get_intermediate_layers(
+                x, n=n, return_class_token=True, norm=True
+            )
 
-        cls: torch.Tensor = out["x_norm_clstoken"]           # (B, D)
-        patch_tokens: torch.Tensor = out["x_norm_patchtokens"]  # (B, N, D)
+        # raw[i] = (patch_tokens (B, N, D), cls (B, D))
+        cls_list    = [r[1] for r in raw]   # L × (B, D)
+        patch_list  = [r[0] for r in raw]   # L × (B, N, D)
 
-        B, _N, D = patch_tokens.shape
-        # reshape to spatial grid — row-major so dim1=y(height), dim2=x(width)
-        patches = patch_tokens.reshape(B, self.grid_h, self.grid_w, D)
+        D = cls_list[0].shape[-1]
+        L = len(cls_list)
+
+        cls = torch.stack(cls_list, dim=1)    # (B, L, D)
+        patches = (
+            torch.stack(patch_list, dim=1)    # (B, L, N, D)
+            .reshape(B, L, self.grid_h, self.grid_w, D)
+        )
+
+        if single:
+            cls     = cls.squeeze(1)      # (B, D)
+            patches = patches.squeeze(1)  # (B, H, W, D)
 
         return ExtractorOutput(cls=cls, patches=patches)
