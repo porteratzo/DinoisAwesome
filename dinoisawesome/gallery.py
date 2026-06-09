@@ -17,14 +17,14 @@ from .encoder import DinoEncoder, ExtractorOutput, _MODEL_NAMES
 class GalleryConfig:
     """Immutable record of the model and settings that produced this gallery."""
 
-    model_name: str       # e.g. "dinov2_vitb14"
-    version: str          # "v2" or "v3"
-    size: str             # "small" / "base" / "large" / "giant"
-    patch_size: int       # 14 (v2) or 16 (v3)
-    image_size: int       # e.g. 518
+    model_name: str           # e.g. "dinov2_vitb14"
+    version: str              # "v2" or "v3"
+    size: str                 # "small" / "base" / "large" / "giant"
+    patch_size: int           # 14 (v2) or 16 (v3)
+    image_size: int           # e.g. 518
     block_indices: list[int]  # transformer block numbers stored, in order
-    embed_dim: int        # embedding dimension D
-    created_at: str       # ISO-8601 UTC timestamp
+    embed_dim: int            # embedding dimension D
+    created_at: str           # ISO-8601 UTC timestamp
     schema_version: str = "1.0"
 
     @property
@@ -71,10 +71,15 @@ class Gallery:
 
         <root>/
             gallery_config.json
-            patches.parquet          # one row per (image_id, row, col)
-            cls_tokens.parquet       # one row per image_id
-            embeddings/<id>.npy      # float32 (L, H, W, D)
-            cls/<id>.npy             # float32 (L, D)
+            patches.parquet        # one row per (image_id, row, col)
+            cls_tokens.parquet     # one row per image_id; row i aligns with cls_tokens.npy[i]
+            cls_tokens.npy         # float32 (N, L, D) — all CLS embeddings in one array
+            embeddings/<id>.npy    # float32 (L, H, W, D) — patch embeddings per image
+
+    CLS tokens are small enough to live in a single file (N×L×D) that can be
+    mmapped and searched globally without opening per-image files.  Patch
+    embeddings stay per-image so large galleries remain feasible with sparse
+    mmap access.
 
     patches.parquet columns:
 
@@ -86,22 +91,45 @@ class Gallery:
         labels    object    list[str] — arbitrary multi-labels
         split     str       "train" / "val" / "test" / "unlabeled"
 
+    cls_tokens.parquet columns:
+
+        image_id  str
+        labels    object    list[str] — image-level labels
+        split     str
+
     Labels live on the *spatial patch* (image_id, row, col), not on a specific
     layer.  When loading embeddings you choose which block to pull from the
-    (L, H, W, D) array; the metadata DF is the same regardless of layer.
+    (L, H, W, D) patch array or the (N, L, D) CLS array; the parquet files are
+    the same regardless of layer choice.
+
+    Typical two-stage retrieval::
+
+        # 1. coarse: find relevant images via CLS similarity (no file opens)
+        top_images = gallery.retrieve_images(query_cls, k=20, split="train")
+
+        # 2. fine: patch search within those images only
+        matches = gallery.retrieve(
+            query_patch, k=10,
+            image_ids=top_images["image_id"].tolist(),
+            has_labels=["keypoint"],
+        )
     """
 
-    _CONFIG_FILE = "gallery_config.json"
+    _CONFIG_FILE  = "gallery_config.json"
     _PATCHES_FILE = "patches.parquet"
-    _CLS_FILE = "cls_tokens.parquet"
-    _EMB_DIR = "embeddings"
-    _CLS_DIR = "cls"
+    _CLS_META     = "cls_tokens.parquet"
+    _CLS_NPY      = "cls_tokens.npy"
+    _EMB_DIR      = "embeddings"
 
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root)
-        self.config = GalleryConfig.load(self.root / self._CONFIG_FILE)
-        self.patches: pd.DataFrame = pd.read_parquet(self.root / self._PATCHES_FILE)
-        self.cls_tokens: pd.DataFrame = pd.read_parquet(self.root / self._CLS_FILE)
+        self.config     = GalleryConfig.load(self.root / self._CONFIG_FILE)
+        self.patches    = pd.read_parquet(self.root / self._PATCHES_FILE)
+        self.cls_tokens = pd.read_parquet(self.root / self._CLS_META)
+        # mmap the whole CLS array; row i aligns with cls_tokens.iloc[i]
+        self._cls_array: np.ndarray = np.load(
+            self.root / self._CLS_NPY, mmap_mode="r"
+        )  # (N, L, D)
 
     # ------------------------------------------------------------------
     # Building
@@ -136,7 +164,6 @@ class Gallery:
         if len(images) != len(image_ids):
             raise ValueError("images and image_ids must have the same length")
 
-        # Require multi-layer so the npy files are always (L, H, W, D)
         if isinstance(encoder.layers, int) and encoder.layers == 1:
             raise ValueError(
                 "Gallery requires multi-layer output. "
@@ -145,15 +172,15 @@ class Gallery:
 
         out_dir = Path(out_dir)
         (out_dir / cls._EMB_DIR).mkdir(parents=True, exist_ok=True)
-        (out_dir / cls._CLS_DIR).mkdir(parents=True, exist_ok=True)
 
-        config = GalleryConfig.from_encoder(encoder)
-        splits = [split] * len(images) if isinstance(split, str) else list(split)
+        config       = GalleryConfig.from_encoder(encoder)
+        splits       = [split] * len(images) if isinstance(split, str) else list(split)
         image_labels = image_labels or {}
         patch_labels = patch_labels or {}
 
         patch_rows: list[dict] = []
-        cls_rows: list[dict] = []
+        cls_rows:   list[dict] = []
+        cls_arrays: list[np.ndarray] = []   # accumulate (L, D) per image
 
         for start in range(0, len(images), batch_size):
             batch_imgs = images[start : start + batch_size]
@@ -166,15 +193,14 @@ class Gallery:
             ]
 
             out: ExtractorOutput = encoder(loaded)
-            # patches: (B, L, H, W, D) — guaranteed by multi-layer requirement above
-            patches_np = out.patches.cpu().float().numpy()
-            cls_np     = out.cls.cpu().float().numpy()
+            patches_np = out.patches.cpu().float().numpy()  # (B, L, H, W, D)
+            cls_np     = out.cls.cpu().float().numpy()      # (B, L, D)
 
             _, L, H, W, _ = patches_np.shape
 
             for b, (img_id, spl) in enumerate(zip(batch_ids, batch_spls)):
                 np.save(out_dir / cls._EMB_DIR / f"{img_id}.npy", patches_np[b])
-                np.save(out_dir / cls._CLS_DIR  / f"{img_id}.npy", cls_np[b])
+                cls_arrays.append(cls_np[b])  # (L, D) — gathered into one array below
 
                 img_lbl = set(image_labels.get(img_id, []))
                 for row in range(H):
@@ -196,6 +222,9 @@ class Gallery:
                     "split":    spl,
                 })
 
+        # Single CLS array: (N, L, D) — row order matches cls_tokens.parquet
+        np.save(out_dir / cls._CLS_NPY, np.stack(cls_arrays, axis=0))
+
         patches_df = pd.DataFrame(patch_rows)
         cls_df     = pd.DataFrame(cls_rows)
 
@@ -203,7 +232,7 @@ class Gallery:
             patches_df[col_name] = patches_df[col_name].astype("int16")
 
         patches_df.to_parquet(out_dir / cls._PATCHES_FILE, index=False)
-        cls_df.to_parquet(out_dir / cls._CLS_FILE,     index=False)
+        cls_df.to_parquet(out_dir / cls._CLS_META, index=False)
         config.save(out_dir / cls._CONFIG_FILE)
 
         return cls(out_dir)
@@ -254,11 +283,11 @@ class Gallery:
     ) -> np.ndarray:
         """Load patch embeddings for the rows in df.
 
-        Groups by image, opens each npy file once with mmap, then vectorised-
-        indexes the requested patches — so no full-file reads for sparse queries.
+        Groups by image, mmaps each per-image npy once, then does a vectorised
+        spatial lookup — no full-file reads for sparse patch subsets.
 
         Args:
-            df:         Sub-DataFrame from .filter() (index must match self.patches).
+            df:         Sub-DataFrame from .filter() (index must align with self.patches).
             block_idx:  Transformer block to use; defaults to the last stored block.
 
         Returns:
@@ -272,14 +301,12 @@ class Gallery:
         pos_map = {idx: i for i, idx in enumerate(df.index)}
 
         for img_id, group in df.groupby("image_id"):
-            npy = np.load(
-                self.root / self._EMB_DIR / f"{img_id}.npy", mmap_mode="r"
-            )  # (L, H, W, D)
-            layer = np.asarray(npy[layer_idx])   # (H, W, D) — one page-in per image
-            rows = group["row"].values.astype(int)
-            cols = group["col"].values.astype(int)
+            npy   = np.load(self.root / self._EMB_DIR / f"{img_id}.npy", mmap_mode="r")
+            layer = np.asarray(npy[layer_idx])  # (H, W, D) — single sequential page-in
+            rows  = group["row"].values.astype(int)
+            cols  = group["col"].values.astype(int)
             out_pos = [pos_map[idx] for idx in group.index]
-            result[out_pos] = layer[rows, cols]  # vectorised spatial lookup
+            result[out_pos] = layer[rows, cols]
 
         return result
 
@@ -288,10 +315,14 @@ class Gallery:
         image_ids: Optional[list[str]] = None,
         block_idx: Optional[int] = None,
     ) -> tuple[list[str], np.ndarray]:
-        """Load CLS token embeddings (one per image).
+        """Load CLS token embeddings from the single cls_tokens.npy array.
+
+        Args:
+            image_ids:  Restrict to these images; None returns all.
+            block_idx:  Transformer block; defaults to the last stored block.
 
         Returns:
-            (ids, embeddings) where embeddings is float32 (N, D).
+            (ids, embeddings) — ids: list[str], embeddings: float32 (N, D).
         """
         if block_idx is None:
             block_idx = self.config.block_indices[-1]
@@ -301,16 +332,70 @@ class Gallery:
         if image_ids is not None:
             df = df[df["image_id"].isin(image_ids)]
 
-        ids = df["image_id"].tolist()
-        embs = np.stack([
-            np.load(self.root / self._CLS_DIR / f"{img_id}.npy", mmap_mode="r")[layer_idx]
-            for img_id in ids
-        ])
-        return ids, embs
+        # df.index values are row positions in _cls_array (RangeIndex after parquet load)
+        positions = df.index.to_numpy()
+        # Load the full layer slice — small enough to be held in RAM for any realistic gallery
+        layer_all = np.asarray(self._cls_array[:, layer_idx, :])  # (N_total, D)
+        return df["image_id"].tolist(), layer_all[positions]
 
     # ------------------------------------------------------------------
     # Retrieval
     # ------------------------------------------------------------------
+
+    def retrieve_images(
+        self,
+        query: np.ndarray,
+        k: int = 10,
+        block_idx: Optional[int] = None,
+        image_ids: Optional[list[str]] = None,
+        split: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """Find the top-k most similar images to a query CLS embedding.
+
+        Operates entirely on cls_tokens.npy — no per-image patch files are
+        opened.  Use the returned image_ids to narrow a subsequent
+        patch-level retrieve() call.
+
+        Args:
+            query:      (D,) CLS embedding to search against.
+            k:          Number of images to return.
+            block_idx:  Which block's CLS to use; defaults to the last stored.
+            image_ids:  Optional pre-filter to a subset of images.
+            split:      "train", "val", "test", or "unlabeled".
+
+        Returns:
+            Sub-DataFrame of self.cls_tokens with a "similarity" column added,
+            sorted descending, index reset.
+        """
+        if block_idx is None:
+            block_idx = self.config.block_indices[-1]
+        layer_idx = self.config.layer_idx(block_idx)
+
+        df = self.cls_tokens
+        if split is not None:
+            df = df[df["split"] == split]
+        if image_ids is not None:
+            df = df[df["image_id"].isin(image_ids)]
+
+        if len(df) == 0:
+            return df.assign(similarity=pd.Series(dtype=float))
+
+        positions  = df.index.to_numpy()
+        layer_all  = np.asarray(self._cls_array[:, layer_idx, :])  # (N_total, D)
+        embs       = layer_all[positions]                            # (N_filtered, D)
+
+        q      = query.ravel().astype(np.float32)
+        norms  = np.linalg.norm(embs, axis=1)
+        q_norm = np.linalg.norm(q)
+        sims   = (embs @ q) / (norms * q_norm + 1e-8)
+
+        k       = min(k, len(df))
+        top_pos = np.argpartition(sims, -k)[-k:]
+        top_pos = top_pos[np.argsort(sims[top_pos])[::-1]]
+
+        result = df.iloc[top_pos].copy()
+        result["similarity"] = sims[top_pos]
+        return result.reset_index(drop=True)
 
     def retrieve(
         self,
@@ -324,11 +409,11 @@ class Gallery:
     ) -> pd.DataFrame:
         """Find the top-k most cosine-similar patches to a query embedding.
 
-        Filter kwargs narrow the search space before loading any embeddings.
+        Filter kwargs narrow the candidate set before loading any patch files.
 
         Returns:
-            Sub-DataFrame of self.patches with a "similarity" float column
-            appended, sorted descending by similarity, index reset.
+            Sub-DataFrame of self.patches with a "similarity" column appended,
+            sorted descending by similarity, index reset.
         """
         df = self.filter(
             has_labels=has_labels,
@@ -339,15 +424,13 @@ class Gallery:
         if len(df) == 0:
             return df.assign(similarity=pd.Series(dtype=float))
 
-        embs = self.load_embeddings(df, block_idx=block_idx)
-        q = query.ravel().astype(np.float32)
-
-        # Cosine similarity: (N, D) · (D,) / (norms · ||q||)
+        embs   = self.load_embeddings(df, block_idx=block_idx)
+        q      = query.ravel().astype(np.float32)
         norms  = np.linalg.norm(embs, axis=1)
         q_norm = np.linalg.norm(q)
         sims   = (embs @ q) / (norms * q_norm + 1e-8)
 
-        k = min(k, len(df))
+        k       = min(k, len(df))
         top_pos = np.argpartition(sims, -k)[-k:]
         top_pos = top_pos[np.argsort(sims[top_pos])[::-1]]
 
@@ -401,4 +484,4 @@ class Gallery:
 
     def _save_metadata(self) -> None:
         self.patches.to_parquet(self.root / self._PATCHES_FILE, index=False)
-        self.cls_tokens.to_parquet(self.root / self._CLS_FILE, index=False)
+        self.cls_tokens.to_parquet(self.root / self._CLS_META, index=False)
