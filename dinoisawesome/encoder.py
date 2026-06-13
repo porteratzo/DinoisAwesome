@@ -25,11 +25,11 @@ _HUB_REPOS: dict[str, str] = {
 
 _MODEL_NAMES: dict[tuple[str, str], str] = {
     ("v2", "small"): "dinov2_vits14",
-    ("v2", "base"):  "dinov2_vitb14",
+    ("v2", "base"): "dinov2_vitb14",
     ("v2", "large"): "dinov2_vitl14",
     ("v2", "giant"): "dinov2_vitg14",
     ("v3", "small"): "dinov3_vits16",
-    ("v3", "base"):  "dinov3_vitb16",
+    ("v3", "base"): "dinov3_vitb16",
     ("v3", "large"): "dinov3_vitl16",
     ("v3", "giant"): "dinov3_vitg16",
 }
@@ -109,16 +109,16 @@ class DinoEncoder(nn.Module):
                 f"img_size must be divisible by {patch_size} for DINO {version}, got {img_size}"
             )
 
-        self.version    = version
-        self.size       = size
-        self.img_size   = img_size
-        self.layers     = layers
-        self.amp        = amp
+        self.version = version
+        self.size = size
+        self.img_size = img_size
+        self.layers = layers
+        self.amp = amp
         self.model_dtype = dtype
-        self.device     = _resolve_device(device)
+        self.device = _resolve_device(device)
         self.patch_size = patch_size
-        self.grid_h     = img_size // patch_size
-        self.grid_w     = img_size // patch_size
+        self.grid_h = img_size // patch_size
+        self.grid_w = img_size // patch_size
 
         backbone = torch.hub.load(_HUB_REPOS[version], _MODEL_NAMES[(version, size)])
         backbone.eval()
@@ -126,12 +126,14 @@ class DinoEncoder(nn.Module):
             backbone = backbone.to(dtype=dtype)
         self.backbone = backbone.to(self.device)
 
-        self.preprocess = transforms.Compose([
-            transforms.Resize(img_size, interpolation=transforms.InterpolationMode.BICUBIC),
-            transforms.CenterCrop(img_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
-        ])
+        self.preprocess = transforms.Compose(
+            [
+                transforms.Resize(img_size, interpolation=transforms.InterpolationMode.BICUBIC),
+                transforms.CenterCrop(img_size),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
+            ]
+        )
 
     def _autocast_ctx(self) -> contextlib.AbstractContextManager:
         """Return a bfloat16 autocast context manager when AMP is enabled, or a no-op."""
@@ -162,8 +164,7 @@ class DinoEncoder(nn.Module):
         else:
             if not isinstance(images, (list, tuple)):
                 images = [images]
-            pil = [img if isinstance(img, Image.Image) else Image.fromarray(img)
-                   for img in images]
+            pil = [img if isinstance(img, Image.Image) else Image.fromarray(img) for img in images]
             x = torch.stack([self.preprocess(img) for img in pil]).to(self.device)
 
         if self.model_dtype is not None and not self.amp:
@@ -188,22 +189,21 @@ class DinoEncoder(nn.Module):
             ExtractorOutput with shapes as documented on that class.
             Patches are in (y, x) / (height, width) spatial order.
         """
-        n      = layers if layers is not None else self.layers
+        n = layers if layers is not None else self.layers
         single = isinstance(n, int) and n == 1
-        x      = self._to_tensor_batch(images)
+        x = self._to_tensor_batch(images)
 
         with self._autocast_ctx():
             # Each element: (patch_tokens (B, N, D), cls_token (B, D))
-            raw = self.backbone.get_intermediate_layers(
-                x, n=n, return_class_token=True, norm=True
-            )
+            raw = self.backbone.get_intermediate_layers(x, n=n, return_class_token=True, norm=True)
 
-        cls     = torch.stack([r[1] for r in raw], dim=1)          # (B, L, D)
-        patches = (torch.stack([r[0] for r in raw], dim=1)          # (B, L, N, D)
-                   .reshape(x.shape[0], len(raw), self.grid_h, self.grid_w, -1))
+        cls = torch.stack([r[1] for r in raw], dim=1)  # (B, L, D)
+        patches = torch.stack([r[0] for r in raw], dim=1).reshape(  # (B, L, N, D)
+            x.shape[0], len(raw), self.grid_h, self.grid_w, -1
+        )
 
         if single:
-            cls     = cls.squeeze(1)      # (B, D)
+            cls = cls.squeeze(1)  # (B, D)
             patches = patches.squeeze(1)  # (B, H, W, D)
 
         return ExtractorOutput(cls=cls, patches=patches)

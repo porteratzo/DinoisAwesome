@@ -20,14 +20,14 @@ from .encoder import DinoEncoder, ExtractorOutput, _MODEL_NAMES
 class GalleryConfig:
     """Immutable record of the model and settings that produced this gallery."""
 
-    model_name: str           # e.g. "dinov2_vitb14"
-    version: str              # "v2" or "v3"
-    size: str                 # "small" / "base" / "large" / "giant"
-    patch_size: int           # 14 (v2) or 16 (v3)
-    image_size: int           # e.g. 518
+    model_name: str  # e.g. "dinov2_vitb14"
+    version: str  # "v2" or "v3"
+    size: str  # "small" / "base" / "large" / "giant"
+    patch_size: int  # 14 (v2) or 16 (v3)
+    image_size: int  # e.g. 518
     block_indices: list[int]  # transformer block numbers stored, in L-axis order
-    embed_dim: int            # embedding dimension D
-    created_at: str           # ISO-8601 UTC timestamp
+    embed_dim: int  # embedding dimension D
+    created_at: str  # ISO-8601 UTC timestamp
     schema_version: str = "1.0"
 
     def layer_idx(self, block_idx: int) -> int:
@@ -131,11 +131,11 @@ class Gallery:
         )
     """
 
-    _CONFIG_FILE  = "gallery_config.json"
+    _CONFIG_FILE = "gallery_config.json"
     _PATCHES_FILE = "patches.parquet"
-    _CLS_META     = "cls_tokens.parquet"
-    _CLS_NPY      = "cls_tokens.npy"
-    _EMB_DIR      = "embeddings"
+    _CLS_META = "cls_tokens.parquet"
+    _CLS_NPY = "cls_tokens.npy"
+    _EMB_DIR = "embeddings"
 
     def __init__(self, root: Path | str) -> None:
         """Load an existing gallery from *root*.
@@ -151,9 +151,9 @@ class Gallery:
         Raises:
             FileNotFoundError: If any required file is missing from *root*.
         """
-        self.root       = Path(root)
-        self.config     = GalleryConfig.load(self.root / self._CONFIG_FILE)
-        self.patches    = pd.read_parquet(self.root / self._PATCHES_FILE)
+        self.root = Path(root)
+        self.config = GalleryConfig.load(self.root / self._CONFIG_FILE)
+        self.patches = pd.read_parquet(self.root / self._PATCHES_FILE)
         self.cls_tokens = pd.read_parquet(self.root / self._CLS_META)
         self._cls_array = np.load(self.root / self._CLS_NPY, mmap_mode="r")  # (N, L, D)
 
@@ -193,18 +193,18 @@ class Gallery:
         out_dir = Path(out_dir)
         (out_dir / cls._EMB_DIR).mkdir(parents=True, exist_ok=True)
 
-        config       = GalleryConfig.from_encoder(encoder)
-        splits       = [split] * len(images) if isinstance(split, str) else list(split)
+        config = GalleryConfig.from_encoder(encoder)
+        splits = [split] * len(images) if isinstance(split, str) else list(split)
         image_labels = image_labels or {}
         patch_labels = patch_labels or {}
 
         patch_rows: list[dict] = []
-        cls_rows:   list[dict] = []
+        cls_rows: list[dict] = []
         cls_arrays: list[np.ndarray] = []
 
         for start in range(0, len(images), batch_size):
             batch_imgs = images[start : start + batch_size]
-            batch_ids  = image_ids[start : start + batch_size]
+            batch_ids = image_ids[start : start + batch_size]
             batch_spls = splits[start : start + batch_size]
 
             loaded = [
@@ -214,7 +214,7 @@ class Gallery:
 
             out: ExtractorOutput = encoder(loaded)
             patches_np = out.patches.cpu().float().numpy()  # (B, L, H, W, D)
-            cls_np     = out.cls.cpu().float().numpy()      # (B, L, D)
+            cls_np = out.cls.cpu().float().numpy()  # (B, L, D)
             _, L, H, W, _ = patches_np.shape
 
             for b, (img_id, spl) in enumerate(zip(batch_ids, batch_spls)):
@@ -225,15 +225,17 @@ class Gallery:
                 for row in range(H):
                     for col in range(W):
                         extra = set(patch_labels.get((img_id, row, col), []))
-                        patch_rows.append({
-                            "image_id": img_id,
-                            "row":      row,
-                            "col":      col,
-                            "y_center": row * config.patch_size + config.patch_size // 2,
-                            "x_center": col * config.patch_size + config.patch_size // 2,
-                            "labels":   list(img_lbl | extra),
-                            "split":    spl,
-                        })
+                        patch_rows.append(
+                            {
+                                "image_id": img_id,
+                                "row": row,
+                                "col": col,
+                                "y_center": row * config.patch_size + config.patch_size // 2,
+                                "x_center": col * config.patch_size + config.patch_size // 2,
+                                "labels": list(img_lbl | extra),
+                                "split": spl,
+                            }
+                        )
                 cls_rows.append({"image_id": img_id, "labels": list(img_lbl), "split": spl})
 
         np.save(out_dir / cls._CLS_NPY, np.stack(cls_arrays))
@@ -298,15 +300,16 @@ class Gallery:
             block_idx = self.config.block_indices[-1]
         layer_idx = self.config.layer_idx(block_idx)
 
-        result  = np.empty((len(df), self.config.embed_dim), dtype=np.float32)
+        result = np.empty((len(df), self.config.embed_dim), dtype=np.float32)
         pos_map = {idx: i for i, idx in enumerate(df.index)}
 
         for img_id, group in df.groupby("image_id"):
-            npy     = np.load(self.root / self._EMB_DIR / f"{img_id}.npy", mmap_mode="r")
-            layer   = np.asarray(npy[layer_idx])  # (H, W, D)
+            npy = np.load(self.root / self._EMB_DIR / f"{img_id}.npy", mmap_mode="r")
+            layer = np.asarray(npy[layer_idx])  # (H, W, D)
             out_pos = [pos_map[idx] for idx in group.index]
-            result[out_pos] = layer[group["row"].values.astype(int),
-                                    group["col"].values.astype(int)]
+            result[out_pos] = layer[
+                group["row"].values.astype(int), group["col"].values.astype(int)
+            ]
         return result
 
     def load_cls_embeddings(
@@ -397,8 +400,9 @@ class Gallery:
             Sub-DataFrame of ``self.patches`` (up to *k* rows) with an extra
             ``"similarity"`` column, sorted descending by similarity.
         """
-        df = self.filter(has_labels=has_labels, any_labels=any_labels,
-                         image_ids=image_ids, split=split)
+        df = self.filter(
+            has_labels=has_labels, any_labels=any_labels, image_ids=image_ids, split=split
+        )
         if len(df) == 0:
             return df.assign(similarity=pd.Series(dtype=float))
 
@@ -472,7 +476,7 @@ class Gallery:
         Pass ``save=False`` when labeling many images; use :meth:`label_from_masks`
         to batch them with a single parquet write.
         """
-        ps     = self.config.patch_size
+        ps = self.config.patch_size
         grid_h = self.config.image_size // ps
         grid_w = self.config.image_size // ps
 
@@ -552,9 +556,7 @@ class Gallery:
         self.cls_tokens.to_parquet(self.root / self._CLS_META, index=False)
 
 
-def _cosine_topk(
-    embs: np.ndarray, query: np.ndarray, k: int
-) -> tuple[np.ndarray, np.ndarray]:
+def _cosine_topk(embs: np.ndarray, query: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
     """Compute cosine similarity between *query* and every row of *embs*, return the top *k*.
 
     Uses ``argpartition`` for an O(N) partial sort followed by a sort of the
@@ -570,11 +572,11 @@ def _cosine_topk(
         of row indices into *embs* and *similarities* is a float32 array of the
         corresponding cosine similarity scores, both sorted descending.
     """
-    q    = query.ravel().astype(np.float32)
+    q = query.ravel().astype(np.float32)
     sims = (embs @ q) / (np.linalg.norm(embs, axis=1) * np.linalg.norm(q) + 1e-8)
-    k    = min(k, len(embs))
-    top  = np.argpartition(sims, -k)[-k:]
-    top  = top[np.argsort(sims[top])[::-1]]
+    k = min(k, len(embs))
+    top = np.argpartition(sims, -k)[-k:]
+    top = top[np.argsort(sims[top])[::-1]]
     return top, sims[top]
 
 
@@ -603,8 +605,8 @@ def _reduce_mask_to_grid(
         return mask[np.ix_(ys, xs)]
     if reduce == "majority":
         cropped = mask[: grid_h * patch_size, : grid_w * patch_size]
-        blocks  = cropped.reshape(grid_h, patch_size, grid_w, patch_size)
-        out     = np.empty((grid_h, grid_w), dtype=mask.dtype)
+        blocks = cropped.reshape(grid_h, patch_size, grid_w, patch_size)
+        out = np.empty((grid_h, grid_w), dtype=mask.dtype)
         for r in range(grid_h):
             for c in range(grid_w):
                 out[r, c] = np.bincount(blocks[r, :, c, :].ravel().astype(np.intp)).argmax()
