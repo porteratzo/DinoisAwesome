@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 
-from .encoder import DinoEncoder, ExtractorOutput, _MODEL_NAMES
+from .encoder import _MODEL_NAMES, DinoEncoder, ExtractorOutput
 
 
 @dataclass
@@ -274,7 +274,7 @@ class Gallery:
             for lbl in has_labels:
                 df = df[df["labels"].apply(lambda ls: lbl in ls)]
         if any_labels:
-            df = df[df["labels"].apply(lambda ls: any(l in ls for l in any_labels))]
+            df = df[df["labels"].apply(lambda ls: any(item in ls for item in any_labels))]
         if image_ids is not None:
             df = df[df["image_id"].isin(image_ids)]
         if split is not None:
@@ -449,7 +449,7 @@ class Gallery:
         remove = set(labels)
         for idx in subset.index:
             self.patches.at[idx, "labels"] = [
-                l for l in self.patches.at[idx, "labels"] if l not in remove
+                item for item in self.patches.at[idx, "labels"] if item not in remove
             ]
         if save:
             self._save_metadata()

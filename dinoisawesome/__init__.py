@@ -4,6 +4,14 @@ from .anomaly_head import AnomalyHead
 from .encoder import DinoEncoder, ExtractorOutput
 from .gallery import Gallery, GalleryConfig
 from .keypoint_head import KeypointHead
+from .instance_detection import (
+    compute_density_map,
+    compute_exemplar_features,
+    detect_instances,
+    extract_patch_tokens,
+    extract_peaks,
+    visualize,
+)
 
 __all__ = [
     "DinoEncoder",
@@ -12,4 +20,10 @@ __all__ = [
     "GalleryConfig",
     "AnomalyHead",
     "KeypointHead",
+    "compute_density_map",
+    "compute_exemplar_features",
+    "detect_instances",
+    "extract_patch_tokens",
+    "extract_peaks",
+    "visualize",
 ]
