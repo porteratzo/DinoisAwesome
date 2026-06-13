@@ -20,11 +20,15 @@ dependencies = [
 xpu = [
     "intel-extension-for-pytorch",
 ]
+vis = [
+    "matplotlib>=3.7",
+]
 dev = [
     "pytest>=8.0",
     "pytest-cov",
     "ruff",
     "mypy",
+    "matplotlib>=3.7",
 ]
 
 [tool.setuptools.packages.find]
