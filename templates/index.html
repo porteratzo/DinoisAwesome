@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DinoisAwesome Annotator</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+<div class="app">
+
+  <!-- ── Left: image gallery ─────────────────────────────────────────── -->
+  <aside class="panel-left">
+    <h2 class="panel-title">Images</h2>
+    <ul id="image-list" class="image-list"></ul>
+  </aside>
+
+  <!-- ── Center: canvas area ──────────────────────────────────────────── -->
+  <main class="canvas-area">
+    <div id="status-bar" class="status-bar">Select an image to begin</div>
+    <div class="canvas-scroll">
+      <div class="canvas-stack">
+        <canvas id="image-canvas"></canvas>
+        <canvas id="overlay-canvas"></canvas>
+      </div>
+    </div>
+  </main>
+
+  <!-- ── Right: controls ──────────────────────────────────────────────── -->
+  <aside class="panel-right">
+
+    <section>
+      <h3 class="section-title">Class</h3>
+      <select id="class-select"></select>
+      <div class="row">
+        <input id="new-class-input" type="text" placeholder="New class name…">
+        <button id="add-class-btn" class="btn btn-sm">Add</button>
+      </div>
+    </section>
+
+    <section>
+      <h3 class="section-title">Instance ID</h3>
+      <input id="instance-id-input" type="number" value="1" min="1">
+    </section>
+
+    <section>
+      <h3 class="section-title">Prompt Type</h3>
+      <label class="radio-label">
+        <input type="radio" name="prompt-type" value="boxes" checked> Boxes (draw on canvas)
+      </label>
+      <label class="radio-label">
+        <input type="radio" name="prompt-type" value="text"> Text
+      </label>
+      <label class="radio-label">
+        <input type="radio" name="prompt-type" value="mixed"> Mixed (boxes + text)
+      </label>
+    </section>
+
+    <section id="text-prompt-section" style="display:none;">
+      <h3 class="section-title">Text Prompt</h3>
+      <input id="text-prompt-input" type="text" placeholder="e.g. cat, person, car…">
+    </section>
+
+    <section>
+      <button id="clear-boxes-btn" class="btn btn-danger">Clear Boxes</button>
+      <button id="segment-btn" class="btn">Segment</button>
+      <button id="save-btn" class="btn btn-success">Save Annotation</button>
+    </section>
+
+    <section id="mask-section">
+      <h3 class="section-title">Returned Masks</h3>
+      <div id="mask-prev-container"></div>
+    </section>
+
+    <section>
+      <h3 class="section-title">Annotations</h3>
+      <ul id="annotation-list"></ul>
+    </section>
+
+  </aside>
+</div>
+<script src="{{ url_for('static', filename='js/mask_editor.js') }}" defer></script>
+</body>
+</html>
