@@ -4,7 +4,9 @@ exposes CLS and patch-level intermediate-layer features."""
 from __future__ import annotations
 
 import contextlib
+import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -34,6 +36,32 @@ _MODEL_NAMES: dict[tuple[str, str], str] = {
     ("v3", "large"): "dinov3_vitl16",
     ("v3", "giant"): "dinov3_vitg16",
 }
+
+_log = logging.getLogger(__name__)
+
+
+def _find_weights_file(weights_dir: Path, model_name: str) -> Path:
+    """Return the unique ``{model_name}_*.pth`` file inside *weights_dir*.
+
+    Args:
+        weights_dir: Directory that contains the ``.pth`` weight files.
+        model_name:  Hub model name (e.g. ``"dinov3_vitb16"``).
+
+    Raises:
+        FileNotFoundError: No matching file found.
+        RuntimeError:      More than one matching file found.
+    """
+    matches = sorted(weights_dir.glob(f"{model_name}_*.pth"))
+    if not matches:
+        raise FileNotFoundError(
+            f"No weight file matching '{model_name}_*.pth' found in {weights_dir}"
+        )
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"Multiple weight files match '{model_name}_*.pth' in {weights_dir}: "
+            + ", ".join(p.name for p in matches)
+        )
+    return matches[0]
 
 
 @dataclass
@@ -87,9 +115,14 @@ class DinoEncoder(nn.Module):
                   int  → last n blocks (e.g. 1 = last block only).
                   list → explicit 0-based block indices (e.g. [8, 9, 10, 11]).
                   Can be overridden per-call in forward().
-        device:   "cuda" / "cuda:N", "xpu" / "xpu:N", "cpu", or None for auto.
-        amp:      Enable torch.autocast (bfloat16) during inference.
-        dtype:    Cast model weights to this dtype. None keeps float32.
+        device:      "cuda" / "cuda:N", "xpu" / "xpu:N", "cpu", or None for auto.
+        amp:         Enable torch.autocast (bfloat16) during inference.
+        dtype:       Cast model weights to this dtype. None keeps float32.
+        weights_dir: Directory containing local ``.pth`` weight files named
+                     ``{model_name}_*.pth`` (e.g. ``dinov3_vitb16_pretrain_*.pth``).
+                     When set, the architecture is still fetched from torch hub
+                     (code only, no large download) and the weights are loaded from
+                     this directory instead.  If ``None``, torch hub downloads both.
     """
 
     def __init__(
@@ -102,6 +135,7 @@ class DinoEncoder(nn.Module):
         amp: bool = False,
         dtype: torch.dtype | None = None,
         svd_components: int = 8,
+        weights_dir: str | Path | None = None,
     ) -> None:
         super().__init__()
 
@@ -122,7 +156,23 @@ class DinoEncoder(nn.Module):
         self.grid_h = img_size // patch_size
         self.grid_w = img_size // patch_size
 
-        backbone = torch.hub.load(_HUB_REPOS[version], _MODEL_NAMES[(version, size)])
+        model_name = _MODEL_NAMES[(version, size)]
+        if weights_dir is not None:
+            weights_path = _find_weights_file(Path(weights_dir), model_name)
+            _log.info("Loading %s architecture from hub (no pretrained weights)", model_name)
+            backbone = torch.hub.load(_HUB_REPOS[version], model_name, pretrained=False)
+            _log.info("Loading weights from %s", weights_path)
+            state = torch.load(weights_path, map_location="cpu", weights_only=True)
+            # some checkpoints nest the state dict under a "model" key
+            if (
+                isinstance(state, dict)
+                and "model" in state
+                and not any(k.startswith("blocks.") for k in state)
+            ):
+                state = state["model"]
+            backbone.load_state_dict(state)
+        else:
+            backbone = torch.hub.load(_HUB_REPOS[version], model_name)
         backbone.eval()
         if dtype is not None:
             backbone = backbone.to(dtype=dtype)
@@ -133,8 +183,11 @@ class DinoEncoder(nn.Module):
 
         self.preprocess = transforms.Compose(
             [
-                transforms.Resize(img_size, interpolation=transforms.InterpolationMode.BICUBIC),
-                transforms.CenterCrop(img_size),
+                transforms.Resize(
+                    (img_size, img_size),
+                    interpolation=transforms.InterpolationMode.BICUBIC,
+                ),
+                # transforms.CenterCrop(img_size),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
             ]

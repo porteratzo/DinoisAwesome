@@ -184,11 +184,6 @@ class Gallery:
         """
         if len(images) != len(image_ids):
             raise ValueError("images and image_ids must have the same length")
-        if isinstance(encoder.layers, int) and encoder.layers == 1:
-            raise ValueError(
-                "Gallery requires multi-layer output. "
-                "Initialise DinoEncoder with layers > 1 or an explicit list."
-            )
 
         out_dir = Path(out_dir)
         (out_dir / cls._EMB_DIR).mkdir(parents=True, exist_ok=True)
@@ -213,8 +208,14 @@ class Gallery:
             ]
 
             out: ExtractorOutput = encoder(loaded)
-            patches_np = out.patches.cpu().float().numpy()  # (B, L, H, W, D)
-            cls_np = out.cls.cpu().float().numpy()  # (B, L, D)
+            patches_np = out.patches.cpu().float().numpy()
+            cls_np = out.cls.cpu().float().numpy()
+            # Single-layer output squeezes the L axis: (B, H, W, D) and (B, D).
+            # Normalise to (B, L, H, W, D) and (B, L, D) so the on-disk layout
+            # is always the same regardless of how many layers the encoder stored.
+            if patches_np.ndim == 4:
+                patches_np = patches_np[:, np.newaxis, ...]  # (B, 1, H, W, D)
+                cls_np = cls_np[:, np.newaxis, :]            # (B, 1, D)
             _, L, H, W, _ = patches_np.shape
 
             for b, (img_id, spl) in enumerate(zip(batch_ids, batch_spls)):

@@ -2,6 +2,7 @@
 
 from .anomaly_head import AnomalyHead
 from .encoder import DinoEncoder, ExtractorOutput
+from .foreground_head import ForegroundHead
 from .gallery import Gallery, GalleryConfig
 from .keypoint_head import KeypointHead
 from .instance_detection import (
@@ -19,6 +20,7 @@ __all__ = [
     "Gallery",
     "GalleryConfig",
     "AnomalyHead",
+    "ForegroundHead",
     "KeypointHead",
     "compute_density_map",
     "compute_exemplar_features",
