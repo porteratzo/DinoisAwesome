@@ -18,7 +18,7 @@ body {
 
 /* ── Gallery panel ───────────────────────────────────────────────────────── */
 .panel-left {
-    width: 200px;
+    width: 190px;
     min-width: 140px;
     flex-shrink: 0;
     background: #242424;
@@ -43,17 +43,32 @@ body {
 .image-list { list-style: none; }
 .image-list li {
     cursor: pointer;
-    padding: 5px 8px;
+    padding: 4px;
     border-radius: 4px;
-    font-size: 11px;
-    color: #bbb;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    border: 2px solid transparent;
+    margin-bottom: 5px;
     user-select: none;
 }
-.image-list li:hover  { background: #2e2e2e; color: #eee; }
-.image-list li.active { background: #1b4f7a; color: #fff; }
+.image-list li:hover  { border-color: #444; }
+.image-list li.active { border-color: #1b4f7a; }
+
+.thumb {
+    width: 100%;
+    height: auto;
+    display: block;
+    border-radius: 2px;
+    background: #111;
+}
+.thumb-name {
+    display: block;
+    font-size: 10px;
+    color: #888;
+    text-align: center;
+    margin-top: 3px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
 
 /* ── Canvas area ─────────────────────────────────────────────────────────── */
 .canvas-area {
@@ -78,20 +93,22 @@ body {
 
 .canvas-scroll {
     flex: 1;
-    overflow: auto;
-    padding: 12px;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
 }
 
-/* Both canvases stacked; overlay sits on top via absolute positioning */
+/* Both canvases stacked; overlay sits on top via absolute positioning.
+   CSS size is set by JS (fitCanvasToContainer); pixel dims stay at natural res. */
 .canvas-stack {
     position: relative;
     display: inline-block;
-    line-height: 0; /* prevent gap below inline-block canvas */
+    line-height: 0;
 }
 
 #image-canvas {
     display: block;
-    max-width: 100%;
 }
 
 #overlay-canvas {
@@ -170,6 +187,16 @@ select:focus, input:focus { border-color: #1b6aaa; }
 .btn-danger:hover  { background: #8b3030; }
 .btn-success  { background: #1a5c2a; }
 .btn-success:hover { background: #237238; }
+.btn-warning  { background: #5c4400; }
+.btn-warning:hover { background: #7a5c00; }
+
+/* Side-by-side button pair */
+.btn-row {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 4px;
+}
+.btn-row .btn { flex: 1; margin-bottom: 0; }
 
 /* ── Radio labels ────────────────────────────────────────────────────────── */
 .radio-label {
@@ -201,7 +228,8 @@ select:focus, input:focus { border-color: #1b6aaa; }
 
 /* ── Annotation list ─────────────────────────────────────────────────────── */
 #annotation-list { list-style: none; }
-#annotation-list li {
+
+.ann-item {
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -209,6 +237,12 @@ select:focus, input:focus { border-color: #1b6aaa; }
     background: #2a2a2a;
     border-radius: 3px;
     margin-bottom: 3px;
+    border: 1px solid transparent;
+}
+
+.ann-item--active {
+    border-color: #2563a0;
+    background: #1b2e40;
 }
 
 .ann-badge {
@@ -218,6 +252,11 @@ select:focus, input:focus { border-color: #1b6aaa; }
     font-size: 10px;
     font-weight: 700;
     letter-spacing: 0.03em;
+    user-select: none;
+}
+
+.ann-badge:hover {
+    filter: brightness(1.15);
 }
 
 .delete-btn {

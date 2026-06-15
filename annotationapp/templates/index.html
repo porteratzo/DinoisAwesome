@@ -46,13 +46,26 @@
     <section>
       <h3 class="section-title">Prompt Type</h3>
       <label class="radio-label">
-        <input type="radio" name="prompt-type" value="boxes" checked> Boxes (draw on canvas)
+        <input type="radio" name="prompt-type" value="points" checked> Points (left-click=fg · right-click=bg)
+      </label>
+      <label class="radio-label">
+        <input type="radio" name="prompt-type" value="boxes"> Boxes (left-drag=positive · right-drag=negative)
       </label>
       <label class="radio-label">
         <input type="radio" name="prompt-type" value="text"> Text
       </label>
       <label class="radio-label">
         <input type="radio" name="prompt-type" value="mixed"> Mixed (boxes + text)
+      </label>
+      <label class="radio-label">
+        <input type="radio" name="prompt-type" value="points_boxes"> Points + Boxes (click=point · drag=box)
+      </label>
+    </section>
+
+    <section>
+      <h3 class="section-title">Options</h3>
+      <label class="radio-label">
+        <input type="checkbox" id="filter-by-prompt"> Filter to prompted region
       </label>
     </section>
 
@@ -62,7 +75,11 @@
     </section>
 
     <section>
-      <button id="clear-boxes-btn" class="btn btn-danger">Clear Boxes</button>
+      <div class="btn-row">
+        <button id="undo-btn" class="btn btn-warning" title="Remove the last added point or box">Undo</button>
+        <button id="clear-instance-btn" class="btn btn-warning" title="Clear all prompts for the current mode">Clear Instance</button>
+      </div>
+      <button id="clear-all-btn" class="btn btn-danger" title="Remove ALL prompts (points, boxes, text) — confirmation required">Clear All Prompts</button>
       <button id="segment-btn" class="btn">Segment</button>
       <button id="save-btn" class="btn btn-success">Save Annotation</button>
     </section>

@@ -23,6 +23,17 @@ import numpy as np
 from flask import Flask, abort, jsonify, render_template, request, send_file
 from PIL import Image
 
+# ── Load .env from the repo root (parent of this file's directory) ────────
+# Done before any HuggingFace/torch import so HF_TOKEN is available for
+# from_pretrained() calls inside SAM3Service._load().
+_ENV_FILE = Path(__file__).parent.parent / ".env"
+if _ENV_FILE.exists():
+    for _line in _ENV_FILE.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _, _v = _line.partition("=")
+            os.environ.setdefault(_k.strip(), _v.strip())
+
 # sam_service module-level code does NOT import torch; torch is imported lazily
 # inside SAM3Service._load() → safe to import the class here before basicConfig.
 from sam_service import SAM3Service
@@ -40,6 +51,7 @@ _log = logging.getLogger(__name__)
 # ── Configuration ─────────────────────────────────────────────────────────
 _WORKING_DIR = Path(os.environ.get("WORKING_DIR", ".")).resolve()
 _IMAGE_EXTS = {"jpg", "jpeg", "png", "JPG", "JPEG", "PNG"}
+_CLASSES_FILE = _WORKING_DIR / "classes.json"
 _log.info("WORKING_DIR: %s", _WORKING_DIR)
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
@@ -101,6 +113,25 @@ def serve_image(filepath: str):
     return send_file(target)
 
 
+@app.route("/api/thumbnail/<path:filepath>")
+def serve_thumbnail(filepath: str):
+    """Return a small JPEG thumbnail (max 180×140) for the gallery sidebar."""
+    target = _safe_resolve(filepath)
+    if not target.is_file():
+        abort(404)
+    try:
+        with Image.open(target) as img:
+            img.thumbnail((180, 140))
+            thumb = img.convert("RGB")
+            buf = io.BytesIO()
+            thumb.save(buf, format="JPEG", quality=72)
+            buf.seek(0)
+        return send_file(buf, mimetype="image/jpeg")
+    except Exception:
+        _log.exception("Failed to generate thumbnail for %s", filepath)
+        abort(500)
+
+
 @app.route("/api/annotations/<path:filepath>")
 def list_annotations(filepath: str):
     """Return all saved annotations for the given image (relative) path."""
@@ -122,6 +153,49 @@ def list_annotations(filepath: str):
     return jsonify({"annotations": annotations})
 
 
+def _run_inference(image, prompt_type: str, prompt_data: dict, filter_by_prompt: bool):
+    """Dispatch to the appropriate SAM method and return a list of masks.
+
+    Raises ValueError with a user-facing message on bad input, or RuntimeError
+    ('busy') when the model is already processing.
+    """
+    fbp = filter_by_prompt
+    if prompt_type == "points":
+        points: list[list[int]] = prompt_data.get("points", [])
+        if not points:
+            raise ValueError("points required for prompt_type=points")
+        labels: list[int] = prompt_data.get("labels", [1] * len(points))
+        return _sam.segment_with_points(image, points, labels, filter_by_prompt=fbp)
+
+    if prompt_type == "text":
+        text: str = prompt_data.get("text", "").strip()
+        if not text:
+            raise ValueError("text required for prompt_type=text")
+        return _sam.segment_with_text(image, text)
+
+    if prompt_type == "boxes":
+        boxes: list[list[int]] = prompt_data.get("boxes", [])
+        if not boxes:
+            raise ValueError("boxes required for prompt_type=boxes")
+        box_labels: list[int] = prompt_data.get("labels", [1] * len(boxes))
+        return _sam.segment_with_boxes(image, boxes, box_labels, filter_by_prompt=fbp)
+
+    if prompt_type == "points_boxes":
+        pts: list[list[int]] = prompt_data.get("points", [])
+        pt_labels: list[int] = prompt_data.get("point_labels", [1] * len(pts))
+        bxs: list[list[int]] = prompt_data.get("boxes", [])
+        bx_labels: list[int] = prompt_data.get("box_labels", [1] * len(bxs))
+        if not pts and not bxs:
+            raise ValueError("points or boxes required for prompt_type=points_boxes")
+        return _sam.segment_with_points_and_boxes(image, pts, pt_labels, bxs, bx_labels, filter_by_prompt=fbp)
+
+    # mixed (default)
+    text = prompt_data.get("text", "").strip()
+    mixed_boxes: list[list[int]] = prompt_data.get("boxes", [])
+    mixed_labels: list[int] = prompt_data.get("labels", [1] * len(mixed_boxes))
+    return _sam.segment_mixed(image, text, mixed_boxes, mixed_labels, filter_by_prompt=fbp)
+
+
 @app.route("/api/segment", methods=["POST"])
 def segment():
     """Run SAM 3 inference.  Returns HTTP 429 while the model is busy."""
@@ -129,6 +203,7 @@ def segment():
     image_b64: str = body.get("image_b64", "")
     prompt_type: str = body.get("prompt_type", "boxes")
     prompt_data: dict = body.get("prompt_data", {})
+    filter_by_prompt: bool = bool(body.get("filter_by_prompt", False))
 
     if not image_b64:
         return jsonify({"error": "Missing image_b64"}), 400
@@ -143,25 +218,9 @@ def segment():
         return jsonify({"error": "Invalid image data"}), 400
 
     try:
-        if prompt_type == "text":
-            text = prompt_data.get("text", "").strip()
-            if not text:
-                return jsonify({"error": "text required for prompt_type=text"}), 400
-            masks = _sam.segment_with_text(image, text)
-
-        elif prompt_type == "boxes":
-            boxes: list[list[int]] = prompt_data.get("boxes", [])
-            labels: list[int] = prompt_data.get("labels", [1] * len(boxes))
-            if not boxes:
-                return jsonify({"error": "boxes required for prompt_type=boxes"}), 400
-            masks = _sam.segment_with_boxes(image, boxes, labels)
-
-        else:  # mixed
-            text = prompt_data.get("text", "").strip()
-            boxes = prompt_data.get("boxes", [])
-            labels = prompt_data.get("labels", [1] * len(boxes))
-            masks = _sam.segment_mixed(image, text, boxes, labels)
-
+        masks = _run_inference(image, prompt_type, prompt_data, filter_by_prompt)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     except RuntimeError as exc:
         if "busy" in str(exc).lower():
             return jsonify({"error": "Model busy"}), 429
@@ -200,6 +259,34 @@ def save_annotation():
     return jsonify({"status": "ok"})
 
 
+@app.route("/api/annotation/mask/<path:filepath>")
+def get_annotation_mask(filepath: str):
+    """Return the boolean mask for a saved annotation as a JSON 2-D array.
+
+    Query params: class_name, instance_id
+    """
+    class_name = request.args.get("class_name", "")
+    instance_id_str = request.args.get("instance_id", "")
+    if not class_name or not instance_id_str:
+        return jsonify({"error": "class_name and instance_id are required"}), 400
+    try:
+        instance_id = int(instance_id_str)
+    except ValueError:
+        return jsonify({"error": "instance_id must be an integer"}), 400
+
+    subdir = _annotation_subdir(filepath, class_name, instance_id)
+    mask_path = subdir / "mask.npy"
+    if not mask_path.exists():
+        abort(404)
+
+    try:
+        mask = np.load(mask_path)
+        return jsonify({"mask": mask.tolist()})
+    except Exception:
+        _log.exception("Failed to load mask from %s", mask_path)
+        abort(500)
+
+
 @app.route("/api/annotation", methods=["DELETE"])
 def delete_annotation():
     """Remove a mask/json pair by class + instance ID."""
@@ -214,6 +301,46 @@ def delete_annotation():
     shutil.rmtree(subdir)
     _log.info("Deleted annotation: %s / %s_%d", image_path_str, class_name, instance_id)
     return jsonify({"status": "ok"})
+
+
+@app.route("/api/classes", methods=["GET"])
+def get_classes():
+    """Return the saved class list from WORKING_DIR/classes.json."""
+    if _CLASSES_FILE.exists():
+        try:
+            data = json.loads(_CLASSES_FILE.read_text())
+            classes = data.get("classes", ["object"])
+        except json.JSONDecodeError:
+            _log.warning("Malformed classes.json — using default")
+            classes = ["object"]
+    else:
+        classes = ["object"]
+    return jsonify({"classes": classes})
+
+
+@app.route("/api/classes", methods=["POST"])
+def add_class():
+    """Append a new class name to WORKING_DIR/classes.json."""
+    body = request.get_json(force=True)
+    name: str = (body.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "Missing name"}), 400
+
+    if _CLASSES_FILE.exists():
+        try:
+            data = json.loads(_CLASSES_FILE.read_text())
+            classes: list[str] = data.get("classes", ["object"])
+        except json.JSONDecodeError:
+            classes = ["object"]
+    else:
+        classes = ["object"]
+
+    if name not in classes:
+        classes.append(name)
+        _CLASSES_FILE.write_text(json.dumps({"classes": classes}, indent=2))
+        _log.info("Added class '%s' → %s", name, _CLASSES_FILE)
+
+    return jsonify({"classes": classes})
 
 
 if __name__ == "__main__":
