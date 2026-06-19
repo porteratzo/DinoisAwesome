@@ -833,7 +833,7 @@ async function _meRunSAM() {
         }
 
         const data = await resp.json();
-        _me.currentMasks    = data.masks || [];
+        _me.currentMasks    = (data.masks || []).map(m => decodeMaskRLE(m.shape, m.rle));
         _me.selectedMaskIdx = 0;
         redrawOverlay();
         updateMaskPreviews(data.count);
@@ -969,7 +969,7 @@ async function selectAnnotation(ann) {
             return;
         }
         const data = await resp.json();
-        _me.currentMasks          = [data.mask];
+        _me.currentMasks          = [decodeMaskRLE(data.mask.shape, data.mask.rle)];
         _me.selectedMaskIdx       = 0;
         _me.highlightedAnnotation = { class: ann.class, instance_id: ann.instance_id };
         renderAnnotationList();
@@ -999,6 +999,26 @@ async function deleteAnnotation(ann) {
     } catch (err) {
         console.error('[mask_editor] delete error:', err);
     }
+}
+
+// ── RLE decode ─────────────────────────────────────────────────────────────
+// Matches the server-side _rle_encode() format: alternating False/True run
+// lengths starting with the False count (leading 0 when mask begins True).
+function decodeMaskRLE(shape, rle) {
+    const [H, W] = shape;
+    const mask = new Array(H);
+    for (let r = 0; r < H; r++) mask[r] = new Array(W).fill(false);
+    let offset = 0;
+    for (let i = 0; i < rle.length; i++) {
+        const count = rle[i];
+        if (i % 2 === 1) {
+            for (let j = 0; j < count; j++) {
+                mask[Math.floor((offset + j) / W)][(offset + j) % W] = true;
+            }
+        }
+        offset += count;
+    }
+    return mask;
 }
 
 // ── Utility ────────────────────────────────────────────────────────────────
