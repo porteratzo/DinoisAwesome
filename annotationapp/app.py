@@ -60,6 +60,29 @@ app = Flask(__name__, template_folder="templates", static_folder="static")
 _sam = SAM3Service()
 
 
+# ── Mask encoding ─────────────────────────────────────────────────────────
+
+
+def _rle_encode(mask: np.ndarray) -> dict:
+    """Encode a (H, W) bool mask as RLE for compact JSON transport.
+
+    Returns {"shape": [H, W], "rle": [count, ...]}.  Run lengths start with
+    the False (background) count, alternating False/True.  If the mask starts
+    with True a leading 0 is prepended so the even/odd convention holds.
+    """
+    flat = mask.ravel().astype(np.uint8)
+    n = len(flat)
+    if n == 0:
+        return {"shape": list(mask.shape), "rle": []}
+    changes = np.where(np.diff(flat))[0] + 1
+    starts = np.concatenate([[0], changes])
+    ends = np.concatenate([changes, [n]])
+    lengths: list[int] = (ends - starts).tolist()
+    if flat[0]:
+        lengths = [0] + lengths
+    return {"shape": list(mask.shape), "rle": lengths}
+
+
 # ── Path helpers ──────────────────────────────────────────────────────────
 
 
@@ -227,7 +250,9 @@ def segment():
         _log.exception("SAM 3 inference error")
         return jsonify({"error": "Inference failed"}), 500
 
-    masks_out = [m.tolist() for m in masks]
+    # RLE-encode masks — raw 2D bool arrays are ~8 M values per 4K mask;
+    # RLE reduces that to ~20 K integers for a typical segmentation mask.
+    masks_out = [_rle_encode(m) for m in masks]
     return jsonify({"masks": masks_out, "count": len(masks_out)})
 
 
@@ -281,7 +306,7 @@ def get_annotation_mask(filepath: str):
 
     try:
         mask = np.load(mask_path)
-        return jsonify({"mask": mask.tolist()})
+        return jsonify({"mask": _rle_encode(mask)})
     except Exception:
         _log.exception("Failed to load mask from %s", mask_path)
         abort(500)
