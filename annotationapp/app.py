@@ -16,7 +16,6 @@ import io
 import json
 import logging
 import os
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -94,10 +93,56 @@ def _safe_resolve(filepath: str) -> Path:
     return target
 
 
-def _annotation_subdir(image_path_str: str, class_name: str, instance_id: int) -> Path:
-    """Return the per-annotation directory under WORKING_DIR/annotations/."""
+def _annotation_paths(image_path_str: str) -> tuple[Path, Path]:
+    """Return (json_path, npy_path) for the flat per-image annotation files."""
     stem = Path(image_path_str.replace("/", "__").replace("\\", "__")).stem
-    return _WORKING_DIR / "annotations" / stem / f"{class_name}_{instance_id}"
+    base = _WORKING_DIR / "annotations" / stem
+    return base.with_suffix(".json"), base.with_suffix(".npy")
+
+
+def _load_annotations(
+    image_path_str: str,
+) -> tuple[list[dict], np.ndarray | None]:
+    """Load (metadata_list, masks_3d) for an image.
+
+    Returns ([], None) when no annotations exist yet.
+    masks_3d is shape (N, H, W) bool.
+    """
+    json_path, npy_path = _annotation_paths(image_path_str)
+    if not json_path.exists():
+        return [], None
+    try:
+        metadata: list[dict] = json.loads(json_path.read_text())
+    except json.JSONDecodeError:
+        _log.warning("Malformed annotation JSON at %s — discarding", json_path)
+        return [], None
+    masks: np.ndarray | None = None
+    if npy_path.exists():
+        try:
+            masks = np.load(npy_path)  # (N, H, W) bool
+        except Exception:
+            _log.warning("Failed to load masks from %s — discarding", npy_path)
+    return metadata, masks
+
+
+def _save_annotations(
+    image_path_str: str,
+    metadata: list[dict],
+    masks: np.ndarray,
+) -> None:
+    """Persist (metadata_list, masks_3d) to disk atomically."""
+    json_path, npy_path = _annotation_paths(image_path_str)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.write_text(json.dumps(metadata, indent=2))
+    np.save(npy_path, masks)
+
+
+def _delete_annotation_files(image_path_str: str) -> None:
+    """Remove both annotation files for an image (called when all annotations gone)."""
+    json_path, npy_path = _annotation_paths(image_path_str)
+    for p in (json_path, npy_path):
+        if p.exists():
+            p.unlink()
 
 
 def _decode_image_b64(image_b64: str) -> Image.Image:
@@ -114,6 +159,12 @@ def _decode_image_b64(image_b64: str) -> Image.Image:
 @app.route("/")
 def index() -> str:
     return render_template("index.html")
+
+
+@app.route("/api/info")
+def api_info():
+    """Return model info for display in the UI."""
+    return jsonify({"model_id": _sam.model_id, "use_tracker": _sam.use_tracker})
 
 
 @app.route("/api/images")
@@ -158,22 +209,8 @@ def serve_thumbnail(filepath: str):
 @app.route("/api/annotations/<path:filepath>")
 def list_annotations(filepath: str):
     """Return all saved annotations for the given image (relative) path."""
-    stem = Path(filepath.replace("/", "__").replace("\\", "__")).stem
-    ann_dir = _WORKING_DIR / "annotations" / stem
-    if not ann_dir.exists():
-        return jsonify({"annotations": []})
-
-    annotations = []
-    for subdir in sorted(ann_dir.iterdir()):
-        if not subdir.is_dir():
-            continue
-        json_file = subdir / "annotation.json"
-        if json_file.exists():
-            try:
-                annotations.append(json.loads(json_file.read_text()))
-            except json.JSONDecodeError:
-                _log.warning("Malformed annotation JSON at %s", json_file)
-    return jsonify({"annotations": annotations})
+    metadata, _ = _load_annotations(filepath)
+    return jsonify({"annotations": metadata})
 
 
 def _run_inference(image, prompt_type: str, prompt_data: dict, filter_by_prompt: bool):
@@ -258,7 +295,12 @@ def segment():
 
 @app.route("/api/save", methods=["POST"])
 def save_annotation():
-    """Persist a boolean mask (.npy) and its metadata (.json)."""
+    """Persist a boolean mask and its metadata into the per-image flat files.
+
+    Storage format:
+      annotations/<stem>.json  — JSON list of all annotation metadata dicts
+      annotations/<stem>.npy   — (N, H, W) bool array, one slice per annotation
+    """
     body = request.get_json(force=True)
     image_path_str: str = body["image_path"]
     class_name: str = body["class_name"]
@@ -267,10 +309,7 @@ def save_annotation():
     prompt_type: str = body.get("prompt_type", "boxes")
     prompt_content: dict = body.get("prompt_content", {})
 
-    subdir = _annotation_subdir(image_path_str, class_name, instance_id)
-    subdir.mkdir(parents=True, exist_ok=True)
-
-    np.save(subdir / "mask.npy", np.array(mask_data, dtype=bool))
+    new_mask = np.array(mask_data, dtype=bool)  # (H, W)
 
     annotation = {
         "class": class_name,
@@ -279,14 +318,35 @@ def save_annotation():
         "prompt_content": prompt_content,
         "image_path": image_path_str,
     }
-    (subdir / "annotation.json").write_text(json.dumps(annotation, indent=2))
+
+    metadata, masks = _load_annotations(image_path_str)
+
+    # Find existing entry for this (class, instance_id) — update in-place or append.
+    idx = next(
+        (i for i, a in enumerate(metadata)
+         if a.get("class") == class_name and a.get("instance_id") == instance_id),
+        None,
+    )
+
+    if idx is not None:
+        metadata[idx] = annotation
+        masks_arr = masks if masks is not None else np.empty((0, *new_mask.shape), dtype=bool)
+        masks_arr[idx] = new_mask
+    else:
+        metadata.append(annotation)
+        if masks is not None:
+            masks_arr = np.concatenate([masks, new_mask[np.newaxis]], axis=0)
+        else:
+            masks_arr = new_mask[np.newaxis]  # (1, H, W)
+
+    _save_annotations(image_path_str, metadata, masks_arr)
     _log.info("Saved annotation: %s / %s_%d", image_path_str, class_name, instance_id)
     return jsonify({"status": "ok"})
 
 
 @app.route("/api/annotation/mask/<path:filepath>")
 def get_annotation_mask(filepath: str):
-    """Return the boolean mask for a saved annotation as a JSON 2-D array.
+    """Return the boolean mask for a saved annotation as RLE.
 
     Query params: class_name, instance_id
     """
@@ -299,31 +359,51 @@ def get_annotation_mask(filepath: str):
     except ValueError:
         return jsonify({"error": "instance_id must be an integer"}), 400
 
-    subdir = _annotation_subdir(filepath, class_name, instance_id)
-    mask_path = subdir / "mask.npy"
-    if not mask_path.exists():
+    metadata, masks = _load_annotations(filepath)
+    if masks is None:
+        abort(404)
+
+    idx = next(
+        (i for i, a in enumerate(metadata)
+         if a.get("class") == class_name and a.get("instance_id") == instance_id),
+        None,
+    )
+    if idx is None:
         abort(404)
 
     try:
-        mask = np.load(mask_path)
-        return jsonify({"mask": _rle_encode(mask)})
+        return jsonify({"mask": _rle_encode(masks[idx])})
     except Exception:
-        _log.exception("Failed to load mask from %s", mask_path)
+        _log.exception("Failed to encode mask for %s / %s_%d", filepath, class_name, instance_id)
         abort(500)
 
 
 @app.route("/api/annotation", methods=["DELETE"])
 def delete_annotation():
-    """Remove a mask/json pair by class + instance ID."""
+    """Remove one annotation from the per-image flat files by class + instance ID."""
     body = request.get_json(force=True)
     image_path_str: str = body["image_path"]
     class_name: str = body["class_name"]
     instance_id: int = int(body["instance_id"])
 
-    subdir = _annotation_subdir(image_path_str, class_name, instance_id)
-    if not subdir.exists():
+    metadata, masks = _load_annotations(image_path_str)
+
+    idx = next(
+        (i for i, a in enumerate(metadata)
+         if a.get("class") == class_name and a.get("instance_id") == instance_id),
+        None,
+    )
+    if idx is None:
         abort(404)
-    shutil.rmtree(subdir)
+
+    metadata.pop(idx)
+    if not metadata:
+        _delete_annotation_files(image_path_str)
+    else:
+        assert masks is not None
+        new_masks = np.delete(masks, idx, axis=0)  # (N-1, H, W)
+        _save_annotations(image_path_str, metadata, new_masks)
+
     _log.info("Deleted annotation: %s / %s_%d", image_path_str, class_name, instance_id)
     return jsonify({"status": "ok"})
 

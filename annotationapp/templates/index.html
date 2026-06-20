@@ -17,7 +17,10 @@
 
   <!-- ── Center: canvas area ──────────────────────────────────────────── -->
   <main class="canvas-area">
-    <div id="status-bar" class="status-bar">Select an image to begin</div>
+    <div class="status-bar">
+      <span id="status-bar">Select an image to begin</span>
+      <span id="canvas-info" class="canvas-info"></span>
+    </div>
     <div class="canvas-scroll">
       <div class="canvas-stack">
         <canvas id="image-canvas"></canvas>
@@ -28,6 +31,11 @@
 
   <!-- ── Right: controls ──────────────────────────────────────────────── -->
   <aside class="panel-right">
+
+    <section>
+      <div id="model-info" class="model-info">Model: —</div>
+      <button id="reset-view-btn" class="btn btn-sm" style="width:100%;margin-top:4px;" title="Reset zoom and pan (Ctrl+0)">Reset View</button>
+    </section>
 
     <section>
       <h3 class="section-title">Class</h3>

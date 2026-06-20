@@ -83,12 +83,21 @@ body {
 .status-bar {
     flex-shrink: 0;
     height: 28px;
-    line-height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
     padding: 0 12px;
     background: #1e1e1e;
     border-bottom: 1px solid #333;
     font-size: 12px;
     color: #999;
+}
+
+.canvas-info {
+    color: #555;
+    font-size: 11px;
+    white-space: nowrap;
+    letter-spacing: 0.02em;
 }
 
 .canvas-scroll {
@@ -132,6 +141,13 @@ body {
 
 .panel-right section {
     margin-bottom: 14px;
+}
+
+.model-info {
+    font-size: 10px;
+    color: #666;
+    padding: 3px 0 1px;
+    letter-spacing: 0.02em;
 }
 
 .section-title {
@@ -208,6 +224,18 @@ select:focus, input:focus { border-color: #1b6aaa; }
     user-select: none;
 }
 .radio-label input[type="radio"] { margin-right: 5px; accent-color: #2563a0; }
+
+/* Prompt options unsupported by the active model backend.
+   Title attribute carries the hover tooltip explaining the limitation + fix. */
+.radio-label.prompt-unavailable {
+    opacity: 0.38;
+    cursor: not-allowed;
+    color: #666;
+    text-decoration: line-through;
+}
+.radio-label.prompt-unavailable input[type="radio"] {
+    pointer-events: none;
+}
 
 /* ── Mask selector buttons ───────────────────────────────────────────────── */
 #mask-prev-container { display: flex; flex-wrap: wrap; gap: 4px; }

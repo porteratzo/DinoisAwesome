@@ -3,11 +3,26 @@
 Two backends are supported, selected by the USE_TRACKER environment variable:
 
 * **Sam3Model** (default, ``USE_TRACKER`` unset / "0"):
-  Supports text, box, and mixed prompts via Sam3Processor.
+  A concept-segmentation model.  Accepts text and/or box prompts via
+  Sam3Processor.  ``input_boxes_labels`` (1=positive, 0=negative) is a
+  first-class parameter of both the processor and Sam3Model.forward — negative
+  boxes genuinely exclude regions.
+
+  **Limitation — no native point support**: Sam3Processor has no
+  ``input_points`` / ``input_labels`` arguments.  Points are internally
+  approximated as tiny bounding boxes around the click coordinates, which is a
+  poor proxy for a true click prompt and gives unreliable results.  Use boxes
+  or text prompts with this backend.
 
 * **Sam3TrackerModel** (``USE_TRACKER=1``):
-  Supports text, box, and point prompts via Sam3TrackerProcessor.
-  Uses a different post-processing path (``post_process_masks``).
+  An interactive visual-segmentation model (SAM2 lineage).  Accepts
+  ``input_points`` / ``input_labels`` (1=fg, 0=bg) and ``input_boxes`` via
+  Sam3TrackerProcessor.
+
+  **Limitation — no negative-box support**: Sam3TrackerProcessor has no
+  ``input_boxes_labels`` argument.  Only positive boxes can be passed; negative
+  boxes are silently dropped.  Express exclusion regions as background click-
+  points (label=0) instead.
 
 Both backends use a non-blocking threading.Lock so concurrent requests receive
 HTTP 429 rather than queueing up and exhausting GPU memory.
@@ -49,6 +64,14 @@ class SAM3Service:
         self._processor: Any = None
         self._model: Any = None
         self._load()
+
+    @property
+    def model_id(self) -> str:
+        return self._model_id
+
+    @property
+    def use_tracker(self) -> bool:
+        return self._use_tracker
 
     # ------------------------------------------------------------------
     # Prompt-overlap filtering helpers
@@ -107,15 +130,6 @@ class SAM3Service:
 
         best = max(masks, key=lambda m: int(np.logical_and(m, prompt_region).sum()))
         return [best]
-
-    # ------------------------------------------------------------------
-    # Public state
-    # ------------------------------------------------------------------
-
-    @property
-    def use_tracker(self) -> bool:
-        """True when Sam3TrackerModel is active; False for Sam3Model."""
-        return self._use_tracker
 
     # ------------------------------------------------------------------
     # Startup
@@ -313,12 +327,16 @@ class SAM3Service:
         prompt_region = None
 
         if self._use_tracker:
-            # Sam3TrackerProcessor expects one object slot per instance:
-            #   input_points: (image, object, points_per_object, coord)
-            #   input_labels: (image, object, points_per_object)
-            # Each point becomes its own object → N masks back.
-            input_points = [[[[x, y]] for x, y in points]]
-            input_labels = [[[lbl] for lbl in labels]]
+            # Sam3TrackerProcessor shapes:
+            #   input_points: [batch, objects, points_per_object, 2]
+            #   input_labels: [batch, objects, points_per_object]
+            # All clicks belong to ONE object so that foreground (label=1) and
+            # background (label=0) points interact correctly within the same
+            # segmentation query.  Putting each click in its own object slot
+            # (the previous bug) made background clicks produce their own mask
+            # instead of suppressing the foreground region.
+            input_points = [[[[x, y] for x, y in points]]]   # [1, 1, N, 2]
+            input_labels = [[[lbl for lbl in labels]]]        # [1, 1, N]
             inputs = self._processor(
                 images=image,
                 input_points=input_points,
@@ -371,8 +389,11 @@ class SAM3Service:
         prompt_region = None
 
         if self._use_tracker:
-            # Tracker uses input_boxes natively: shape (batch, num_objects, 4).
-            # It has no box-label concept — only positive (label=1) boxes are passed.
+            # Sam3TrackerProcessor has no box-label concept — only positive
+            # (label=1) boxes can be expressed.  Negative boxes are dropped here
+            # because there is no API argument to carry them.  To exclude a
+            # region with the tracker, use a background click-point (label=0)
+            # via segment_with_points or segment_with_points_and_boxes instead.
             fg_boxes = [b for b, lbl in zip(boxes, labels) if lbl == 1]
             inputs = self._processor(
                 images=image,

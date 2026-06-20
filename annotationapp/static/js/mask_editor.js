@@ -24,12 +24,19 @@ const _me = {
     annotations: [],
     // Currently highlighted saved annotation (null or {class, instance_id})
     highlightedAnnotation: null,
+    // Cached decoded masks for all saved annotations: "class:instance_id" → 2-D bool array
+    annotationMasks: {},
 
     // Class management
     classes: ['object'],
     selectedClass: 'object',
     instanceId: 1,
     classColors: {},       // className → [r, g, b]
+
+    // Which SAM backend is active — set by loadModelInfo() from /api/info.
+    // false = Sam3Model (concept model, text+boxes only, no native points)
+    // true  = Sam3TrackerModel (interactive, native points, no negative boxes)
+    useTracker: false,
 
     // Prompt
     promptType: 'points',  // 'points' | 'boxes' | 'text' | 'mixed' | 'points_boxes'
@@ -57,6 +64,18 @@ const _me = {
 
     // Polarity of the box/point currently being drawn (1 = positive, 0 = negative)
     boxPolarity: 1,
+
+    // ── Zoom / pan ─────────────────────────────────────────────────────────
+    // CSS transform on .canvas-stack; canvasCoords() uses getBoundingClientRect()
+    // so coordinate conversion stays correct at any zoom level.
+    zoom: 1,
+    panX: 0,
+    panY: 0,
+    isPanning: false,
+    _panAnchorX: 0,
+    _panAnchorY: 0,
+    _panStartX: 0,
+    _panStartY: 0,
 };
 
 // ── Module-level vars ──────────────────────────────────────────────────────
@@ -67,6 +86,199 @@ let imageCanvas, overlayCanvas, imageCtx, overlayCtx;
 let _pxDown = null;
 
 function $id(id) { return document.getElementById(id); }
+
+// ── Zoom / pan ─────────────────────────────────────────────────────────────
+
+/**
+ * Clamp panX/panY using standard image-viewer rules:
+ *  - If the canvas is larger than the scroll container on an axis, clamp so
+ *    the canvas edge never retreats past the container edge (no black border).
+ *  - If the canvas is smaller, lock pan to 0 on that axis (keep it centered).
+ */
+function _clampPan() {
+    const scrollEl = document.querySelector('.canvas-scroll');
+    if (!scrollEl || !imageCanvas.offsetWidth) return;
+
+    const scrollW = scrollEl.clientWidth;
+    const scrollH = scrollEl.clientHeight;
+    // Natural (pre-transform) CSS layout size of the canvas-stack
+    const nW = imageCanvas.offsetWidth;
+    const nH = imageCanvas.offsetHeight;
+
+    // Half-extents of the canvas in screen pixels at current zoom
+    const halfW = (nW / 2) * _me.zoom;
+    const halfH = (nH / 2) * _me.zoom;
+    const halfSW = scrollW / 2;
+    const halfSH = scrollH / 2;
+
+    // X axis
+    if (halfW > halfSW) {
+        // Canvas wider than container: clamp so neither edge shows a gap
+        const limit = halfW - halfSW;
+        _me.panX = Math.max(-limit, Math.min(limit, _me.panX));
+    } else {
+        _me.panX = 0;
+    }
+
+    // Y axis
+    if (halfH > halfSH) {
+        const limit = halfH - halfSH;
+        _me.panY = Math.max(-limit, Math.min(limit, _me.panY));
+    } else {
+        _me.panY = 0;
+    }
+}
+
+function _applyTransform() {
+    _clampPan();
+    const stack = document.querySelector('.canvas-stack');
+    if (stack) {
+        stack.style.transform = `translate(${_me.panX}px,${_me.panY}px) scale(${_me.zoom})`;
+    }
+    _updateCanvasInfo();
+}
+
+function _resetView() {
+    _me.zoom = 1;
+    _me.panX = 0;
+    _me.panY = 0;
+    _applyTransform();
+}
+
+/** Update the right-side info chip in the status bar. */
+function _updateCanvasInfo() {
+    const el = $id('canvas-info');
+    if (!el) return;
+    const parts = [];
+    if (imageCanvas && imageCanvas.width && imageCanvas.height) {
+        parts.push(`${imageCanvas.width}\u00d7${imageCanvas.height}`);
+    }
+    parts.push(`${Math.round(_me.zoom * 100)}%`);
+    el.textContent = parts.join(' · ');
+}
+
+// ── Wheel: Ctrl+scroll → zoom, plain scroll → pan ─────────────────────────
+function _onScrollWheel(e) {
+    e.preventDefault();
+    const scrollEl = document.querySelector('.canvas-scroll');
+    const scrollRect = scrollEl.getBoundingClientRect();
+    // Natural center of .canvas-stack (flex-centered, no transform)
+    const cx0 = scrollRect.left + scrollRect.width  / 2;
+    const cy0 = scrollRect.top  + scrollRect.height / 2;
+
+    if (e.ctrlKey) {
+        // Zoom toward cursor
+        const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+        const s  = _me.zoom;
+        const s1 = Math.max(0.1, Math.min(15, s * factor));
+        if (s !== 0) {
+            _me.panX = (e.clientX - cx0) * (1 - s1 / s) + _me.panX * (s1 / s);
+            _me.panY = (e.clientY - cy0) * (1 - s1 / s) + _me.panY * (s1 / s);
+        }
+        _me.zoom = s1;
+    } else {
+        // Pan: vertical scroll moves Y, horizontal (trackpad / shift+scroll) moves X
+        _me.panX -= e.deltaX;
+        _me.panY -= e.deltaY;
+    }
+    _applyTransform();
+}
+
+// ── Middle-mouse-button drag → pan ─────────────────────────────────────────
+function _onScrollMouseDown(e) {
+    if (e.button !== 1) return;
+    e.preventDefault();
+    _me.isPanning    = true;
+    _me._panAnchorX  = e.clientX;
+    _me._panAnchorY  = e.clientY;
+    _me._panStartX   = _me.panX;
+    _me._panStartY   = _me.panY;
+    const scrollEl = document.querySelector('.canvas-scroll');
+    if (scrollEl) scrollEl.style.cursor = 'grabbing';
+}
+
+function _onScrollMouseMove(e) {
+    if (!_me.isPanning) return;
+    _me.panX = _me._panStartX + (e.clientX - _me._panAnchorX);
+    _me.panY = _me._panStartY + (e.clientY - _me._panAnchorY);
+    _applyTransform();
+}
+
+function _onScrollMouseUp() {
+    if (!_me.isPanning) return;
+    _me.isPanning = false;
+    const scrollEl = document.querySelector('.canvas-scroll');
+    if (scrollEl) scrollEl.style.cursor = '';
+}
+
+// ── Model info ─────────────────────────────────────────────────────────────
+async function loadModelInfo() {
+    try {
+        const resp = await fetch('/api/info');
+        const data = await resp.json();
+        _me.useTracker = !!data.use_tracker;
+        const el = $id('model-info');
+        if (el) {
+            const name    = (data.model_id || 'unknown').split('/').pop();
+            const tracker = _me.useTracker ? ' · tracker' : '';
+            el.textContent = `Model: ${name}${tracker}`;
+        }
+    } catch { /* non-critical — leave default text */ }
+    _updatePromptAvailability();
+}
+
+/**
+ * Grey out prompt-type radio buttons that are unsupported by the active model
+ * and annotate them with a hover tooltip explaining the limitation and fix.
+ *
+ * Sam3Model (useTracker=false):
+ *   - No native point support. Sam3Processor accepts only text and boxes.
+ *     Points are approximated as tiny micro-boxes, giving unreliable results.
+ *   → Disables: "points", "points_boxes"
+ *
+ * Sam3TrackerModel (useTracker=true):
+ *   - No negative-box support. Sam3TrackerProcessor has no box-label argument;
+ *     negative boxes are silently dropped.
+ *   → Warns at draw-time (not disabled here — positive boxes still work).
+ */
+function _updatePromptAvailability() {
+    // Per-mode limitation messages (null = available).
+    const SAM3_WARNINGS = {
+        points:
+            'Not available with Sam3Model.\n\n' +
+            'Sam3Processor has no native point input — clicks are converted to tiny ' +
+            'bounding boxes internally, which gives unreliable results.\n\n' +
+            'Fix: set USE_TRACKER=1 to load Sam3TrackerModel, which has native point support.',
+        points_boxes:
+            'Not available with Sam3Model.\n\n' +
+            'The point half of this mode is unsupported (Sam3Processor has no native ' +
+            'input_points argument). Only boxes would reach the model.\n\n' +
+            'Fix: set USE_TRACKER=1, or use the "Boxes" mode directly.',
+    };
+
+    document.querySelectorAll('input[name="prompt-type"]').forEach(radio => {
+        const label = radio.closest('label') || radio.parentElement;
+        const warning = !_me.useTracker ? (SAM3_WARNINGS[radio.value] || null) : null;
+
+        if (warning) {
+            radio.disabled = true;
+            label.classList.add('prompt-unavailable');
+            label.title = warning;
+            // If this mode is currently selected, fall back to boxes.
+            if (_me.promptType === radio.value) {
+                const fallback = document.querySelector('input[name="prompt-type"][value="boxes"]');
+                if (fallback) {
+                    fallback.checked = true;
+                    _me.promptType = 'boxes';
+                }
+            }
+        } else {
+            radio.disabled = false;
+            label.classList.remove('prompt-unavailable');
+            label.title = '';
+        }
+    });
+}
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
@@ -116,14 +328,30 @@ document.addEventListener('DOMContentLoaded', () => {
         _me.filterByPrompt = e.target.checked;
     });
 
-    // Re-fit canvas when the window is resized
-    window.addEventListener('resize', fitCanvasToContainer);
+    // Re-fit canvas when the window is resized (also resets view)
+    window.addEventListener('resize', () => { fitCanvasToContainer(); _resetView(); });
+
+    // Zoom / pan on the scroll container
+    const scrollEl = document.querySelector('.canvas-scroll');
+    scrollEl.addEventListener('wheel',     _onScrollWheel,     { passive: false });
+    scrollEl.addEventListener('mousedown', _onScrollMouseDown);
+    scrollEl.addEventListener('mousemove', _onScrollMouseMove);
+    scrollEl.addEventListener('mouseup',   _onScrollMouseUp);
+    scrollEl.addEventListener('mouseleave', _onScrollMouseUp);
+
+    // Reset view button + Ctrl+0 keyboard shortcut
+    $id('reset-view-btn').addEventListener('click', _resetView);
+    window.addEventListener('keydown', e => {
+        if (e.ctrlKey && e.key === '0') { e.preventDefault(); _resetView(); }
+    });
 
     loadClasses();
     loadImageList();
+    loadModelInfo();
 });
 
 function setStatus(msg) {
+    // status-bar is now a <span> inside the .status-bar container
     $id('status-bar').textContent = msg;
 }
 
@@ -177,6 +405,7 @@ async function loadImage(relPath) {
     _me.annotations           = [];
     _me.highlightedAnnotation = null;
 
+    _me.annotationMasks = {};
     clearOverlay();
     $id('mask-prev-container').innerHTML = '';
     $id('annotation-list').innerHTML = '';
@@ -190,8 +419,9 @@ async function loadImage(relPath) {
             overlayCanvas.width  = img.naturalWidth;
             overlayCanvas.height = img.naturalHeight;
             imageCtx.drawImage(img, 0, 0);
-            // Scale the CSS display size to fill the available area
+            // Scale the CSS display size to fill the available area, then reset view
             fitCanvasToContainer();
+            _resetView();
             resolve();
         };
         img.onerror = reject;
@@ -305,6 +535,8 @@ function _clearHighlightedAnnotation() {
 
 // ── Mouse event dispatch ───────────────────────────────────────────────────
 function onMouseDown(e) {
+    if (e.button === 1) return;  // middle-mouse handled by canvas-scroll pan handler
+
     if (_me.promptType === 'points') {
         onPointMouseDown(e);
         return;
@@ -326,6 +558,15 @@ function onMouseDown(e) {
         _me.boxPolarity = 1;
     } else if (e.button === 2) {
         _me.boxPolarity = 0;
+        // Sam3TrackerModel has no negative-box API — warn and block right-drag.
+        if (_me.useTracker) {
+            setStatus(
+                '⚠ Negative boxes are not supported by Sam3TrackerModel ' +
+                '(Sam3TrackerProcessor has no box-label argument — they would be silently dropped). ' +
+                'Use right-click point prompts in "Points" or "Points + Boxes" mode to exclude regions.'
+            );
+            return;
+        }
     } else {
         return;
     }
@@ -590,13 +831,16 @@ function clearOverlay() {
 function redrawOverlay() {
     clearOverlay();
 
-    // 1. Render all returned masks simultaneously, then mark the selected one
+    // 1. Render all saved annotation masks as background layer
+    renderAllAnnotationMasks();
+
+    // 2. Render SAM-returned masks on top (if any are active)
     if (_me.currentMasks.length > 0) {
         renderAllMasks();
         drawSelectedMaskMarker();
     }
 
-    // 2. Draw prompts on top
+    // 3. Draw prompts on top
     const type = _me.promptType;
     if (type === 'points') {
         drawPoints();
@@ -606,6 +850,58 @@ function redrawOverlay() {
     } else {
         drawBoxes();
     }
+}
+
+function renderAllAnnotationMasks() {
+    if (_me.annotations.length === 0) return;
+    const keys = Object.keys(_me.annotationMasks);
+    if (keys.length === 0) return;
+
+    // Determine canvas dimensions from the first available mask
+    const firstMask = _me.annotationMasks[keys[0]];
+    const H = firstMask.length;
+    const W = H > 0 ? firstMask[0].length : 0;
+    if (!H || !W) return;
+
+    const imgData = overlayCtx.createImageData(W, H);
+    const buf     = imgData.data;
+
+    for (const ann of _me.annotations) {
+        const key  = `${ann.class}:${ann.instance_id}`;
+        const mask = _me.annotationMasks[key];
+        if (!mask) continue;
+        const [r, g, b] = classColor(ann.class);
+        const isHighlighted = _me.highlightedAnnotation &&
+            _me.highlightedAnnotation.class === ann.class &&
+            _me.highlightedAnnotation.instance_id === ann.instance_id;
+        const alpha = isHighlighted ? 170 : 80;
+
+        for (let row = 0; row < H; row++) {
+            const maskRow = mask[row];
+            const rowBase = row * W * 4;
+            for (let col = 0; col < W; col++) {
+                if (maskRow[col]) {
+                    const i = rowBase + col * 4;
+                    // Alpha-composite: new color over whatever is already in buf
+                    const bgA   = buf[i + 3] / 255;
+                    const fgA   = alpha / 255;
+                    const outA  = fgA + bgA * (1 - fgA);
+                    if (outA > 0) {
+                        buf[i]     = Math.round((r * fgA + buf[i]     * bgA * (1 - fgA)) / outA);
+                        buf[i + 1] = Math.round((g * fgA + buf[i + 1] * bgA * (1 - fgA)) / outA);
+                        buf[i + 2] = Math.round((b * fgA + buf[i + 2] * bgA * (1 - fgA)) / outA);
+                        buf[i + 3] = Math.round(outA * 255);
+                    }
+                }
+            }
+        }
+    }
+    // Use drawImage so subsequent layers (SAM masks, prompts) can composite on top
+    const tmp = document.createElement('canvas');
+    tmp.width  = W;
+    tmp.height = H;
+    tmp.getContext('2d').putImageData(imgData, 0, 0);
+    overlayCtx.drawImage(tmp, 0, 0);
 }
 
 function renderAllMasks() {
@@ -637,7 +933,12 @@ function renderAllMasks() {
             }
         }
     }
-    overlayCtx.putImageData(imgData, 0, 0);
+    // Use drawImage so annotation masks drawn before are not wiped
+    const tmp = document.createElement('canvas');
+    tmp.width  = W;
+    tmp.height = H;
+    tmp.getContext('2d').putImageData(imgData, 0, 0);
+    overlayCtx.drawImage(tmp, 0, 0);
 }
 
 // Draw an X at the bounding-box centre of the selected mask.
@@ -907,6 +1208,25 @@ async function loadAnnotations() {
     }
     renderAnnotationList();
     updateInstanceId();
+    _me.annotationMasks = {};
+    await loadAllAnnotationMasks();
+}
+
+async function loadAllAnnotationMasks() {
+    if (!_me.currentImagePath || _me.annotations.length === 0) return;
+    const imagePath = _me.currentImagePath;
+    await Promise.all(_me.annotations.map(async ann => {
+        const key = `${ann.class}:${ann.instance_id}`;
+        try {
+            const params = new URLSearchParams({ class_name: ann.class, instance_id: ann.instance_id });
+            const resp = await fetch(`/api/annotation/mask/${imagePath}?${params}`);
+            if (resp.ok) {
+                const data = await resp.json();
+                _me.annotationMasks[key] = decodeMaskRLE(data.mask.shape, data.mask.rle);
+                redrawOverlay();
+            }
+        } catch { /* mask load failure is non-fatal */ }
+    }));
 }
 
 function renderAnnotationList() {
@@ -931,17 +1251,14 @@ function renderAnnotationList() {
     }
 }
 
-async function selectAnnotation(ann) {
-    // If already highlighted, deselect and clear overlay
+function selectAnnotation(ann) {
+    // Toggle: clicking the already-highlighted annotation deselects it
     if (_me.highlightedAnnotation &&
         _me.highlightedAnnotation.class === ann.class &&
         _me.highlightedAnnotation.instance_id === ann.instance_id) {
         _me.highlightedAnnotation = null;
-        _me.currentMasks    = [];
-        _me.selectedMaskIdx = 0;
-        clearOverlay();
-        $id('mask-prev-container').innerHTML = '';
         renderAnnotationList();
+        redrawOverlay();
         setStatus('Annotation deselected');
         return;
     }
@@ -953,32 +1270,15 @@ async function selectAnnotation(ann) {
     _me.instanceId = ann.instance_id;
     $id('instance-id-input').value = ann.instance_id;
 
-    // Clear active prompts so the canvas shows only the saved mask
-    _me.boxes        = [];
-    _me.boxLabels    = [];
-    _me.points       = [];
-    _me.promptStack  = [];
+    // Clear any active SAM results so the canvas focuses on saved masks
+    _me.currentMasks    = [];
+    _me.selectedMaskIdx = 0;
     $id('mask-prev-container').innerHTML = '';
 
-    setStatus('Loading mask…');
-    try {
-        const params = new URLSearchParams({ class_name: ann.class, instance_id: ann.instance_id });
-        const resp = await fetch(`/api/annotation/mask/${_me.currentImagePath}?${params}`);
-        if (!resp.ok) {
-            setStatus('Failed to load mask');
-            return;
-        }
-        const data = await resp.json();
-        _me.currentMasks          = [decodeMaskRLE(data.mask.shape, data.mask.rle)];
-        _me.selectedMaskIdx       = 0;
-        _me.highlightedAnnotation = { class: ann.class, instance_id: ann.instance_id };
-        renderAnnotationList();
-        redrawOverlay();
-        setStatus(`Showing mask: ${ann.class} #${ann.instance_id}`);
-    } catch (err) {
-        setStatus('Network error loading mask');
-        console.error('[mask_editor] mask load error:', err);
-    }
+    _me.highlightedAnnotation = { class: ann.class, instance_id: ann.instance_id };
+    renderAnnotationList();
+    redrawOverlay();
+    setStatus(`Highlighting: ${ann.class} #${ann.instance_id}`);
 }
 
 async function deleteAnnotation(ann) {
