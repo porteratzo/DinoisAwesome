@@ -49,6 +49,7 @@ select = ["E", "F", "I", "UP"]
 
 [tool.ruff.lint.per-file-ignores]
 "notebooks/*.ipynb" = ["E402"]
+"experiments/*.py" = ["E402"]
 
 [tool.mypy]
 python_version = "3.10"

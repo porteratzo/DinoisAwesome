@@ -200,8 +200,10 @@ class KeypointHead:
         if not target_labels:
             return []
 
-        ref_embs = {lbl: self._get_label_emb(lbl) for lbl in target_labels}
-        ref_embs = {lbl: emb for lbl, emb in ref_embs.items() if emb is not None}
+        _raw_embs = {lbl: self._get_label_emb(lbl) for lbl in target_labels}
+        ref_embs: dict[str, torch.Tensor] = {
+            lbl: emb for lbl, emb in _raw_embs.items() if emb is not None
+        }
         if not ref_embs:
             return []
 
