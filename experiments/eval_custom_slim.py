@@ -1,22 +1,19 @@
 # %% [markdown]
 # # SAM3 + DINO Custom Slim Evaluation
 #
-# End-to-end walkthrough of the `eval_custom_slim` pipeline: SAM3 (text-prompted) proposes
-# candidate masks; DINO patch features rank them against an exemplar; ground-truth IoU measures quality.
+# End-to-end walkthrough of the `eval_custom_slim` pipeline:
+# SAM3 (text-prompted) proposes candidate masks; DINO patch features rank them
+# against an exemplar; ground-truth IoU measures quality.
 #
-# | Step | What happens |
-# |------|--------------|
-# | 0 | Load `custom_slim` images and `_mask_good.npz` GT masks |
-# | 1 | Extract DINO features from the exemplar image + GT mask |
-# | 2 | SAM3 text-prompt generates candidate instance masks per image |
-# | 3 | DINO pre-filter (cosine similarity) discards low-confidence candidates |
-# | 4 | Three scoring methods (M1 global / M2 patch-cross / M3 cluster) rank survivors |
-# | 5 | Precision-Recall, ROC, IoU histogram, and score-distribution plots |
-#
-# **No local SAM checkpoint needed** — the model is downloaded from HuggingFace Hub on first use.
+# Steps:
+#   0. Load `custom_slim` images and `_mask_good.npz` GT masks
+#   1. Extract DINO features from the exemplar image + GT mask
+#   2. SAM3 text-prompt generates candidate instance masks per image
+#   3. DINO pre-filter (cosine similarity) discards low-confidence candidates
+#   4. Three scoring methods (M1 global / M2 patch-cross / M3 cluster) rank survivors
+#   5. Precision-Recall, ROC, IoU histogram, and score-distribution plots
 
-# %%
-# ── logging BEFORE any torch / transformers import ─────────────────────────
+# %% Logging — must be before any torch / transformers import
 import logging
 
 logging.basicConfig(
@@ -27,7 +24,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# %%
+# %% Imports
 import os
 import sys
 import time
@@ -36,21 +33,16 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import numpy as np
 from dotenv import load_dotenv
 from PIL import Image
 
-load_dotenv(Path("../../../.env"))
+_REPO_ROOT = Path(__file__).parent.parent
+load_dotenv(_REPO_ROOT / ".env")
+sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 
 import torch
-import torch.nn.functional as F
-from dinoisawesome import DinoEncoder
-
-# ── pipeline helpers from the scripts directory ────────────────────────────
-_SCRIPTS = Path("").resolve()
-sys.path.insert(0, str(_SCRIPTS))
-from eval_sam_dino import (  # noqa: E402
+from eval_sam_dino import (
     ExemplarFeatures,
     _bbox_from_mask,
     _cosine_sim,
@@ -64,71 +56,58 @@ from eval_sam_dino import (  # noqa: E402
     score_method3,
 )
 
+from dinoisawesome import DinoEncoder
+
 log.info("Imports OK — torch %s", torch.__version__)
 
-# %%
-# ── Dataset ───────────────────────────────────────────────────────────────
-DATA_DIR = Path("../data/custom_slim")
-EXEMPLAR_STEM = None  # None → first sample alphabetically
-OUTPUT_DIR = Path("../results/custom_slim_nb")
+# %% Parameters
+DATA_DIR = _REPO_ROOT / "data" / "custom_slim"
+EXEMPLAR_STEM: str | None = None  # None → first sample alphabetically
+OUTPUT_DIR = _REPO_ROOT / "results" / "custom_slim_nb"
 
-# ── DINO encoder ──────────────────────────────────────────────────────────
 DINO_VERSION = "v3"
 DINO_SIZE = "base"
 IMG_SIZE = 448
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 AMP = True
 
-# ── Pipeline thresholds ───────────────────────────────────────────────────
 PREFILT_THRESHOLD = 0.3
 N_CLUSTERS = 4
 IOU_THRESHOLD = 0.5
 SCORE_THRESHOLD = 0.5
 
-# ── SAM3 (HuggingFace transformers) ──────────────────────────────────────
 SAM_MODEL_ID = "facebook/sam3"
-TEXT_PROMPT = "object"  # e.g. "spectacle frame"
+TEXT_PROMPT = "object"
 SAM_SCORE_THRESHOLD = 0.5
 SAM_MASK_THRESHOLD = 0.5
 NMS_IOU_THRESHOLD = 0.70
 MIN_AREA_FRAC = 0.001
-SAM_INPUT_SIZE = None  # e.g. 1024 to cap VRAM on large images
+SAM_INPUT_SIZE: int | None = None
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 log.info("Output → %s", OUTPUT_DIR.resolve())
 log.info("Device  : %s", DEVICE)
 
-# %% [markdown]
-# ## SAMSegmenter + HFSAMTextGenerator
-#
-# `SAMSegmenter` wraps the HuggingFace SAM3 (or SAM2 fallback) and exposes two prompt modes:
-# point-based and text-based.  `HFSAMTextGenerator` wraps the text mode and adds area filtering
-# and greedy mask-IoU NMS, producing the `{segmentation, bbox}` dict list expected by the
-# evaluation loop.
+# %% SAMSegmenter definition
 
 
-# %%
-def _to_pil_rgb(image):
+def _to_pil_rgb(image: Any) -> Image.Image:
     if isinstance(image, np.ndarray):
         return Image.fromarray(image).convert("RGB")
     return image.convert("RGB")
 
 
 class SAMSegmenter:
-    """HuggingFace SAM3 (SAM2 fallback) wrapper.
+    """HuggingFace SAM3 (SAM2 fallback) wrapper. Model is downloaded on first use."""
 
-    The model is downloaded from HuggingFace Hub on first use.
-    SAM3 classes are tried first; SAM2 classes are used as a fallback.
-    """
-
-    def __init__(self, model_id=SAM_MODEL_ID, device=None):
+    def __init__(self, model_id: str = SAM_MODEL_ID, device: str | None = None) -> None:
         self._model_id = model_id
         self._device = device or DEVICE
         self._dtype = torch.bfloat16 if self._device.startswith("cuda") else torch.float32
         self._model = None
         self._processor = None
 
-    def _to_device(self, inputs):
+    def _to_device(self, inputs: dict) -> dict:
         return {
             k: (
                 v.to(device=self._device, dtype=self._dtype)
@@ -138,7 +117,7 @@ class SAMSegmenter:
             for k, v in inputs.items()
         }
 
-    def _ensure_loaded(self):
+    def _ensure_loaded(self) -> None:
         if self._model is not None:
             return
         token = os.environ.get("HF_TOKEN") or None
@@ -162,7 +141,13 @@ class SAMSegmenter:
             log.info("SAM2 ready (fallback).")
         self._model.eval()
 
-    def segment_with_text(self, image, text, score_threshold=0.5, mask_threshold=0.5):
+    def segment_with_text(
+        self,
+        image: Any,
+        text: str,
+        score_threshold: float = 0.5,
+        mask_threshold: float = 0.5,
+    ) -> list[dict]:
         """Return [{mask: bool[H,W], score: float}, …] sorted by score desc."""
         self._ensure_loaded()
         pil = _to_pil_rgb(image)
@@ -189,25 +174,25 @@ class SAMSegmenter:
 
 log.info("SAMSegmenter defined.")
 
+# %% HFSAMTextGenerator definition
 
-# %%
+
 class HFSAMTextGenerator:
     """Wraps SAMSegmenter text-prompt mode with area filtering and greedy mask-IoU NMS.
 
-    Produces ``[{"segmentation": bool[H,W], "bbox": [x,y,w,h], "predicted_iou": float}, …]``
-    — the format expected by the DINO evaluation loop.
+    Produces [{segmentation: bool[H,W], bbox: [x,y,w,h], predicted_iou: float}, …].
     """
 
     def __init__(
         self,
-        segmenter,
-        text_prompt=TEXT_PROMPT,
-        score_threshold=SAM_SCORE_THRESHOLD,
-        mask_threshold=SAM_MASK_THRESHOLD,
-        nms_iou_threshold=NMS_IOU_THRESHOLD,
-        min_area_frac=MIN_AREA_FRAC,
-        sam_input_size=SAM_INPUT_SIZE,
-    ):
+        segmenter: SAMSegmenter,
+        text_prompt: str = TEXT_PROMPT,
+        score_threshold: float = SAM_SCORE_THRESHOLD,
+        mask_threshold: float = SAM_MASK_THRESHOLD,
+        nms_iou_threshold: float = NMS_IOU_THRESHOLD,
+        min_area_frac: float = MIN_AREA_FRAC,
+        sam_input_size: int | None = SAM_INPUT_SIZE,
+    ) -> None:
         self._seg = segmenter
         self._text_prompt = text_prompt
         self._score_threshold = score_threshold
@@ -217,16 +202,15 @@ class HFSAMTextGenerator:
         self._sam_input_size = sam_input_size
 
     @staticmethod
-    def _mask_iou(a, b):
+    def _mask_iou(a: np.ndarray, b: np.ndarray) -> float:
         inter = int((a & b).sum())
         union = int((a | b).sum())
         return inter / union if union else 0.0
 
-    def generate(self, image):
+    def generate(self, image: np.ndarray) -> list[dict]:
         H, W = image.shape[:2]
         min_area = int(H * W * self._min_area_frac)
 
-        # ── optional downscale to reduce VRAM ─────────────────────────────
         if self._sam_input_size is not None and max(H, W) > self._sam_input_size:
             scale = self._sam_input_size / max(H, W)
             sam_h, sam_w = int(H * scale), int(W * scale)
@@ -242,7 +226,6 @@ class HFSAMTextGenerator:
             mask_threshold=self._mask_threshold,
         )
 
-        # ── upsample masks if image was downscaled ─────────────────────────
         if sam_image is not image:
             upsampled = []
             for r in raw_results:
@@ -252,7 +235,6 @@ class HFSAMTextGenerator:
                 upsampled.append({"mask": np.array(m_pil) > 127, "score": r["score"]})
             raw_results = upsampled
 
-        # ── area filter ────────────────────────────────────────────────────
         raw = [(r["mask"], r["score"]) for r in raw_results if r["mask"].sum() >= min_area]
         if not raw:
             log.warning(
@@ -262,7 +244,6 @@ class HFSAMTextGenerator:
             )
             return []
 
-        # ── greedy mask-IoU NMS ────────────────────────────────────────────
         raw.sort(key=lambda t: t[1], reverse=True)
         kept = []
         for mask, score in raw:
@@ -284,11 +265,9 @@ class HFSAMTextGenerator:
 
 log.info("HFSAMTextGenerator defined.")
 
-# %% [markdown]
-# ## Step 0 — Dataset
+# %% Step 0 — Dataset
 
 
-# %%
 @dataclass
 class Sample:
     stem: str
@@ -299,12 +278,8 @@ class Sample:
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
-def load_dataset(data_dir):
-    """Load all image + ``_mask_good.npz`` pairs from *data_dir*.
-
-    GT masks are stored at 768×768 and rescaled to the image's native
-    resolution with nearest-neighbour interpolation.
-    """
+def load_dataset(data_dir: Path) -> list[Sample]:
+    """Load all image + `_mask_good.npz` pairs from *data_dir*."""
     samples = []
     for img_path in sorted(data_dir.iterdir()):
         if img_path.suffix.lower() not in _IMAGE_EXTS:
@@ -326,7 +301,6 @@ def load_dataset(data_dir):
 
 samples = load_dataset(DATA_DIR)
 
-# ── pick exemplar ──────────────────────────────────────────────────────────
 if EXEMPLAR_STEM is not None:
     ex_idx = next(i for i, s in enumerate(samples) if s.stem == EXEMPLAR_STEM)
 else:
@@ -335,8 +309,7 @@ exemplar_sample = samples[ex_idx]
 inference_samples = [s for i, s in enumerate(samples) if i != ex_idx]
 log.info("Exemplar: %s  |  Inference set: %d images", exemplar_sample.stem, len(inference_samples))
 
-# %%
-# ── visualise dataset sample ───────────────────────────────────────────────
+# %% Visualise dataset sample
 n_show = min(6, len(samples))
 fig, axes = plt.subplots(2, n_show, figsize=(3 * n_show, 6))
 if n_show == 1:
@@ -346,7 +319,6 @@ for col, s in enumerate(samples[:n_show]):
     axes[0, col].imshow(s.image)
     axes[0, col].set_title(s.stem, fontsize=7)
     axes[0, col].axis("off")
-    # overlay GT mask in green
     overlay = s.image.copy()
     overlay[s.gt_mask] = (
         (overlay[s.gt_mask] * 0.4 + np.array([0, 200, 80]) * 0.6).clip(0, 255).astype(np.uint8)
@@ -359,14 +331,7 @@ fig.suptitle(f"Dataset — {len(samples)} samples  (exemplar: {exemplar_sample.s
 fig.tight_layout()
 plt.show()
 
-# %% [markdown]
-# ## Step 1 — DINO Encoder + Exemplar Features
-#
-# `process_exemplar` runs the exemplar image through the DINO encoder, applies the GT mask to
-# select object patches, and builds three representations: a mean prototype, the full set of
-# masked patch vectors, and (optionally) K-means cluster prototypes.
-
-# %%
+# %% Step 1 — DINO Encoder + Exemplar Features
 encoder = DinoEncoder(
     version=DINO_VERSION,
     size=DINO_SIZE,
@@ -378,7 +343,7 @@ encoder = DinoEncoder(
 )
 log.info("Encoder: DINO%s-%s  img_size=%d  device=%s", DINO_VERSION, DINO_SIZE, IMG_SIZE, DEVICE)
 
-# %%
+# %% Compute exemplar features
 n_clusters_arg = N_CLUSTERS if N_CLUSTERS > 1 else None
 
 log.info("Processing exemplar …")
@@ -388,36 +353,25 @@ exemplar_feats: ExemplarFeatures = process_exemplar(
     exemplar_sample.gt_mask,
     n_clusters=n_clusters_arg,
 )
-log.info(
-    "Exemplar  prototype shape : %s",
-    exemplar_feats.prototype.shape,
-)
-log.info(
-    "Exemplar  patches shape   : %s",
-    exemplar_feats.patches.shape,
-)
+log.info("Exemplar  prototype shape : %s", exemplar_feats.prototype.shape)
+log.info("Exemplar  patches shape   : %s", exemplar_feats.patches.shape)
 if exemplar_feats.cluster_prototypes is not None:
     log.info("Cluster prototypes shape  : %s", exemplar_feats.cluster_prototypes.shape)
 
-# %%
-# ── visualise exemplar: image, GT mask, patch-level similarity map ─────────
+# %% Visualise exemplar
 ex_patches = encoder([exemplar_sample.image]).patches[0].cpu().numpy()  # (Hg, Wg, D)
 Hg, Wg, D = ex_patches.shape
 flat = ex_patches.reshape(-1, D)
 proto = exemplar_feats.prototype
-sim_flat = (
-    flat @ proto / (np.linalg.norm(flat, axis=1, keepdims=True) * np.linalg.norm(proto) + 1e-8)
-)
+norms = np.linalg.norm(flat, axis=1, keepdims=True) * np.linalg.norm(proto) + 1e-8
+sim_flat = flat @ proto / norms
 sim_map = sim_flat.reshape(Hg, Wg)
 
 fig, axes = plt.subplots(1, 3, figsize=(13, 4))
-
-# raw exemplar
 axes[0].imshow(exemplar_sample.image)
 axes[0].set_title("Exemplar image")
 axes[0].axis("off")
 
-# GT mask overlay
 overlay = exemplar_sample.image.copy()
 overlay[exemplar_sample.gt_mask] = (
     (overlay[exemplar_sample.gt_mask] * 0.4 + np.array([0, 200, 80]) * 0.6)
@@ -428,7 +382,6 @@ axes[1].imshow(overlay)
 axes[1].set_title("GT mask (green)")
 axes[1].axis("off")
 
-# cosine similarity map against exemplar prototype
 im = axes[2].imshow(sim_map, cmap="RdYlGn", vmin=-0.2, vmax=1.0)
 plt.colorbar(im, ax=axes[2], fraction=0.046)
 axes[2].set_title("Patch cosine sim vs. exemplar prototype")
@@ -438,13 +391,7 @@ fig.suptitle(f"Exemplar: {exemplar_sample.stem}", fontsize=10)
 fig.tight_layout()
 plt.show()
 
-# %% [markdown]
-# ## Step 2 — SAM3 Mask Generator
-#
-# Initialise `SAMSegmenter` (lazy — model loads on first `generate()` call) and wrap it in
-# `HFSAMTextGenerator`.  Run on one inference image to preview the candidate masks before scoring.
-
-# %%
+# %% Step 2 — SAM3 Mask Generator
 segmenter = SAMSegmenter(model_id=SAM_MODEL_ID, device=DEVICE)
 mask_generator = HFSAMTextGenerator(
     segmenter,
@@ -463,8 +410,7 @@ log.info(
     NMS_IOU_THRESHOLD,
 )
 
-# %%
-# ── demo: run SAM3 on the first inference image ────────────────────────────
+# %% Demo: SAM3 on first inference image
 demo_sample = inference_samples[0]
 log.info("Demo SAM3 on: %s", demo_sample.stem)
 
@@ -472,24 +418,22 @@ t0 = time.perf_counter()
 demo_masks = mask_generator.generate(demo_sample.image)
 log.info("SAM3 → %d candidates (%.2fs)", len(demo_masks), time.perf_counter() - t0)
 
-# ── plot raw SAM candidates ────────────────────────────────────────────────
 n_show_masks = min(8, len(demo_masks))
 cols = min(4, n_show_masks)
-rows = (n_show_masks + cols - 1) // cols
+rows = max(1, (n_show_masks + cols - 1) // cols)
 
 fig, axes = plt.subplots(rows, cols, figsize=(4 * cols, 3.5 * rows))
 axes_flat = np.array(axes).flatten()
-
-cmap = plt.get_cmap("tab10")
+cmap_demo = plt.get_cmap("tab10")
 
 for idx, m in enumerate(demo_masks[:n_show_masks]):
     ax = axes_flat[idx]
-    overlay = demo_sample.image.copy()
-    colour = (np.array(cmap(idx % 10)[:3]) * 200).astype(np.uint8)
-    overlay[m["segmentation"]] = (
-        (overlay[m["segmentation"]] * 0.4 + colour * 0.6).clip(0, 255).astype(np.uint8)
+    ovl = demo_sample.image.copy()
+    colour = (np.array(cmap_demo(idx % 10)[:3]) * 200).astype(np.uint8)
+    ovl[m["segmentation"]] = (
+        (ovl[m["segmentation"]] * 0.4 + colour * 0.6).clip(0, 255).astype(np.uint8)
     )
-    ax.imshow(overlay)
+    ax.imshow(ovl)
     ax.set_title(f"candidate {idx}  score={m['predicted_iou']:.2f}", fontsize=8)
     ax.axis("off")
 
@@ -500,22 +444,10 @@ fig.suptitle(f"SAM3 candidates — {demo_sample.stem}  (prompt: {TEXT_PROMPT!r})
 fig.tight_layout()
 plt.show()
 
-# %% [markdown]
-# ## Step 3 — DINO Scoring on a Single Image
-#
-# For each SAM candidate that passes the cosine-similarity pre-filter, three scoring methods are
-# applied.  The candidate with the highest score per method should correspond to the target object.
-#
-# | Method | Description |
-# |--------|-------------|
-# | M1 — Global | Mean cosine similarity of candidate patches vs. exemplar prototype |
-# | M2 — PatchCross | Mean of best-match similarities: each candidate patch vs. all exemplar patches |
-# | M3 — Cluster | Mean cosine similarity vs. K-means cluster centroids (requires `N_CLUSTERS > 1`) |
+# %% Step 3 — DINO Scoring helpers
 
 
-# %%
-def mask_iou(a, b):
-    """Intersection-over-Union between two boolean masks of the same shape."""
+def mask_iou(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.logical_and(a, b).sum()) / (float(np.logical_or(a, b).sum()) + 1e-8)
 
 
@@ -531,14 +463,20 @@ class CandidateRecord:
     iou_gt: float
 
 
-def evaluate_image(image_id, image, gt_mask, exemplar, encoder_, mask_gen, prefilt_thr):
-    """Run SAM+DINO on *image* and return one CandidateRecord per surviving mask."""
+def evaluate_image(
+    image_id: str,
+    image: np.ndarray,
+    gt_mask: np.ndarray,
+    exemplar: ExemplarFeatures,
+    encoder_: DinoEncoder,
+    mask_gen: HFSAMTextGenerator,
+    prefilt_thr: float,
+) -> list[CandidateRecord]:
     t0 = time.perf_counter()
     sam_masks = mask_gen.generate(image)
     log.info("  %s: SAM → %d masks", image_id, len(sam_masks))
 
     full_patches = encoder_([image]).patches[0].cpu().numpy()
-
     prefilt_pairs = []
     for m in sam_masks:
         seg = m["segmentation"]
@@ -602,8 +540,7 @@ def evaluate_image(image_id, image, gt_mask, exemplar, encoder_, mask_gen, prefi
 
 log.info("evaluate_image defined.")
 
-# %%
-# ── demo scoring on the first inference image ──────────────────────────────
+# %% Demo scoring on first inference image
 demo_records = evaluate_image(
     image_id=demo_sample.stem,
     image=demo_sample.image,
@@ -625,8 +562,7 @@ for r in demo_records:
         r.iou_gt,
     )
 
-# %%
-# ── visualise scored candidates on the demo image ──────────────────────────
+# %% Visualise scored candidates
 if demo_records:
     _METHODS_DEMO = [
         ("score_m1", "M1 Global"),
@@ -635,7 +571,6 @@ if demo_records:
     ]
     fig, axes = plt.subplots(1, 4, figsize=(18, 4))
 
-    # column 0: GT mask overlay
     gt_overlay = demo_sample.image.copy()
     gt_overlay[demo_sample.gt_mask] = (
         (gt_overlay[demo_sample.gt_mask] * 0.4 + np.array([0, 200, 80]) * 0.6)
@@ -646,7 +581,6 @@ if demo_records:
     axes[0].set_title("GT mask (green)")
     axes[0].axis("off")
 
-    # columns 1-3: best candidate per scoring method
     for ax, (attr, label) in zip(axes[1:], _METHODS_DEMO):
         valid = [r for r in demo_records if getattr(r, attr) is not None]
         if not valid:
@@ -654,11 +588,10 @@ if demo_records:
             ax.set_title(f"{label}\n(no candidates)")
             continue
         best = max(valid, key=lambda r: getattr(r, attr))
-        overlay = demo_sample.image.copy()
-        # TP (IoU >= threshold) in green; FP in red
+        ovl = demo_sample.image.copy()
         colour = np.array([0, 200, 80]) if best.iou_gt >= IOU_THRESHOLD else np.array([220, 50, 50])
-        overlay[best.seg] = (overlay[best.seg] * 0.35 + colour * 0.65).clip(0, 255).astype(np.uint8)
-        ax.imshow(overlay)
+        ovl[best.seg] = (ovl[best.seg] * 0.35 + colour * 0.65).clip(0, 255).astype(np.uint8)
+        ax.imshow(ovl)
         score_val = getattr(best, attr)
         ax.set_title(
             f"{label}\nscore={score_val:.3f}  IoU={best.iou_gt:.3f}"
@@ -673,13 +606,7 @@ if demo_records:
 else:
     log.warning("No candidates to visualise for %s", demo_sample.stem)
 
-# %% [markdown]
-# ## Step 4 — Full Evaluation Loop
-#
-# Run the complete SAM → pre-filter → DINO scoring pipeline over all inference images and collect
-# every `CandidateRecord`.
-
-# %%
+# %% Step 4 — Full Evaluation Loop
 all_records: list[CandidateRecord] = []
 image_ids: list[str] = []
 
@@ -706,17 +633,12 @@ log.info(
     len(inference_samples),
 )
 
-# %% [markdown]
-# ## Step 5 — Precision-Recall and ROC Curves
-#
-# Candidate-level curves: each SAM candidate is labelled TP if its IoU with the GT mask
-# exceeds `IOU_THRESHOLD`.  Recall is normalised by the number of inference images (one
-# GT instance per image).
+# %% Step 5 — Precision-Recall and ROC helpers
 
 
-# %%
-def compute_pr_curve(scores, iou_gt, iou_threshold, n_images):
-    """Precision-Recall curve; recall normalised by n_images."""
+def compute_pr_curve(
+    scores: np.ndarray, iou_gt: np.ndarray, iou_threshold: float, n_images: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     order = np.argsort(scores)[::-1]
     labels = (iou_gt[order] >= iou_threshold).astype(int)
     tp_cum = np.cumsum(labels)
@@ -726,8 +648,9 @@ def compute_pr_curve(scores, iou_gt, iou_threshold, n_images):
     return precisions, recalls, scores[order]
 
 
-def compute_roc_curve(scores, iou_gt, iou_threshold):
-    """ROC: TPR vs FPR at candidate level."""
+def compute_roc_curve(
+    scores: np.ndarray, iou_gt: np.ndarray, iou_threshold: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     order = np.argsort(scores)[::-1]
     labels = (iou_gt[order] >= iou_threshold).astype(int)
     total_pos = labels.sum()
@@ -741,8 +664,7 @@ def compute_roc_curve(scores, iou_gt, iou_threshold):
     return tprs, fprs, scores[order]
 
 
-def average_precision(precisions, recalls):
-    """Area under PR curve (trapezoidal, sklearn-style)."""
+def average_precision(precisions: np.ndarray, recalls: np.ndarray) -> float:
     r = np.concatenate([[0.0], recalls, [recalls[-1]]])
     p = np.concatenate([[1.0], precisions, [0.0]])
     return float(np.trapezoid(p, r))
@@ -753,13 +675,10 @@ _METHODS = [
     ("score_m2", "M2 PatchCross", "tab:orange"),
     ("score_m3", "M3 Cluster", "tab:green"),
 ]
-
 log.info("Metric helpers defined.")
 
-# %%
-# ── Precision-Recall curves ────────────────────────────────────────────────
+# %% Precision-Recall curves
 fig, ax = plt.subplots(figsize=(7, 5))
-
 for attr, label, color in _METHODS:
     scores = np.array([getattr(r, attr) for r in all_records if getattr(r, attr) is not None])
     ious = np.array([r.iou_gt for r in all_records if getattr(r, attr) is not None])
@@ -780,11 +699,9 @@ fig.tight_layout()
 fig.savefig(OUTPUT_DIR / "pr_curves.png", dpi=150)
 plt.show()
 
-# %%
-# ── ROC curves ────────────────────────────────────────────────────────────
+# %% ROC curves
 fig, ax = plt.subplots(figsize=(7, 5))
 ax.plot([0, 1], [0, 1], "k--", lw=0.8, alpha=0.5, label="Random")
-
 for attr, label, color in _METHODS:
     scores = np.array([getattr(r, attr) for r in all_records if getattr(r, attr) is not None])
     ious = np.array([r.iou_gt for r in all_records if getattr(r, attr) is not None])
@@ -805,14 +722,7 @@ fig.tight_layout()
 fig.savefig(OUTPUT_DIR / "roc_curves.png", dpi=150)
 plt.show()
 
-# %% [markdown]
-# ## Step 6 — IoU Distribution and Score Separability
-#
-# A good scoring method pushes high-IoU candidates (TP) to high scores and low-IoU candidates (FP)
-# to low scores.  The score-distribution plot makes separability visible.
-
-# %%
-# ── IoU histogram ─────────────────────────────────────────────────────────
+# %% Step 6 — IoU Distribution and Score Separability
 ious_all = np.array([r.iou_gt for r in all_records])
 fig, ax = plt.subplots(figsize=(7, 4))
 ax.hist(ious_all, bins=50, color="steelblue", edgecolor="white")
@@ -834,10 +744,8 @@ log.info(
     float(np.mean(ious_all >= IOU_THRESHOLD)),
 )
 
-# %%
-# ── score distributions — TP vs FP ────────────────────────────────────────
+# %% Score distributions — TP vs FP
 fig, axes = plt.subplots(1, 3, figsize=(14, 4), sharey=False)
-
 for ax, (attr, label, color) in zip(axes, _METHODS):
     pos_scores = [
         getattr(r, attr)
@@ -865,14 +773,17 @@ fig.tight_layout()
 fig.savefig(OUTPUT_DIR / "score_distributions.png", dpi=150)
 plt.show()
 
-# %% [markdown]
-# ## Summary
+# %% Summary table
 
 
-# %%
-def instance_stats(all_recs, img_ids, score_attr, score_thr, iou_thr):
-    """Per-image TP/FP/FN: the best-scoring candidate above *score_thr* is the detection."""
-    per_image = {i: [] for i in img_ids}
+def instance_stats(
+    all_recs: list[CandidateRecord],
+    img_ids: list[str],
+    score_attr: str,
+    score_thr: float,
+    iou_thr: float,
+) -> dict:
+    per_image: dict[str, list] = {i: [] for i in img_ids}
     for rec in all_recs:
         s = getattr(rec, score_attr)
         if s is not None and s >= score_thr:
@@ -892,39 +803,50 @@ def instance_stats(all_recs, img_ids, score_attr, score_thr, iou_thr):
     return {"TP": tp, "FP": fp, "FN": fn, "TPR": tpr, "Precision": prec}
 
 
-# ── compute and display summary ────────────────────────────────────────────
-print("\n── Metrics Summary ──────────────────────────────────────────────")
-print(f"  Exemplar          : {exemplar_sample.stem}")
-print(f"  Inference images  : {len(inference_samples)}")
-print(f"  Total candidates  : {len(all_records)}")
 iou_vals = [r.iou_gt for r in all_records]
-print(f"  IoU  mean/median  : {np.mean(iou_vals):.3f} / {np.median(iou_vals):.3f}")
-print(
-    f"  IoU > {IOU_THRESHOLD:.2f} fraction  : {np.mean([v >= IOU_THRESHOLD for v in iou_vals]):.3f}"
+log.info("── Metrics Summary ──────────────────────────────────────────────")
+log.info("  Exemplar          : %s", exemplar_sample.stem)
+log.info("  Inference images  : %d", len(inference_samples))
+log.info("  Total candidates  : %d", len(all_records))
+log.info("  IoU  mean/median  : %.3f / %.3f", np.mean(iou_vals), np.median(iou_vals))
+log.info(
+    "  IoU > %.2f fraction  : %.3f",
+    IOU_THRESHOLD,
+    np.mean([v >= IOU_THRESHOLD for v in iou_vals]),
 )
-print()
-print(
-    f"  {'Method':<18}  {'AP':>6}  {'AUC-ROC':>8}  {'TP':>4}  {'FP':>4}  {'FN':>4}  "
-    f"{'TPR':>6}  {'Prec':>6}"
+log.info(
+    "  %-18s  %6s  %8s  %4s  %4s  %4s  %6s  %6s",
+    "Method",
+    "AP",
+    "AUC-ROC",
+    "TP",
+    "FP",
+    "FN",
+    "TPR",
+    "Prec",
 )
-print("  " + "-" * 68)
 
 for attr, label, _ in _METHODS:
     scores = np.array([getattr(r, attr) for r in all_records if getattr(r, attr) is not None])
     ious = np.array([r.iou_gt for r in all_records if getattr(r, attr) is not None])
     if len(scores) == 0:
-        print(f"  {label:<18}  {'—':>6}  {'—':>8}  (no data)")
+        log.info("  %-18s  %6s  %8s  (no data)", label, "—", "—")
         continue
     prec, rec, _ = compute_pr_curve(scores, ious, IOU_THRESHOLD, len(inference_samples))
     tprs, fprs, _ = compute_roc_curve(scores, ious, IOU_THRESHOLD)
     ap = average_precision(prec, rec)
     auc = float(np.trapezoid(tprs, fprs))
     ist = instance_stats(all_records, image_ids, attr, SCORE_THRESHOLD, IOU_THRESHOLD)
-    print(
-        f"  {label:<18}  {ap:>6.3f}  {auc:>8.3f}  "
-        f"{ist['TP']:>4}  {ist['FP']:>4}  {ist['FN']:>4}  "
-        f"{ist['TPR']:>6.3f}  {ist['Precision']:>6.3f}"
+    log.info(
+        "  %-18s  %6.3f  %8.3f  %4d  %4d  %4d  %6.3f  %6.3f",
+        label,
+        ap,
+        auc,
+        ist["TP"],
+        ist["FP"],
+        ist["FN"],
+        ist["TPR"],
+        ist["Precision"],
     )
 
-print("─────────────────────────────────────────────────────────────────")
 log.info("Plots saved to %s", OUTPUT_DIR.resolve())

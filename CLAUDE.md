@@ -2,6 +2,8 @@
 
 Experiments with DINO vision transformer encoders (v2 / v3). Provides feature extraction and patch-level retrieval galleries backed by pandas + memory-mapped NumPy arrays.
 
+**This is primarily an experiments repository. Do not write or run tests.**
+
 ## Common Commands
 
 ```bash
@@ -17,8 +19,6 @@ ruff format .
 # Type-check
 mypy dinoisawesome/
 
-# Run tests (once a test suite exists)
-pytest
 ```
 
 ## Non-Negotiables
@@ -37,7 +37,6 @@ pytest
 
 Evaluate requests on their technical merits before acting. If you spot a flaw, a simpler path, or a hidden cost, say so and explain why. When a plan is sound, confirm and proceed.
 
-Every bug fix should include a regression test (or an explanation of why one isn't practical).
 
 ## Pre-Push Checklist
 
