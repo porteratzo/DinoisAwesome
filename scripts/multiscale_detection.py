@@ -492,8 +492,14 @@ def fig_combined_detections(
             px_x = (peaks_np[:, 0] + 0.5) * patch_size * q_arr.shape[1] / IMG_SIZE
             px_y = (peaks_np[:, 1] + 0.5) * patch_size * q_arr.shape[0] / IMG_SIZE
             axes[ax_idx].scatter(
-                px_x, px_y, c=color, s=150, marker="o",
-                linewidths=1.5, edgecolors="white", zorder=5,
+                px_x,
+                px_y,
+                c=color,
+                s=150,
+                marker="o",
+                linewidths=1.5,
+                edgecolors="white",
+                zorder=5,
             )
             axes[-1].scatter(
                 px_x,

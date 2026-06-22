@@ -215,7 +215,7 @@ class Gallery:
             # is always the same regardless of how many layers the encoder stored.
             if patches_np.ndim == 4:
                 patches_np = patches_np[:, np.newaxis, ...]  # (B, 1, H, W, D)
-                cls_np = cls_np[:, np.newaxis, :]            # (B, 1, D)
+                cls_np = cls_np[:, np.newaxis, :]  # (B, 1, D)
             _, L, H, W, _ = patches_np.shape
 
             for b, (img_id, spl) in enumerate(zip(batch_ids, batch_spls)):

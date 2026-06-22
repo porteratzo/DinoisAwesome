@@ -4,7 +4,6 @@ from .anomaly_head import AnomalyHead
 from .encoder import DinoEncoder, ExtractorOutput
 from .foreground_head import ForegroundHead
 from .gallery import Gallery, GalleryConfig
-from .keypoint_head import KeypointHead
 from .instance_detection import (
     compute_density_map,
     compute_exemplar_features,
@@ -12,6 +11,14 @@ from .instance_detection import (
     extract_patch_tokens,
     extract_peaks,
     visualize,
+)
+from .keypoint_head import KeypointHead
+from .keypoint_localization import (
+    apply_gaussian_suppression,
+    localize_keypoint,
+    make_coordinate_grid,
+    rescale_coords_to_image,
+    temperature_softmax,
 )
 
 __all__ = [
@@ -22,6 +29,11 @@ __all__ = [
     "AnomalyHead",
     "ForegroundHead",
     "KeypointHead",
+    "apply_gaussian_suppression",
+    "localize_keypoint",
+    "make_coordinate_grid",
+    "rescale_coords_to_image",
+    "temperature_softmax",
     "compute_density_map",
     "compute_exemplar_features",
     "detect_instances",

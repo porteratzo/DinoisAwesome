@@ -131,9 +131,7 @@ class KeypointHead:
         for (x, y), label in zip(points, labels):
             col = min(int(x * img_size / orig_w) // ps, n_patches - 1)
             row = min(int(y * img_size / orig_h) // ps, n_patches - 1)
-            patch_row = img_patches[
-                (img_patches["row"] == row) & (img_patches["col"] == col)
-            ]
+            patch_row = img_patches[(img_patches["row"] == row) & (img_patches["col"] == col)]
             if patch_row.empty:
                 logger.warning(
                     "No patch at (row=%d, col=%d) for image_id=%r — skipping label %r",
