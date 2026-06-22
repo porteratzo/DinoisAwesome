@@ -247,7 +247,9 @@ def _run_inference(image, prompt_type: str, prompt_data: dict, filter_by_prompt:
         bx_labels: list[int] = prompt_data.get("box_labels", [1] * len(bxs))
         if not pts and not bxs:
             raise ValueError("points or boxes required for prompt_type=points_boxes")
-        return _sam.segment_with_points_and_boxes(image, pts, pt_labels, bxs, bx_labels, filter_by_prompt=fbp)
+        return _sam.segment_with_points_and_boxes(
+            image, pts, pt_labels, bxs, bx_labels, filter_by_prompt=fbp
+        )
 
     # mixed (default)
     text = prompt_data.get("text", "").strip()
@@ -323,8 +325,11 @@ def save_annotation():
 
     # Find existing entry for this (class, instance_id) — update in-place or append.
     idx = next(
-        (i for i, a in enumerate(metadata)
-         if a.get("class") == class_name and a.get("instance_id") == instance_id),
+        (
+            i
+            for i, a in enumerate(metadata)
+            if a.get("class") == class_name and a.get("instance_id") == instance_id
+        ),
         None,
     )
 
@@ -364,8 +369,11 @@ def get_annotation_mask(filepath: str):
         abort(404)
 
     idx = next(
-        (i for i, a in enumerate(metadata)
-         if a.get("class") == class_name and a.get("instance_id") == instance_id),
+        (
+            i
+            for i, a in enumerate(metadata)
+            if a.get("class") == class_name and a.get("instance_id") == instance_id
+        ),
         None,
     )
     if idx is None:
@@ -389,8 +397,11 @@ def delete_annotation():
     metadata, masks = _load_annotations(image_path_str)
 
     idx = next(
-        (i for i, a in enumerate(metadata)
-         if a.get("class") == class_name and a.get("instance_id") == instance_id),
+        (
+            i
+            for i, a in enumerate(metadata)
+            if a.get("class") == class_name and a.get("instance_id") == instance_id
+        ),
         None,
     )
     if idx is None:

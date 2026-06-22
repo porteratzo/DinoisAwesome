@@ -117,7 +117,11 @@ class SAMSegmenter:
     def _to_device(self, inputs: dict) -> dict:
         """Move inputs to device, casting floating-point tensors to the model dtype."""
         return {
-            k: (v.to(device=self._device, dtype=self._dtype) if torch.is_floating_point(v) else v.to(self._device))
+            k: (
+                v.to(device=self._device, dtype=self._dtype)
+                if torch.is_floating_point(v)
+                else v.to(self._device)
+            )
             for k, v in inputs.items()
         }
 
@@ -216,7 +220,10 @@ class SAMSegmenter:
         )[0]
 
         entries = [
-            {"mask": results["masks"][i].cpu().numpy().astype(bool), "score": float(results["scores"][i])}
+            {
+                "mask": results["masks"][i].cpu().numpy().astype(bool),
+                "score": float(results["scores"][i]),
+            }
             for i in range(len(results["masks"]))
         ]
         return sorted(entries, key=lambda r: r["score"], reverse=True)
@@ -281,9 +288,7 @@ class HFSAMTextGenerator:
         if self._sam_input_size is not None and max(H, W) > self._sam_input_size:
             scale = self._sam_input_size / max(H, W)
             sam_h, sam_w = int(H * scale), int(W * scale)
-            sam_image = np.array(
-                Image.fromarray(image).resize((sam_w, sam_h), Image.BILINEAR)
-            )
+            sam_image = np.array(Image.fromarray(image).resize((sam_w, sam_h), Image.BILINEAR))
             log.info("  SAM input resized %dx%d → %dx%d", W, H, sam_w, sam_h)
         else:
             sam_image = image
@@ -308,13 +313,15 @@ class HFSAMTextGenerator:
 
         # Filter by minimum area.
         raw: list[tuple[np.ndarray, float]] = [
-            (r["mask"], r["score"])
-            for r in raw_results
-            if r["mask"].sum() >= min_area
+            (r["mask"], r["score"]) for r in raw_results if r["mask"].sum() >= min_area
         ]
 
         if not raw:
-            log.warning("No masks above min_area_frac=%.4f for prompt %r", self._min_area_frac, self._text_prompt)
+            log.warning(
+                "No masks above min_area_frac=%.4f for prompt %r",
+                self._min_area_frac,
+                self._text_prompt,
+            )
             return []
 
         # Greedy NMS: keep masks in score order; drop those overlapping a kept mask.
@@ -710,10 +717,16 @@ def plot_score_distributions(
 ) -> None:
     fig, axes = plt.subplots(1, 3, figsize=(14, 4), sharey=False)
     for ax, (attr, label, color) in zip(axes, _METHODS):
-        pos_scores = [getattr(r, attr) for r in all_records
-                      if getattr(r, attr) is not None and r.iou_gt >= iou_threshold]
-        neg_scores = [getattr(r, attr) for r in all_records
-                      if getattr(r, attr) is not None and r.iou_gt < iou_threshold]
+        pos_scores = [
+            getattr(r, attr)
+            for r in all_records
+            if getattr(r, attr) is not None and r.iou_gt >= iou_threshold
+        ]
+        neg_scores = [
+            getattr(r, attr)
+            for r in all_records
+            if getattr(r, attr) is not None and r.iou_gt < iou_threshold
+        ]
         bins = np.linspace(0, 1, 30)
         ax.hist(neg_scores, bins=bins, alpha=0.6, color="salmon", label="IoU < thr (FP)")
         ax.hist(pos_scores, bins=bins, alpha=0.7, color="steelblue", label="IoU ≥ thr (TP)")
@@ -764,17 +777,24 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--img-size", type=int, default=448)
     parser.add_argument("--device", default=None)
     parser.add_argument(
-        "--no-amp", dest="amp", action="store_false",
+        "--no-amp",
+        dest="amp",
+        action="store_false",
         help="Disable bfloat16 autocast in DinoEncoder (default: enabled).",
     )
     parser.set_defaults(amp=True)
     # Pipeline
     parser.add_argument("--threshold", type=float, default=0.3, help="Pre-filter threshold.")
     parser.add_argument("--n-clusters", type=int, default=4)
-    parser.add_argument("--iou-threshold", type=float, default=0.5,
-                        help="IoU threshold for TP/FP assignment.")
-    parser.add_argument("--score-threshold", type=float, default=0.5,
-                        help="Score threshold used for instance-level stats.")
+    parser.add_argument(
+        "--iou-threshold", type=float, default=0.5, help="IoU threshold for TP/FP assignment."
+    )
+    parser.add_argument(
+        "--score-threshold",
+        type=float,
+        default=0.5,
+        help="Score threshold used for instance-level stats.",
+    )
     # SAM3 (HuggingFace transformers backend — no local checkpoint needed)
     parser.add_argument(
         "--sam-model-id",
@@ -861,8 +881,9 @@ def main(argv: list[str] | None = None) -> None:
         amp=args.amp,
         weights_dir=Path(""),
     )
-    log.info("Encoder: DINO%s-%s  img_size=%d  device=%s",
-             args.version, args.size, args.img_size, device)
+    log.info(
+        "Encoder: DINO%s-%s  img_size=%d  device=%s", args.version, args.size, args.img_size, device
+    )
 
     segmenter = SAMSegmenter(model_id=args.sam_model_id, device=device)
     mask_generator = HFSAMTextGenerator(
@@ -929,19 +950,24 @@ def main(argv: list[str] | None = None) -> None:
 
     # ── plots ─────────────────────────────────────────────────────────────────
     plot_pr_curves(
-        all_records, len(inference_samples), args.iou_threshold,
+        all_records,
+        len(inference_samples),
+        args.iou_threshold,
         args.output_dir / "pr_curves.png",
     )
     plot_roc_curves(
-        all_records, args.iou_threshold,
+        all_records,
+        args.iou_threshold,
         args.output_dir / "roc_curves.png",
     )
     plot_iou_histogram(
-        all_records, args.iou_threshold,
+        all_records,
+        args.iou_threshold,
         args.output_dir / "iou_histogram.png",
     )
     plot_score_distributions(
-        all_records, args.iou_threshold,
+        all_records,
+        args.iou_threshold,
         args.output_dir / "score_distributions.png",
     )
 
@@ -992,20 +1018,26 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  Total candidates  : {len(all_records)}")
     iou_vals = [r.iou_gt for r in all_records]
     print(f"  IoU  mean/median  : {np.mean(iou_vals):.3f} / {np.median(iou_vals):.3f}")
-    print(f"  IoU > {args.iou_threshold:.2f} fraction  : "
-          f"{np.mean([v >= args.iou_threshold for v in iou_vals]):.3f}")
+    print(
+        f"  IoU > {args.iou_threshold:.2f} fraction  : "
+        f"{np.mean([v >= args.iou_threshold for v in iou_vals]):.3f}"
+    )
     print()
-    print(f"  {'Method':<18}  {'AP':>6}  {'AUC-ROC':>8}  {'TP':>4}  {'FP':>4}  {'FN':>4}  "
-          f"{'TPR':>6}  {'Prec':>6}")
+    print(
+        f"  {'Method':<18}  {'AP':>6}  {'AUC-ROC':>8}  {'TP':>4}  {'FP':>4}  {'FN':>4}  "
+        f"{'TPR':>6}  {'Prec':>6}"
+    )
     print("  " + "-" * 68)
     for attr, label, _ in _METHODS:
         if label not in summary["methods"]:
             continue
         m = summary["methods"][label]
         ist = m["instance_stats_at_score_threshold"]
-        print(f"  {label:<18}  {m['AP']:>6.3f}  {m['AUC_ROC']:>8.3f}  "
-              f"{ist['TP']:>4}  {ist['FP']:>4}  {ist['FN']:>4}  "
-              f"{ist['TPR']:>6.3f}  {ist['Precision']:>6.3f}")
+        print(
+            f"  {label:<18}  {m['AP']:>6.3f}  {m['AUC_ROC']:>8.3f}  "
+            f"{ist['TP']:>4}  {ist['FP']:>4}  {ist['FN']:>4}  "
+            f"{ist['TPR']:>6.3f}  {ist['Precision']:>6.3f}"
+        )
     print("─────────────────────────────────────────────────────────────────\n")
 
 

@@ -335,8 +335,8 @@ class SAM3Service:
             # segmentation query.  Putting each click in its own object slot
             # (the previous bug) made background clicks produce their own mask
             # instead of suppressing the foreground region.
-            input_points = [[[[x, y] for x, y in points]]]   # [1, 1, N, 2]
-            input_labels = [[[lbl for lbl in labels]]]        # [1, 1, N]
+            input_points = [[[[x, y] for x, y in points]]]  # [1, 1, N, 2]
+            input_labels = [[[lbl for lbl in labels]]]  # [1, 1, N]
             inputs = self._processor(
                 images=image,
                 input_points=input_points,
@@ -351,7 +351,9 @@ class SAM3Service:
             half = max(8, min(W, H) // 100)
             boxes: list[list[int]] = []
             for x, y in points:
-                boxes.append([max(0, x - half), max(0, y - half), min(W, x + half), min(H, y + half)])
+                boxes.append(
+                    [max(0, x - half), max(0, y - half), min(W, x + half), min(H, y + half)]
+                )
             inputs = self._processor(
                 images=image,
                 input_boxes=[boxes],
@@ -637,8 +639,11 @@ class SAM3Service:
         a flat list of (H, W) bool arrays, one entry per instance.
         """
         original_sizes = inputs_dev.get("original_sizes")
-        masks_tensor = self._processor.post_process_masks(
-            outputs.pred_masks.cpu(), original_sizes
-        )[0]
+        masks_tensor = self._processor.post_process_masks(outputs.pred_masks.cpu(), original_sizes)[
+            0
+        ]
         # masks_tensor shape: (num_objects, 1, H, W)
-        return [masks_tensor[obj_idx, 0].numpy().astype(bool) for obj_idx in range(masks_tensor.shape[0])]
+        return [
+            masks_tensor[obj_idx, 0].numpy().astype(bool)
+            for obj_idx in range(masks_tensor.shape[0])
+        ]
