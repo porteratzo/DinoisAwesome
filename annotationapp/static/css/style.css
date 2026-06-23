@@ -214,6 +214,21 @@ select:focus, input:focus { border-color: #1b6aaa; }
 }
 .btn-row .btn { flex: 1; margin-bottom: 0; }
 
+/* ── Range input ─────────────────────────────────────────────────────────── */
+input[type="range"] {
+    width: 100%;
+    accent-color: #2563a0;
+    margin-bottom: 6px;
+    cursor: pointer;
+}
+
+.brush-size-label {
+    display: block;
+    font-size: 11px;
+    color: #999;
+    margin-bottom: 3px;
+}
+
 /* ── Radio labels ────────────────────────────────────────────────────────── */
 .radio-label {
     display: block;
