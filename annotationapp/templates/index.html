@@ -68,6 +68,9 @@
       <label class="radio-label">
         <input type="radio" name="prompt-type" value="points_boxes"> Points + Boxes (click=point · drag=box)
       </label>
+      <label class="radio-label">
+        <input type="radio" name="prompt-type" value="brush"> Brush (left=paint · right=erase)
+      </label>
     </section>
 
     <section>
@@ -75,6 +78,14 @@
       <label class="radio-label">
         <input type="checkbox" id="filter-by-prompt"> Filter to prompted region
       </label>
+    </section>
+
+    <section id="brush-section" style="display:none;">
+      <h3 class="section-title">Brush</h3>
+      <label class="brush-size-label">Size: <span id="brush-size-value">20</span>px</label>
+      <input id="brush-size-slider" type="range" min="2" max="100" value="20">
+      <button id="init-from-sam-btn" class="btn" style="display:none;">Initialize from SAM Mask</button>
+      <button id="clear-brush-btn" class="btn btn-warning">Clear Brush Mask</button>
     </section>
 
     <section id="text-prompt-section" style="display:none;">

@@ -55,6 +55,11 @@ const _me = {
     // Prompt insertion order — used by undoLastPrompt in points_boxes mode
     promptStack: [],       // 'point' | 'box'
 
+    // Brush tool
+    brushSize: 20,       // radius in image pixels
+    isBrushing: false,   // true while mouse button held in brush mode
+    brushErasing: false, // true = right-click erase stroke
+
     // Options
     filterByPrompt: false,
 
@@ -80,6 +85,11 @@ const _me = {
 
 // ── Module-level vars ──────────────────────────────────────────────────────
 let imageCanvas, overlayCanvas, imageCtx, overlayCtx;
+
+// Off-screen canvas that accumulates brush strokes (image-pixel sized).
+// White-with-alpha; color is applied at render time via compositing.
+let _brushCanvas = null;
+let _brushCtx    = null;
 
 // Used in points_boxes mode: tracks mouse-down position to distinguish
 // a stationary click (→ point) from a drag (→ box).
@@ -316,8 +326,18 @@ document.addEventListener('DOMContentLoaded', () => {
             _me.promptType = radio.value;
             $id('text-prompt-section').style.display =
                 (_me.promptType === 'text' || _me.promptType === 'mixed') ? 'block' : 'none';
+            _updateBrushCursorStyle();
+            _updateBrushUI();
         });
     });
+
+    $id('brush-size-slider').addEventListener('input', e => {
+        _me.brushSize = parseInt(e.target.value, 10);
+        $id('brush-size-value').textContent = _me.brushSize;
+    });
+
+    $id('init-from-sam-btn').addEventListener('click', initBrushFromSAMMask);
+    $id('clear-brush-btn').addEventListener('click', clearBrushCanvas);
 
     $id('undo-btn').addEventListener('click', undoLastPrompt);
     $id('clear-instance-btn').addEventListener('click', clearInstancePrompts);
@@ -419,6 +439,7 @@ async function loadImage(relPath) {
             overlayCanvas.width  = img.naturalWidth;
             overlayCanvas.height = img.naturalHeight;
             imageCtx.drawImage(img, 0, 0);
+            _initBrushCanvas();
             // Scale the CSS display size to fill the available area, then reset view
             fitCanvasToContainer();
             _resetView();
@@ -537,6 +558,18 @@ function _clearHighlightedAnnotation() {
 function onMouseDown(e) {
     if (e.button === 1) return;  // middle-mouse handled by canvas-scroll pan handler
 
+    if (_me.promptType === 'brush') {
+        if (e.button !== 0 && e.button !== 2) return;
+        e.preventDefault();
+        _me.isBrushing  = true;
+        _me.brushErasing = (e.button === 2);
+        const coords = canvasCoords(e);
+        _brushPaint(coords.x, coords.y, _me.brushErasing);
+        redrawOverlay();
+        _drawBrushCursor(coords.x, coords.y);
+        return;
+    }
+
     if (_me.promptType === 'points') {
         onPointMouseDown(e);
         return;
@@ -576,6 +609,18 @@ function onMouseDown(e) {
 }
 
 function onMouseMove(e) {
+    if (_me.promptType === 'brush') {
+        const coords = canvasCoords(e);
+        if (_me.isBrushing) {
+            _brushPaint(coords.x, coords.y, _me.brushErasing);
+            redrawOverlay();
+        } else {
+            redrawOverlay();
+        }
+        _drawBrushCursor(coords.x, coords.y);
+        return;
+    }
+
     if (_me.promptType === 'points') return;
 
     if (_me.promptType === 'points_boxes') {
@@ -601,6 +646,11 @@ function onMouseMove(e) {
 }
 
 function onMouseUp(e) {
+    if (_me.promptType === 'brush') {
+        _me.isBrushing = false;
+        return;
+    }
+
     if (_me.promptType === 'points') return;
 
     if (_me.promptType === 'points_boxes') {
@@ -644,6 +694,12 @@ function onMouseUp(e) {
 }
 
 function onMouseLeave() {
+    if (_me.promptType === 'brush') {
+        _me.isBrushing = false;
+        redrawOverlay();  // erase the cursor circle
+        return;
+    }
+
     if (_me.drawingBox) {
         _me.drawingBox = false;
         _pxDown = null;
@@ -689,6 +745,10 @@ function _drawBoxPreview(start, end, polarity) {
  * In single-type modes (points/boxes) falls back to the relevant array.
  */
 function undoLastPrompt() {
+    if (_me.promptType === 'brush') {
+        setStatus('Undo is not supported for brush — use Clear Brush Mask');
+        return;
+    }
     const type = _me.promptType;
     let removed = false;
 
@@ -745,6 +805,10 @@ function undoLastPrompt() {
  * - points_boxes→ clear both points and boxes
  */
 function clearInstancePrompts() {
+    if (_me.promptType === 'brush') {
+        clearBrushCanvas();
+        return;
+    }
     const type = _me.promptType;
     let cleared = false;
 
@@ -840,14 +904,17 @@ function redrawOverlay() {
         drawSelectedMaskMarker();
     }
 
-    // 3. Draw prompts on top
+    // 3. Render brush mask (visible regardless of prompt mode so it persists)
+    renderBrushMask();
+
+    // 4. Draw prompts on top (not in brush mode — brush cursor is drawn separately)
     const type = _me.promptType;
     if (type === 'points') {
         drawPoints();
     } else if (type === 'points_boxes') {
-        drawPoints();   // both types visible simultaneously
+        drawPoints();
         drawBoxes();
-    } else {
+    } else if (type !== 'brush') {
         drawBoxes();
     }
 }
@@ -1024,6 +1091,7 @@ function drawBoxes() {
 
 // ── Multi-mask selector ────────────────────────────────────────────────────
 function updateMaskPreviews(count) {
+    _updateBrushUI();  // show/hide "Init from SAM" button based on mask availability
     const container = $id('mask-prev-container');
     container.innerHTML = '';
     for (let i = 0; i < count; i++) {
@@ -1059,6 +1127,10 @@ function scheduleSegment() {
 
 async function _meRunSAM() {
     _me.debounceTimer = null;
+    if (_me.promptType === 'brush') {
+        setStatus('Segment is not available in brush mode');
+        return;
+    }
     if (_me.isProcessing || !_me.currentImagePath) return;
 
     const promptType = _me.promptType;
@@ -1153,6 +1225,40 @@ async function saveAnnotation() {
         setStatus('No image loaded');
         return;
     }
+
+    if (_me.promptType === 'brush') {
+        if (!_brushCanvas) { setStatus('No brush canvas'); return; }
+        const brushMask = _extractBrushMask();
+        const hasPaint = brushMask.some(row => row.some(v => v));
+        if (!hasPaint) {
+            setStatus('Brush canvas is empty — paint something first');
+            return;
+        }
+        try {
+            const resp = await fetch('/api/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    image_path:     _me.currentImagePath,
+                    class_name:     _me.selectedClass,
+                    instance_id:    _me.instanceId,
+                    mask_data:      brushMask,
+                    prompt_type:    'brush',
+                    prompt_content: {},
+                }),
+            });
+            if (!resp.ok) { setStatus('Save failed'); return; }
+            _me.instanceId++;
+            $id('instance-id-input').value = _me.instanceId;
+            await loadAnnotations();
+            setStatus('Brush annotation saved');
+        } catch (err) {
+            setStatus('Network error on save');
+            console.error('[mask_editor] brush save error:', err);
+        }
+        return;
+    }
+
     if (_me.currentMasks.length === 0) {
         setStatus('No mask to save — segment first');
         return;
@@ -1298,6 +1404,118 @@ async function deleteAnnotation(ann) {
         }
     } catch (err) {
         console.error('[mask_editor] delete error:', err);
+    }
+}
+
+// ── Brush tool ─────────────────────────────────────────────────────────────
+
+function _initBrushCanvas() {
+    _brushCanvas = document.createElement('canvas');
+    _brushCanvas.width  = imageCanvas.width;
+    _brushCanvas.height = imageCanvas.height;
+    _brushCtx = _brushCanvas.getContext('2d');
+}
+
+function _brushPaint(x, y, erase) {
+    if (!_brushCtx) return;
+    _brushCtx.save();
+    _brushCtx.globalCompositeOperation = erase ? 'destination-out' : 'source-over';
+    _brushCtx.fillStyle = 'rgba(255,255,255,1)';
+    _brushCtx.beginPath();
+    _brushCtx.arc(x, y, _me.brushSize, 0, Math.PI * 2);
+    _brushCtx.fill();
+    _brushCtx.restore();
+}
+
+function renderBrushMask() {
+    if (!_brushCanvas) return;
+    const [r, g, b] = classColor(_me.selectedClass);
+    const scratch = document.createElement('canvas');
+    scratch.width  = overlayCanvas.width;
+    scratch.height = overlayCanvas.height;
+    const sCtx = scratch.getContext('2d');
+    sCtx.fillStyle = `rgba(${r},${g},${b},${160 / 255})`;
+    sCtx.fillRect(0, 0, scratch.width, scratch.height);
+    sCtx.globalCompositeOperation = 'destination-in';
+    sCtx.drawImage(_brushCanvas, 0, 0);
+    overlayCtx.drawImage(scratch, 0, 0);
+}
+
+function _drawBrushCursor(x, y) {
+    overlayCtx.save();
+    overlayCtx.strokeStyle = 'rgba(0,0,0,0.5)';
+    overlayCtx.lineWidth   = 1.5;
+    overlayCtx.setLineDash([]);
+    overlayCtx.beginPath();
+    overlayCtx.arc(x, y, _me.brushSize, 0, Math.PI * 2);
+    overlayCtx.stroke();
+    overlayCtx.strokeStyle = 'rgba(255,255,255,0.85)';
+    overlayCtx.lineWidth   = 1;
+    overlayCtx.setLineDash([4, 3]);
+    overlayCtx.beginPath();
+    overlayCtx.arc(x, y, _me.brushSize, 0, Math.PI * 2);
+    overlayCtx.stroke();
+    overlayCtx.restore();
+}
+
+function _extractBrushMask() {
+    const W = _brushCanvas.width;
+    const H = _brushCanvas.height;
+    const imgData = _brushCtx.getImageData(0, 0, W, H);
+    const buf  = imgData.data;
+    const mask = new Array(H);
+    for (let row = 0; row < H; row++) {
+        mask[row] = new Array(W);
+        const rowBase = row * W * 4;
+        for (let col = 0; col < W; col++) {
+            mask[row][col] = buf[rowBase + col * 4 + 3] > 0;
+        }
+    }
+    return mask;
+}
+
+function clearBrushCanvas() {
+    if (!_brushCtx) return;
+    _brushCtx.clearRect(0, 0, _brushCanvas.width, _brushCanvas.height);
+    redrawOverlay();
+    setStatus('Brush canvas cleared');
+}
+
+function initBrushFromSAMMask() {
+    if (!_brushCtx || _me.currentMasks.length === 0) return;
+    const mask = _me.currentMasks[_me.selectedMaskIdx];
+    const H = mask.length;
+    const W = H > 0 ? mask[0].length : 0;
+    if (!H || !W) return;
+    const imgData = _brushCtx.createImageData(W, H);
+    const buf = imgData.data;
+    for (let row = 0; row < H; row++) {
+        const maskRow = mask[row];
+        for (let col = 0; col < W; col++) {
+            if (maskRow[col]) {
+                const i = (row * W + col) * 4;
+                buf[i] = buf[i + 1] = buf[i + 2] = 255;
+                buf[i + 3] = 255;
+            }
+        }
+    }
+    _brushCtx.clearRect(0, 0, W, H);
+    _brushCtx.putImageData(imgData, 0, 0);
+    redrawOverlay();
+    setStatus('Brush initialized from SAM mask');
+}
+
+function _updateBrushCursorStyle() {
+    overlayCanvas.style.cursor = (_me.promptType === 'brush') ? 'none' : 'crosshair';
+}
+
+function _updateBrushUI() {
+    const isBrush = _me.promptType === 'brush';
+    const brushSection = $id('brush-section');
+    if (brushSection) brushSection.style.display = isBrush ? 'block' : 'none';
+    const initBtn = $id('init-from-sam-btn');
+    if (initBtn) {
+        initBtn.style.display = (isBrush && _me.currentMasks.length > 0) ? 'block' : 'none';
     }
 }
 
