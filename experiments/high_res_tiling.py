@@ -50,8 +50,7 @@ _REPO_ROOT = Path(__file__).parent.parent
 load_dotenv(_REPO_ROOT / ".env")
 
 # Image to experiment on — set to a local path or leave None to download
-IMAGE_PATH: Path | None = _REPO_ROOT / "data" / "tiger.jpeg"
-SAMPLE_URL = "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/1200px-Cat03.jpg"
+IMAGE_PATH: Path | None = _REPO_ROOT / "data" / "abc2" / "LHa_1.jpg"
 
 # Optional exemplar mask for instance-detection comparison (.npy / .npz)
 MASK_PATH: Path | None = None
@@ -68,8 +67,8 @@ N_TILES = 2  # n_tiles × n_tiles grid (2 → 4 tiles, 3 → 9 tiles)
 EFFECTIVE_SIZE = BASE_IMG_SIZE * N_TILES  # 2048 — image is scaled to this before tiling
 
 # Overlap sweep
-OVERLAP_VALUES = [0, 32, 64, 128, 256]  # pixels of context added to each tile boundary
-DEFAULT_OVERLAP = 128  # overlap used for blending comparison
+OVERLAP_VALUES = [0, 16, 32, 64, 128]  # pixels of context added to each tile boundary
+DEFAULT_OVERLAP = 32  # overlap used for blending comparison
 
 # Blending methods to compare
 BLEND_METHODS = ["hard", "linear", "gaussian"]
@@ -94,6 +93,7 @@ def encode_tiled(
     n_tiles: int = 2,
     overlap_px: int = 0,
     blend: str = "hard",
+    debias: bool = True,
 ) -> torch.Tensor:
     """Encode image at `effective_size` resolution via n_tiles×n_tiles tiling.
 
@@ -138,44 +138,63 @@ def encode_tiled(
             tile_w = x1 - x0
 
             crop = Image.fromarray(img_arr[y0:y1, x0:x1])
-            out = encoder([crop])
+            out = encoder([crop], debias=debias)
             tile_feat = out.patches[0].cpu().float()  # (H_t, W_t, D)
 
-            # Map each tile patch to its canonical output position
+            # Map each tile patch to its canonical output position (float)
             gc_y = y0 + (TY + 0.5) * tile_h / H_t  # global pixel centre (H_t, W_t)
             gc_x = x0 + (TX + 0.5) * tile_w / W_t
-            OY = (gc_y * H_out / effective_size).long().clamp(0, H_out - 1)
-            OX = (gc_x * W_out / effective_size).long().clamp(0, W_out - 1)
+            oy_f = (gc_y * H_out / effective_size).clamp(0, H_out - 1)  # float
+            ox_f = (gc_x * W_out / effective_size).clamp(0, W_out - 1)
 
             # Per-patch blending weights
             if blend == "hard":
                 W_map = torch.ones(H_t, W_t)
             elif blend == "linear":
                 # Triangle: peak = 1 at tile centre, 0 at outer edge
-                dy = 1.0 - (TY - (H_t - 1) / 2.0).abs() / (H_t / 2.0)
-                dx = 1.0 - (TX - (W_t - 1) / 2.0).abs() / (W_t / 2.0)
-                W_map = (dy * dx).clamp(min=0.0)
+                bdy = 1.0 - (TY - (H_t - 1) / 2.0).abs() / (H_t / 2.0)
+                bdx = 1.0 - (TX - (W_t - 1) / 2.0).abs() / (W_t / 2.0)
+                W_map = (bdy * bdx).clamp(min=0.0)
             elif blend == "gaussian":
                 sigma_y = H_t / 4.0
                 sigma_x = W_t / 4.0
-                dy = torch.exp(-0.5 * ((TY - (H_t - 1) / 2.0) / sigma_y) ** 2)
-                dx = torch.exp(-0.5 * ((TX - (W_t - 1) / 2.0) / sigma_x) ** 2)
-                W_map = dy * dx
+                bdy = torch.exp(-0.5 * ((TY - (H_t - 1) / 2.0) / sigma_y) ** 2)
+                bdx = torch.exp(-0.5 * ((TX - (W_t - 1) / 2.0) / sigma_x) ** 2)
+                W_map = bdy * bdx
             else:
                 raise ValueError(f"Unknown blend method: {blend!r}")
 
-            flat_oy = OY.reshape(-1)  # (H_t*W_t,)
-            flat_ox = OX.reshape(-1)
             flat_w = W_map.reshape(-1)
             flat_f = tile_feat.reshape(H_t * W_t, D)  # (H_t*W_t, D)
-            flat_idx = flat_oy * W_out + flat_ox  # linear index
 
-            wgt.reshape(-1).scatter_add_(0, flat_idx, flat_w)
-            acc.reshape(-1, D).scatter_add_(
-                0,
-                flat_idx.unsqueeze(1).expand(-1, D),
-                flat_w.unsqueeze(1) * flat_f,
-            )
+            # Bilinear splatting: distribute each patch to its 4 surrounding output
+            # positions.  This prevents "holes" (zero-weight positions) that appear
+            # when tile_h > stride_px (overlap > 0) and the floor-based nearest-
+            # neighbour mapping skips output rows/columns periodically.
+            oy_lo = oy_f.long().clamp(0, H_out - 1)
+            oy_hi = (oy_lo + 1).clamp(0, H_out - 1)
+            ox_lo = ox_f.long().clamp(0, W_out - 1)
+            ox_hi = (ox_lo + 1).clamp(0, W_out - 1)
+            frac_y = (oy_f - oy_lo.float()).clamp(0.0, 1.0)
+            frac_x = (ox_f - ox_lo.float()).clamp(0.0, 1.0)
+
+            bilinear_corners = [
+                (oy_lo, ox_lo, (1.0 - frac_y) * (1.0 - frac_x)),
+                (oy_lo, ox_hi, (1.0 - frac_y) * frac_x),
+                (oy_hi, ox_lo, frac_y * (1.0 - frac_x)),
+                (oy_hi, ox_hi, frac_y * frac_x),
+            ]
+            for OY, OX, corner_w in bilinear_corners:
+                flat_oy = OY.reshape(-1)
+                flat_ox = OX.reshape(-1)
+                combined_w = flat_w * corner_w.reshape(-1)
+                flat_idx = flat_oy * W_out + flat_ox
+                wgt.reshape(-1).scatter_add_(0, flat_idx, combined_w)
+                acc.reshape(-1, D).scatter_add_(
+                    0,
+                    flat_idx.unsqueeze(1).expand(-1, D),
+                    combined_w.unsqueeze(1) * flat_f,
+                )
 
     # Normalise by accumulated weights
     mask = wgt > 0
@@ -241,20 +260,13 @@ log.info(
     N_TILES * W_GRID,
 )
 
-if IMAGE_PATH is None or not Path(IMAGE_PATH).exists():
-    _dl = _REPO_ROOT / "data" / "sample.jpg"
-    _dl.parent.mkdir(parents=True, exist_ok=True)
-    log.info("Downloading sample image …")
-    urlretrieve(SAMPLE_URL, _dl)
-    IMAGE_PATH = _dl
-
 img = Image.open(IMAGE_PATH).convert("RGB")
 log.info("Loaded: %s  (%dx%d px)", IMAGE_PATH, *img.size)
 
 display_base = np.array(img.resize((BASE_IMG_SIZE, BASE_IMG_SIZE), Image.BICUBIC))
 display_2x = np.array(img.resize((EFFECTIVE_SIZE, EFFECTIVE_SIZE), Image.BICUBIC))
 
-fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+fig, axes = plt.subplots(1, 2, figsize=(15, 10))
 axes[0].imshow(display_base)
 axes[0].set_title(f"Baseline input  ({BASE_IMG_SIZE}×{BASE_IMG_SIZE})")
 axes[0].axis("off")
@@ -269,12 +281,13 @@ plt.show()
 log.info("Experiment 1: Baseline 1× vs Tiled 2× (overlap=0) …")
 
 # Baseline: single forward pass at BASE_IMG_SIZE
-out_base = encoder(img)
+with_debias = True  # v3 large has some bias in later layers that can dominate PCA; set to False to disable
+out_base = encoder(img, debias=with_debias)
 feat_base = out_base.patches[0].cpu().float()  # (H_GRID, W_GRID, D)
 feat_base = F.normalize(feat_base, p=2, dim=-1)
 
 # Tiled 2×: 4 tiles, no overlap
-feat_tiled = encode_tiled(img, encoder, EFFECTIVE_SIZE, n_tiles=N_TILES, overlap_px=0, blend="hard")
+feat_tiled = encode_tiled(img, encoder, EFFECTIVE_SIZE, n_tiles=N_TILES, overlap_px=0, blend="hard", debias=with_debias)
 # feat_tiled: (2*H_GRID, 2*W_GRID, D)
 
 log.info("Baseline feature map : %s", tuple(feat_base.shape))
@@ -467,7 +480,7 @@ overlap_results: list[dict] = []
 for ov in OVERLAP_VALUES:
     log.info("  overlap_px=%d …", ov)
     feat_ov = encode_tiled(
-        img, encoder, EFFECTIVE_SIZE, n_tiles=N_TILES, overlap_px=ov, blend="linear"
+        img, encoder, EFFECTIVE_SIZE, n_tiles=N_TILES, overlap_px=ov, blend="linear", debias=with_debias
     )
     stats_v_ov = seam_sim_stats(feat_ov, "vertical")
     stats_h_ov = seam_sim_stats(feat_ov, "horizontal")
@@ -791,6 +804,13 @@ dm_tiled_np = dm_tiled.cpu().numpy()
 def heat_overlay(bg: np.ndarray, heat: np.ndarray, alpha: float = 0.55) -> np.ndarray:
     norm = (heat - heat.min()) / (heat.max() - heat.min() + 1e-8)
     colored = plt.get_cmap("jet")(norm)[..., :3]
+    # Upsample heatmap to match background spatial size if needed
+    if colored.shape[:2] != bg.shape[:2]:
+        colored = np.array(
+            Image.fromarray((colored * 255).astype(np.uint8)).resize(
+                (bg.shape[1], bg.shape[0]), Image.NEAREST
+            )
+        ) / 255.0
     return np.clip(bg / 255.0 * (1 - alpha) + colored * alpha, 0, 1)
 
 
@@ -906,3 +926,5 @@ log.info("  Instance detection:")
 log.info("    Baseline (%dx%d): %d peaks", H_GRID, W_GRID, len(peaks_base))
 log.info("    Tiled    (%dx%d): %d peaks", H_2x, W_2x, len(peaks_tiled))
 log.info("Outputs saved to %s", OUTPUT_DIR)
+
+# %%

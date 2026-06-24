@@ -184,7 +184,9 @@ class KeypointHead:
         Args:
             image:   Query PIL Image, numpy (H,W,3) uint8 array, or file path.
             labels:  Restrict to these keypoint labels.  ``None`` = all registered.
-            debias:  Remove the positional subspace from query patches before matching.
+            debias:  Remove the positional subspace from both query patches and reference
+                     embeddings before matching.  The positional basis is computed lazily
+                     on first use and cached on the encoder.
 
         Returns:
             List of dicts, one per matched keypoint, in the same order as *labels*
@@ -214,9 +216,16 @@ class KeypointHead:
         H, W, D = patches.shape
         flat = F.normalize(patches.reshape(H * W, D), p=2, dim=1)  # (N, D)
 
+        if debias:
+            basis = self.encoder.positional_basis.to(flat.device, dtype=flat.dtype)  # (D, k)
+            D = flat.shape[-1]
+            P_perp = torch.eye(D, device=flat.device, dtype=flat.dtype) - basis @ basis.T
+
         results: list[dict] = []
         for lbl, ref_emb in ref_embs.items():
-            ref_emb = ref_emb.to(flat.device)
+            ref_emb = ref_emb.to(flat.device, dtype=flat.dtype)
+            if debias:
+                ref_emb = F.normalize(ref_emb @ P_perp, p=2, dim=0)
             sims = flat @ ref_emb  # (N,)
             best_idx = int(sims.argmax())
             row, col = divmod(best_idx, W)

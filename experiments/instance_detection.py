@@ -69,7 +69,7 @@ EXEMPLAR_K = 3
 
 DENSITY_THRESHOLD = 0.3
 PEAK_KERNEL_SIZE = 5
-MIN_PEAK_THRESHOLD = 0.3
+MIN_PEAK_THRESHOLD = 0.5
 
 log.info("Reference images: 1  |  Target images: %d", len(TAR_IMAGE_PATH))
 
@@ -145,35 +145,104 @@ for p, qi in zip(QUERY_PATHS, query_imgs):
     log.info("Query:    %s  (%dx%d px)", p, *qi.size)
 
 pixel_mask: np.ndarray | None = None
+fg_mask: np.ndarray | None = None
 n_instances = 0
 if EXEMPLAR_MASK_PATH is not None and Path(EXEMPLAR_MASK_PATH).exists():
     if EXEMPLAR_MASK_PATH.endswith(".npy"):
         raw_seg = np.load(EXEMPLAR_MASK_PATH)
-        if raw_seg.ndim == 3 and raw_seg.shape[0] < raw_seg.shape[1]:
+        # Detect (N, H, W) by requiring dim-0 to be smaller than *both* spatial dims.
+        # Checking only shape[0] < shape[1] is ambiguous for landscape images (H < W),
+        # where an already-correct (H, W, N) array would be wrongly transposed.
+        if raw_seg.ndim == 3 and raw_seg.shape[0] < raw_seg.shape[1] and raw_seg.shape[0] < raw_seg.shape[2]:
             raw_seg = raw_seg.transpose(1, 2, 0)
     elif EXEMPLAR_MASK_PATH.endswith(".npz"):
         raw_seg = np.load(EXEMPLAR_MASK_PATH)["segmaps"]
     else:
         raw_seg = np.array(Image.open(EXEMPLAR_MASK_PATH).convert("L"))[:, :, None] > 0
-    pixel_mask = raw_seg.any(axis=2)
-    n_instances = raw_seg.shape[2]
+
+    # --- Foreground crop ---
+    # The largest mask is treated as the foreground region. Crop all images to its tight
+    # bounding box plus a 5% border, then discard that mask. The remaining instance masks
+    # (also cropped) drive the rest of the pipeline.
+    mask_sizes = [int(raw_seg[:, :, i].sum()) for i in range(raw_seg.shape[2])]
+    fg_idx = int(np.argmax(mask_sizes))
+    fg_mask = raw_seg[:, :, fg_idx].astype(bool)
+    # apply erosion then dilation to clean up the foreground mask (removing small spurious masks can cause issues downstream)
+    import cv2
+    fg_mask = cv2.morphologyEx(fg_mask.astype(np.uint8), cv2.MORPH_OPEN, kernel=np.ones((3, 3), dtype=np.uint8)).astype(bool)
+    log.info("Foreground mask: index=%d  size=%d px", fg_idx, mask_sizes[fg_idx])
+
+    rows = np.where(fg_mask.any(axis=1))[0]
+    cols = np.where(fg_mask.any(axis=0))[0]
+    r_min, r_max = int(rows[0]), int(rows[-1]) + 1
+    c_min, c_max = int(cols[0]), int(cols[-1]) + 1
+    border_h = max(1, int(0.05 * (r_max - r_min)))
+    border_w = max(1, int(0.05 * (c_max - c_min)))
+    orig_h, orig_w = raw_seg.shape[:2]
+    crop_r_min = max(0, r_min - border_h)
+    crop_r_max = min(orig_h, r_max + border_h)
+    crop_c_min = max(0, c_min - border_w)
+    crop_c_max = min(orig_w, c_max + border_w)
     log.info(
-        "Mask: shape=%s  instances=%d  coverage=%.1f%%",
-        raw_seg.shape,
-        n_instances,
-        100.0 * pixel_mask.mean(),
+        "Crop box (fg + 5%% border): rows=[%d,%d) cols=[%d,%d)  → %dx%d px",
+        crop_r_min,
+        crop_r_max,
+        crop_c_min,
+        crop_c_max,
+        crop_c_max - crop_c_min,
+        crop_r_max - crop_r_min,
     )
+
+    # Save originals for Step 0 display, then crop in-place (PIL order: left, upper, right, lower)
+    exemplar_img_orig = exemplar_img
+    query_imgs_orig = list(query_imgs)
+    exemplar_img = exemplar_img.crop((crop_c_min, crop_r_min, crop_c_max, crop_r_max))
+    query_imgs = [qi.crop((crop_c_min, crop_r_min, crop_c_max, crop_r_max)) for qi in query_imgs]
+
+    # Discard the foreground mask; crop and union the remaining instance masks
+    other_idx = [i for i in range(raw_seg.shape[2]) if i != fg_idx]
+    if other_idx:
+        raw_seg_cropped = raw_seg[crop_r_min:crop_r_max, crop_c_min:crop_c_max, :][:, :, other_idx]
+        pixel_mask = raw_seg_cropped.any(axis=2)
+        n_instances = raw_seg_cropped.shape[2]
+        log.info(
+            "Instance masks after fg crop: shape=%s  instances=%d  coverage=%.1f%%",
+            raw_seg_cropped.shape,
+            n_instances,
+            100.0 * pixel_mask.mean(),
+        )
+    else:
+        log.warning("Only one mask found (used as foreground) — no instance masks remain.")
 else:
     log.warning("Mask not found at %s — running without mask.", EXEMPLAR_MASK_PATH)
+    exemplar_img_orig = exemplar_img
+    query_imgs_orig = list(query_imgs)
 
 display_ex = np.array(exemplar_img.resize((IMG_SIZE, IMG_SIZE), Image.BICUBIC))
 
 ncols = 2 + len(query_imgs)
 fig, axes = plt.subplots(1, ncols, figsize=(ncols * 4, 5))
 
-axes[0].imshow(exemplar_img)
-axes[0].set_title("Exemplar (original)", fontsize=10)
-axes[0].axis("off")
+axes[0].imshow(exemplar_img_orig)
+if fg_mask is not None:
+    fg_disp = (
+        np.array(
+            Image.fromarray(fg_mask.astype(np.uint8) * 255).resize(
+                exemplar_img_orig.size, Image.NEAREST
+            )
+        )
+        > 0
+    )
+    fg_overlay = np.zeros((*fg_disp.shape, 4), dtype=np.float32)
+    fg_overlay[fg_disp] = [0.9, 0.4, 0.1, 0.5]
+    axes[0].imshow(fg_overlay)
+    axes[0].set_title(
+        f"Exemplar (original) + foreground mask\n{100 * fg_mask.mean():.1f}% coverage",
+        fontsize=10,
+    )
+else:
+    axes[0].set_title("Exemplar (original)", fontsize=10)
+#axes[0].axis("off")
 
 axes[1].imshow(display_ex)
 if pixel_mask is not None:
@@ -189,7 +258,7 @@ if pixel_mask is not None:
     green_overlay[mask_disp] = [0.2, 0.9, 0.2, 0.5]
     axes[1].imshow(green_overlay)
     axes[1].set_title(
-        f"Exemplar + instance mask\n"
+        f"Exemplar (cropped to fg) + instance mask\n"
         f"{n_instances} instance(s) | {100 * pixel_mask.mean():.1f}% coverage",
         fontsize=10,
     )
@@ -197,9 +266,9 @@ else:
     axes[1].set_title("Exemplar (no mask)", fontsize=10)
 axes[1].axis("off")
 
-for i, (p, qi) in enumerate(zip(QUERY_PATHS, query_imgs), start=2):
-    axes[i].imshow(qi)
-    axes[i].set_title(f"Query {i - 1}\n{Path(p).name}", fontsize=9)
+for i, (p, qi_orig, qi) in enumerate(zip(QUERY_PATHS, query_imgs_orig, query_imgs), start=2):
+    axes[i].imshow(qi_orig)
+    axes[i].set_title(f"Query {i - 1} (original)\n{Path(p).name}", fontsize=9)
     axes[i].axis("off")
 
 plt.suptitle("Step 0: Input images and exemplar mask", fontsize=12)
@@ -803,3 +872,5 @@ else:
     )
     plt.tight_layout()
     plt.show()
+
+# %%

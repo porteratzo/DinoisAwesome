@@ -41,12 +41,12 @@ from dinoisawesome import DinoEncoder, Gallery, KeypointHead
 _REPO_ROOT = Path(__file__).parent.parent
 load_dotenv(_REPO_ROOT / ".env")
 
-part_type = "left_under"
+part_type = "LHa"
 ref_number = 1
-data_dir = _REPO_ROOT / "data" / "abc"
+data_dir = _REPO_ROOT / "data" / "abc2"
 
 all_images = glob(str(data_dir / f"{part_type}_*.jpg"))
-REF_IMAGE_PATH: str = [i for i in all_images if f"{part_type}_{str(ref_number).zfill(3)}.jpg" in i][
+REF_IMAGE_PATH: str = [i for i in all_images if f"{part_type}_{str(ref_number).zfill(1)}.jpg" in i][
     0
 ]
 TAR_IMAGE_PATH: list[str] = [
@@ -56,10 +56,12 @@ TAR_IMAGE_PATH: list[str] = [
 # Keypoints to register — pixel coords in the ORIGINAL image space (before any resize).
 # Edit these to match the reference image; or use the cv2.selectROI block below.
 KEYPOINTS: list[dict] | None = [
-    {"x": 791, "y": 1149, "label": "point1"},
-    {"x": 1698, "y": 961, "label": "point2"},
-    {"x": 2118, "y": 877, "label": "point3"},
-    {"x": 2797, "y": 759, "label": "point4"},
+    {"x": 491, "y": 1128, "label": "point1"},
+    {"x": 873, "y": 966, "label": "point2"},
+    {"x": 1835, "y": 723, "label": "point3"},
+    {"x": 2370, "y": 590, "label": "point4"},
+    {"x": 2919, "y": 459, "label": "point5"},
+    {"x": 3228, "y": 408, "label": "point6"},
 ]
 
 # Query transforms applied to target images.
@@ -103,15 +105,17 @@ log.info("Target images: %d", len(TAR_IMAGE_PATH))
 # resized_cv = cv2.resize(img_cv, (IMG_SIZE, IMG_SIZE))
 # scale_x = orig_w / IMG_SIZE
 # scale_y = orig_h / IMG_SIZE
-#
+
 # selected = []
-# for label in ["point1", "point2", "point3", "point4"]:
+# for label in ["point1", "point2", "point3", "point4", "point5", "point6"]:
 #     roi = cv2.selectROI(f"Select {label}", resized_cv)
-#     selected.append({
-#         "x": int((roi[0] + roi[2] / 2) * scale_x),
-#         "y": int((roi[1] + roi[3] / 2) * scale_y),
-#         "label": label,
-#     })
+#     selected.append(
+#         {
+#             "x": int((roi[0] + roi[2] / 2) * scale_x),
+#             "y": int((roi[1] + roi[3] / 2) * scale_y),
+#             "label": label,
+#         }
+#     )
 # cv2.destroyAllWindows()
 # KEYPOINTS = selected
 # log.info("Selected keypoints: %s", KEYPOINTS)
@@ -288,8 +292,8 @@ plt.tight_layout()
 plt.show()
 
 # %% Similarity heatmaps for each keypoint on a chosen query
-QUERY_IDX = 0  # index into query_results; adjust to inspect different queries
-_DEBIAS_HEAT = False
+QUERY_IDX = 1  # index into query_results; adjust to inspect different queries
+_DEBIAS_HEAT = True
 
 qr = query_results[QUERY_IDX]
 q_img = qr["image"]
@@ -346,14 +350,15 @@ plt.tight_layout()
 plt.show()
 
 # %% Homography estimation (RANSAC) and warp
+discard_points = [4]
 HOMO_QUERY_IDX = min(len(QUERIES), len(query_results) - 1)
-
+HOMO_QUERY_IDX = 1
 qr = query_results[HOMO_QUERY_IDX]
 q_img = qr["image"]
 q_w, q_h = q_img.size
 
 match_map = {m["label"]: m["point"] for m in qr["matches"]}
-valid_kps = [kp for kp in KEYPOINTS if kp["label"] in match_map]
+valid_kps = [kp for n, kp in enumerate(KEYPOINTS) if kp["label"] in match_map and n not in discard_points]
 src_pts = np.array([[kp["x"], kp["y"]] for kp in valid_kps], dtype=np.float32)
 dst_pts = np.array([match_map[kp["label"]] for kp in valid_kps], dtype=np.float32)
 valid_labels = [kp["label"] for kp in valid_kps]
@@ -362,7 +367,8 @@ if len(src_pts) < 4:
     log.warning("Need at least 4 correspondences for homography; got %d.", len(src_pts))
     H_mat, inlier_mask = None, None
 else:
-    H_mat, inlier_mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, ransacReprojThreshold=8.0)
+    H_mat, inlier_mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, ransacReprojThreshold=2.0)
+    M = cv2.getAffineTransform(src_pts[[0,2,4]], dst_pts[[0,2,4]])
     n_inliers = int(inlier_mask.sum()) if inlier_mask is not None else 0
     log.info(
         "Query: %r | correspondences=%d | RANSAC inliers=%d",
@@ -371,16 +377,54 @@ else:
         n_inliers,
     )
     log.info("Homography matrix:\n%s", np.array2string(H_mat, precision=4, suppress_small=True))
+    log.info("Affine matrix:\n%s", np.array2string(M, precision=4, suppress_small=True))
+#%%
+ref_np = np.array(ref_img)
+q_np = np.array(q_img)
+canvas_w = orig_w + q_w
+canvas_h = max(orig_h, q_h)
+corresp = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+corresp[:orig_h, :orig_w] = ref_np
+corresp[:q_h, orig_w:] = q_np
 
+for i, (sp, dp, lbl) in enumerate(zip(src_pts, dst_pts, valid_labels)):
+    is_inlier = bool(inlier_mask[i]) if inlier_mask is not None else True
+    color = label_color[lbl] if is_inlier else (120, 120, 120)
+    pt1 = (int(sp[0]), int(sp[1]))
+    pt2 = (int(dp[0]) + orig_w, int(dp[1]))
+    cv2.line(corresp, pt1, pt2, color, thickness=2, lineType=cv2.LINE_AA)
+    cv2.circle(corresp, pt1, MARKER_RADIUS, color, -1)
+    cv2.circle(corresp, pt2, MARKER_RADIUS, color, -1)
+
+fig, axes = plt.subplots(1, 1, figsize=(18, 6))
+axes.imshow(corresp)
+axes.set_title(
+    f'Correspondences  (ref → "{qr["name"]}")\n'
+    f"inliers {n_inliers}/{len(src_pts)}  (grey = outlier)",
+    fontsize=10,
+)
+axes.axis("off")
 # %% Warp reference into query frame
 if H_mat is not None:
     ref_np = np.array(ref_img)
     q_np = np.array(q_img)
     h_out, w_out = q_np.shape[:2]
 
+    affined = cv2.warpAffine(ref_np, M, (w_out, h_out))
     warped = cv2.warpPerspective(ref_np, H_mat, (w_out, h_out))
 
     WARP_ALPHA = 0.45
+
+    blend_mask = (affined.sum(axis=2) > 0).astype(np.float32)[..., None]
+    overlay_affine = (
+        (
+            q_np.astype(np.float32) * (1 - WARP_ALPHA * blend_mask)
+            + affined.astype(np.float32) * WARP_ALPHA * blend_mask
+        )
+        .clip(0, 255)
+        .astype(np.uint8)
+    )
+
     blend_mask = (warped.sum(axis=2) > 0).astype(np.float32)[..., None]
     overlay = (
         (
@@ -406,7 +450,7 @@ if H_mat is not None:
         cv2.circle(corresp, pt1, MARKER_RADIUS, color, -1)
         cv2.circle(corresp, pt2, MARKER_RADIUS, color, -1)
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig, axes = plt.subplots(1, 5, figsize=(18, 6))
     axes[0].imshow(corresp)
     axes[0].set_title(
         f'Correspondences  (ref → "{qr["name"]}")\n'
@@ -415,13 +459,21 @@ if H_mat is not None:
     )
     axes[0].axis("off")
 
-    axes[1].imshow(warped)
-    axes[1].set_title("Reference warped into query frame", fontsize=10)
+    axes[1].imshow(affined)
+    axes[1].set_title("Reference affined into query frame", fontsize=10)
     axes[1].axis("off")
 
-    axes[2].imshow(overlay)
-    axes[2].set_title(f"Overlay  (warped α={WARP_ALPHA:.0%})", fontsize=10)
+    axes[2].imshow(warped)
+    axes[2].set_title("Reference warped into query frame", fontsize=10)
     axes[2].axis("off")
+
+    axes[3].imshow(overlay_affine)
+    axes[3].set_title(f"Overlay  (affine α={WARP_ALPHA:.0%})", fontsize=10)
+    axes[3].axis("off")
+
+    axes[4].imshow(overlay)
+    axes[4].set_title(f"Overlay  (warped α={WARP_ALPHA:.0%})", fontsize=10)
+    axes[4].axis("off")
 
     legend_handles = [
         mpatches.Patch(color=[c / 255 for c in label_color[lbl]], label=lbl) for lbl in valid_labels
@@ -443,3 +495,29 @@ if H_mat is not None:
     plt.show()
 else:
     log.warning("Skipping warp visualisation (insufficient correspondences).")
+
+
+# %%
+def verify_transform(H_mat, M, src_pts, dst_pts):
+    """Check that src_pts map to dst_pts under both transforms."""
+    # Perspective
+    src_h = np.hstack([src_pts, np.ones((len(src_pts), 1))])  # (N, 3)
+    proj = (H_mat @ src_h.T).T  # (N, 3)
+    proj_pts = proj[:, :2] / proj[:, 2:3]  # dehomogenize
+    print("source pts:\n", src_pts, "\ndst pts:\n", dst_pts, "\nprojected pts:\n", proj_pts)
+    persp_err = np.linalg.norm(proj_pts - dst_pts, axis=1)
+
+    # Affine
+    src_h2 = np.hstack([src_pts, np.ones((len(src_pts), 1))])  # (N, 3)
+    aff_pts = (M @ src_h2.T).T  # (N, 2)
+    aff_err = np.linalg.norm(aff_pts - dst_pts, axis=1)
+
+    for i, (pe, ae) in enumerate(zip(persp_err, aff_err)):
+        print(f"  pt{i}: perspective err={pe:.1f}px  affine err={ae:.1f}px")
+    print(f"  mean perspective err: {persp_err.mean():.1f}px")
+    print(f"  mean affine err:      {aff_err.mean():.1f}px")
+
+
+verify_transform(H_mat, M, src_pts, dst_pts)
+
+# %%
