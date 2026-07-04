@@ -14,6 +14,7 @@
 #   5.  Blending method comparison — hard / linear / gaussian (fixed overlap)
 #   6.  Self-similarity comparison — how consistent are features across scales?
 #   7.  Instance detection — baseline vs tiled density map comparison
+#   8.  Throughput — wall time for n baseline / n tiled (batched) / n full-size runs
 
 # %% Logging — must be before torch import
 import logging
@@ -26,9 +27,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("high_res_tiling")
 
+import time
 from pathlib import Path
-from urllib.request import urlretrieve
 
+import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -38,6 +40,7 @@ from PIL import Image
 from sklearn.decomposition import PCA
 
 from dinoisawesome import DinoEncoder
+from dinoisawesome.annotation_utils import load_annotations
 from dinoisawesome.instance_detection import (
     compute_density_map,
     compute_exemplar_features,
@@ -50,15 +53,15 @@ _REPO_ROOT = Path(__file__).parent.parent
 load_dotenv(_REPO_ROOT / ".env")
 
 # Image to experiment on — set to a local path or leave None to download
-IMAGE_PATH: Path | None = _REPO_ROOT / "data" / "abc2" / "LHa_1.jpg"
+IMAGE_PATH: Path | None = _REPO_ROOT / "data" / "abc3" / "LHa_1.jpg"
 
 # Optional exemplar mask for instance-detection comparison (.npy / .npz)
-MASK_PATH: Path | None = None
+MASK_PATH: Path | None = _REPO_ROOT / "data" / "abc3" / 'annotations' / "LHa_1"
 
 # Encoder
 DINO_VERSION = "v3"  # "v2" or "v3"
 DINO_SIZE = "large"  # "small" | "base" | "large" | "giant"
-BASE_IMG_SIZE = 1024  # encoder's fixed input size; "1× resolution" baseline
+BASE_IMG_SIZE = 512  # encoder's fixed input size; "1× resolution" baseline
 LAYER_IDX = 23  # transformer block for patch-token extraction
 DINO_WEIGHTS_DIR: str | None = os.environ.get("DINO_WEIGHTS_DIR")
 
@@ -68,17 +71,21 @@ EFFECTIVE_SIZE = BASE_IMG_SIZE * N_TILES  # 2048 — image is scaled to this bef
 
 # Overlap sweep
 OVERLAP_VALUES = [0, 16, 32, 64, 128]  # pixels of context added to each tile boundary
-DEFAULT_OVERLAP = 32  # overlap used for blending comparison
+DEFAULT_OVERLAP = 64  # overlap used for blending comparison
 
 # Blending methods to compare
 BLEND_METHODS = ["hard", "linear", "gaussian"]
 
 # Instance detection (for section 7)
-DENSITY_THRESHOLD = 0.3
+DENSITY_THRESHOLD = 0.5
 PEAK_KERNEL_SIZE = 5
-MIN_PEAK_THRESHOLD = 0.3
+MIN_PEAK_THRESHOLD = 0.5
 MASK_PATCH_THRESHOLD = 0.3
 EXEMPLAR_MODE = "mean"
+
+# Timing (Experiment 8)
+N_TIMING_RUNS = 30  # timed forward passes per method
+N_TIMING_WARMUP = 10  # warmup passes (discarded) before timing starts
 
 OUTPUT_DIR = _REPO_ROOT / "results" / "high_res_tiling"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -127,81 +134,109 @@ def encode_tiled(
     tx_idx = torch.arange(W_t, dtype=torch.float32)
     TY, TX = torch.meshgrid(ty_idx, tx_idx, indexing="ij")  # (H_t, W_t)
 
+    _dev = encoder.device
+
+    # --- Pass 1: collect all tile crops and their grid metadata ---
+    _t0_crop = time.perf_counter()
+    crops: list[Image.Image] = []
+    tile_meta: list[tuple[int, int, int, int, int, int]] = []  # y0, y1, x0, x1, tile_h, tile_w
     for row in range(n_tiles):
         for col in range(n_tiles):
             y0 = max(0, row * stride_px - overlap_px)
             y1 = min(effective_size, (row + 1) * stride_px + overlap_px)
             x0 = max(0, col * stride_px - overlap_px)
             x1 = min(effective_size, (col + 1) * stride_px + overlap_px)
+            crops.append(Image.fromarray(img_arr[y0:y1, x0:x1]))
+            tile_meta.append((y0, y1, x0, x1, y1 - y0, x1 - x0))
+    _t_crop = time.perf_counter() - _t0_crop
 
-            tile_h = y1 - y0
-            tile_w = x1 - x0
+    # --- Single batched forward pass over all n_tiles² crops ---
+    if _dev.type == "cuda":
+        torch.cuda.synchronize(_dev)
+    _t0_fwd = time.perf_counter()
+    out = encoder(crops, debias=debias)
+    if _dev.type == "cuda":
+        torch.cuda.synchronize(_dev)
+    _t_fwd = time.perf_counter() - _t0_fwd
 
-            crop = Image.fromarray(img_arr[y0:y1, x0:x1])
-            out = encoder([crop], debias=debias)
-            tile_feat = out.patches[0].cpu().float()  # (H_t, W_t, D)
+    _t0_post = time.perf_counter()
+    tile_feats = out.patches.cpu().float()  # (B, H_t, W_t, D)
 
-            # Map each tile patch to its canonical output position (float)
-            gc_y = y0 + (TY + 0.5) * tile_h / H_t  # global pixel centre (H_t, W_t)
-            gc_x = x0 + (TX + 0.5) * tile_w / W_t
-            oy_f = (gc_y * H_out / effective_size).clamp(0, H_out - 1)  # float
-            ox_f = (gc_x * W_out / effective_size).clamp(0, W_out - 1)
+    # --- Pass 2: accumulate each tile's patches into the output grid ---
+    for tile_feat, (y0, y1, x0, x1, tile_h, tile_w) in zip(tile_feats, tile_meta):
+        # Map each tile patch to its canonical output position (float)
+        gc_y = y0 + (TY + 0.5) * tile_h / H_t  # global pixel centre (H_t, W_t)
+        gc_x = x0 + (TX + 0.5) * tile_w / W_t
+        oy_f = (gc_y * H_out / effective_size).clamp(0, H_out - 1)  # float
+        ox_f = (gc_x * W_out / effective_size).clamp(0, W_out - 1)
 
-            # Per-patch blending weights
-            if blend == "hard":
-                W_map = torch.ones(H_t, W_t)
-            elif blend == "linear":
-                # Triangle: peak = 1 at tile centre, 0 at outer edge
-                bdy = 1.0 - (TY - (H_t - 1) / 2.0).abs() / (H_t / 2.0)
-                bdx = 1.0 - (TX - (W_t - 1) / 2.0).abs() / (W_t / 2.0)
-                W_map = (bdy * bdx).clamp(min=0.0)
-            elif blend == "gaussian":
-                sigma_y = H_t / 4.0
-                sigma_x = W_t / 4.0
-                bdy = torch.exp(-0.5 * ((TY - (H_t - 1) / 2.0) / sigma_y) ** 2)
-                bdx = torch.exp(-0.5 * ((TX - (W_t - 1) / 2.0) / sigma_x) ** 2)
-                W_map = bdy * bdx
-            else:
-                raise ValueError(f"Unknown blend method: {blend!r}")
+        # Per-patch blending weights
+        if blend == "hard":
+            W_map = torch.ones(H_t, W_t)
+        elif blend == "linear":
+            # Triangle: peak = 1 at tile centre, 0 at outer edge
+            bdy = 1.0 - (TY - (H_t - 1) / 2.0).abs() / (H_t / 2.0)
+            bdx = 1.0 - (TX - (W_t - 1) / 2.0).abs() / (W_t / 2.0)
+            W_map = (bdy * bdx).clamp(min=0.0)
+        elif blend == "gaussian":
+            sigma_y = H_t / 4.0
+            sigma_x = W_t / 4.0
+            bdy = torch.exp(-0.5 * ((TY - (H_t - 1) / 2.0) / sigma_y) ** 2)
+            bdx = torch.exp(-0.5 * ((TX - (W_t - 1) / 2.0) / sigma_x) ** 2)
+            W_map = bdy * bdx
+        else:
+            raise ValueError(f"Unknown blend method: {blend!r}")
 
-            flat_w = W_map.reshape(-1)
-            flat_f = tile_feat.reshape(H_t * W_t, D)  # (H_t*W_t, D)
+        flat_w = W_map.reshape(-1)
+        flat_f = tile_feat.reshape(H_t * W_t, D)  # (H_t*W_t, D)
 
-            # Bilinear splatting: distribute each patch to its 4 surrounding output
-            # positions.  This prevents "holes" (zero-weight positions) that appear
-            # when tile_h > stride_px (overlap > 0) and the floor-based nearest-
-            # neighbour mapping skips output rows/columns periodically.
-            oy_lo = oy_f.long().clamp(0, H_out - 1)
-            oy_hi = (oy_lo + 1).clamp(0, H_out - 1)
-            ox_lo = ox_f.long().clamp(0, W_out - 1)
-            ox_hi = (ox_lo + 1).clamp(0, W_out - 1)
-            frac_y = (oy_f - oy_lo.float()).clamp(0.0, 1.0)
-            frac_x = (ox_f - ox_lo.float()).clamp(0.0, 1.0)
+        # Bilinear splatting: distribute each patch to its 4 surrounding output
+        # positions.  This prevents "holes" (zero-weight positions) that appear
+        # when tile_h > stride_px (overlap > 0) and the floor-based nearest-
+        # neighbour mapping skips output rows/columns periodically.
+        oy_lo = oy_f.long().clamp(0, H_out - 1)
+        oy_hi = (oy_lo + 1).clamp(0, H_out - 1)
+        ox_lo = ox_f.long().clamp(0, W_out - 1)
+        ox_hi = (ox_lo + 1).clamp(0, W_out - 1)
+        frac_y = (oy_f - oy_lo.float()).clamp(0.0, 1.0)
+        frac_x = (ox_f - ox_lo.float()).clamp(0.0, 1.0)
 
-            bilinear_corners = [
-                (oy_lo, ox_lo, (1.0 - frac_y) * (1.0 - frac_x)),
-                (oy_lo, ox_hi, (1.0 - frac_y) * frac_x),
-                (oy_hi, ox_lo, frac_y * (1.0 - frac_x)),
-                (oy_hi, ox_hi, frac_y * frac_x),
-            ]
-            for OY, OX, corner_w in bilinear_corners:
-                flat_oy = OY.reshape(-1)
-                flat_ox = OX.reshape(-1)
-                combined_w = flat_w * corner_w.reshape(-1)
-                flat_idx = flat_oy * W_out + flat_ox
-                wgt.reshape(-1).scatter_add_(0, flat_idx, combined_w)
-                acc.reshape(-1, D).scatter_add_(
-                    0,
-                    flat_idx.unsqueeze(1).expand(-1, D),
-                    combined_w.unsqueeze(1) * flat_f,
-                )
+        bilinear_corners = [
+            (oy_lo, ox_lo, (1.0 - frac_y) * (1.0 - frac_x)),
+            (oy_lo, ox_hi, (1.0 - frac_y) * frac_x),
+            (oy_hi, ox_lo, frac_y * (1.0 - frac_x)),
+            (oy_hi, ox_hi, frac_y * frac_x),
+        ]
+        for OY, OX, corner_w in bilinear_corners:
+            flat_oy = OY.reshape(-1)
+            flat_ox = OX.reshape(-1)
+            combined_w = flat_w * corner_w.reshape(-1)
+            flat_idx = flat_oy * W_out + flat_ox
+            wgt.reshape(-1).scatter_add_(0, flat_idx, combined_w)
+            acc.reshape(-1, D).scatter_add_(
+                0,
+                flat_idx.unsqueeze(1).expand(-1, D),
+                combined_w.unsqueeze(1) * flat_f,
+            )
 
     # Normalise by accumulated weights
     mask = wgt > 0
     acc[mask] /= wgt[mask, None]
 
     # L2-normalise each patch vector
-    return F.normalize(acc, p=2, dim=-1)
+    result = F.normalize(acc, p=2, dim=-1)
+    _t_post = time.perf_counter() - _t0_post
+
+    _total = _t_crop + _t_fwd + _t_post
+    log.debug(
+        "encode_tiled  crop=%.1fms  forward=%.1fms (%.0f%%)  accum=%.1fms  total=%.1fms",
+        _t_crop * 1e3,
+        _t_fwd * 1e3,
+        100.0 * _t_fwd / _total if _total > 0 else 0.0,
+        _t_post * 1e3,
+        _total * 1e3,
+    )
+    return result
 
 
 def pca_rgb(feat_map: torch.Tensor, pca_fit: PCA | None = None) -> tuple[np.ndarray, PCA]:
@@ -235,6 +270,7 @@ encoder = DinoEncoder(
     size=DINO_SIZE,
     img_size=BASE_IMG_SIZE,
     weights_dir=DINO_WEIGHTS_DIR,
+    amp=True
 )
 H_GRID = encoder.grid_h  # 64 for v3 at 1024
 W_GRID = encoder.grid_w
@@ -281,13 +317,16 @@ plt.show()
 log.info("Experiment 1: Baseline 1× vs Tiled 2× (overlap=0) …")
 
 # Baseline: single forward pass at BASE_IMG_SIZE
-with_debias = True  # v3 large has some bias in later layers that can dominate PCA; set to False to disable
+# v3 large has some bias in later layers that can dominate PCA; set to False to disable
+with_debias = True
 out_base = encoder(img, debias=with_debias)
 feat_base = out_base.patches[0].cpu().float()  # (H_GRID, W_GRID, D)
 feat_base = F.normalize(feat_base, p=2, dim=-1)
 
 # Tiled 2×: 4 tiles, no overlap
-feat_tiled = encode_tiled(img, encoder, EFFECTIVE_SIZE, n_tiles=N_TILES, overlap_px=0, blend="hard", debias=with_debias)
+feat_tiled = encode_tiled(
+    img, encoder, EFFECTIVE_SIZE, n_tiles=N_TILES, overlap_px=0, blend="hard", debias=with_debias
+)
 # feat_tiled: (2*H_GRID, 2*W_GRID, D)
 
 log.info("Baseline feature map : %s", tuple(feat_base.shape))
@@ -476,11 +515,55 @@ plt.show()
 # %% Experiment 4 — Overlap sweep
 log.info("Experiment 4: Overlap sweep %s px …", OVERLAP_VALUES)
 
+# Effective receptive field per patch as a function of overlap.
+# The image goes through three resizes:
+#   original → effective_size (upscale) → tile crop (clamped) → encoder native size.
+# Each patch token covers (tile_crop_px / H_t) pixels of the effective image,
+# which maps back to (tile_crop_px / H_t) * (orig_h / effective_size) original pixels.
+# Edge tiles only get overlap on one side (max(0,...) / min(eff,...) clamps), so the
+# actual crop size varies by position — we simulate all tile positions to find the range.
+_orig_w, _orig_h = img.size
+_H_t = encoder.grid_h  # patch rows per tile (e.g. 73 for v3-large at 1024)
+_stride_px = EFFECTIVE_SIZE // N_TILES
+log.info(
+    "  ERF breakdown — orig=%dx%d  effective=%d  n_tiles=%d  stride_px=%d  patches_per_tile=%dx%d",
+    _orig_w,
+    _orig_h,
+    EFFECTIVE_SIZE,
+    N_TILES,
+    _stride_px,
+    _H_t,
+    encoder.grid_w,
+)
+log.info(
+    "  %8s  %14s  %14s  %12s  %12s",
+    "overlap",
+    "crop_min_px",
+    "crop_max_px",
+    "erf_min_px",
+    "erf_max_px",
+)
+for _ov in OVERLAP_VALUES:
+    _crops: list[int] = []
+    for _r in range(N_TILES):
+        for _c in range(N_TILES):
+            _y0 = max(0, _r * _stride_px - _ov)
+            _y1 = min(EFFECTIVE_SIZE, (_r + 1) * _stride_px + _ov)
+            _x0 = max(0, _c * _stride_px - _ov)
+            _x1 = min(EFFECTIVE_SIZE, (_c + 1) * _stride_px + _ov)
+            _crops.append(_y1 - _y0)
+            _crops.append(_x1 - _x0)
+    _crop_min, _crop_max = min(_crops), max(_crops)
+    _erf_min = _crop_min / _H_t * (_orig_h / EFFECTIVE_SIZE)
+    _erf_max = _crop_max / _H_t * (_orig_h / EFFECTIVE_SIZE)
+    log.info("  %8d  %14d  %14d  %12.1f  %12.1f", _ov, _crop_min, _crop_max, _erf_min, _erf_max)
+
 overlap_results: list[dict] = []
 for ov in OVERLAP_VALUES:
     log.info("  overlap_px=%d …", ov)
     feat_ov = encode_tiled(
-        img, encoder, EFFECTIVE_SIZE, n_tiles=N_TILES, overlap_px=ov, blend="linear", debias=with_debias
+        img, encoder, EFFECTIVE_SIZE,
+        n_tiles=N_TILES, overlap_px=ov, blend="linear", debias=with_debias
     )
     stats_v_ov = seam_sim_stats(feat_ov, "vertical")
     stats_h_ov = seam_sim_stats(feat_ov, "horizontal")
@@ -691,11 +774,11 @@ log.info(
 
 fig, axes = plt.subplots(1, 3, figsize=(16, 5))
 
-axes[0].imshow(to_img(rgb_base, BASE_IMG_SIZE))
-axes[0].set_title("Baseline PCA (1024)", fontsize=10)
+axes[0].imshow(img.resize((BASE_IMG_SIZE, BASE_IMG_SIZE), Image.BICUBIC))
+axes[0].set_title("Original image", fontsize=10)
 axes[0].axis("off")
 
-im = axes[1].imshow(cross_sim, cmap="RdYlGn", vmin=0, vmax=1, aspect="auto")
+im = axes[1].imshow(cross_sim, cmap="jet", vmin=0, vmax=1, aspect="auto")
 axes[1].set_title(
     f"Cross-scale cosine sim\nmean={cross_sim.mean():.3f}  std={cross_sim.std():.3f}",
     fontsize=10,
@@ -720,18 +803,14 @@ plt.show()
 # %% Experiment 7 — Instance detection comparison
 log.info("Experiment 7: Instance detection baseline vs tiled …")
 
-if MASK_PATH is not None and Path(MASK_PATH).exists():
-    if str(MASK_PATH).endswith(".npy"):
-        raw_seg = np.load(MASK_PATH)
-        if raw_seg.ndim == 3 and raw_seg.shape[0] < raw_seg.shape[1]:
-            raw_seg = raw_seg.transpose(1, 2, 0)
-    else:
-        raw_seg = np.load(MASK_PATH)["segmaps"]
-    pixel_mask_det = raw_seg.any(axis=2)
-    log.info("Mask loaded: coverage=%.1f%%", 100 * pixel_mask_det.mean())
-else:
+try:
+    anns = load_annotations(MASK_PATH)
+except FileNotFoundError as e:
     log.info("No mask provided — using full image as exemplar.")
+    log.info('error: %s', e)
     pixel_mask_det = None
+
+# %%
 
 
 def extract_masked_exemplar(
@@ -757,6 +836,17 @@ def extract_masked_exemplar(
     return flat[sel] if sel.any() else flat
 
 
+detection_class = ['donut foam', 'donut foam single']
+detection_masks = [i for i in anns if i['class'] in detection_class]
+pixel_mask_det = (
+    np.stack([i['mask'] for i in detection_masks]).any(axis=0) if detection_masks else None
+)
+canvas = np.array(img.copy())
+mask_overlay = (np.stack([pixel_mask_det] * 3, axis=-1) * 255).astype(np.uint8)
+canvas = cv2.addWeighted(canvas, 0.5, mask_overlay, 0.5, 0)
+plt.imshow(canvas)
+
+# %%
 # Baseline: use encode to get tokens from encoder forward (which is at BASE_IMG_SIZE)
 exemplar_tokens_base, ex_h_base, ex_w_base = extract_patch_tokens(encoder, img, LAYER_IDX)
 exemplar_masked_base = extract_masked_exemplar(
@@ -926,5 +1016,127 @@ log.info("  Instance detection:")
 log.info("    Baseline (%dx%d): %d peaks", H_GRID, W_GRID, len(peaks_base))
 log.info("    Tiled    (%dx%d): %d peaks", H_2x, W_2x, len(peaks_tiled))
 log.info("Outputs saved to %s", OUTPUT_DIR)
+
+# %% Experiment 8 — Throughput: baseline vs tiled (batched) vs full-size single-pass
+#
+# Three approaches: N_TIMING_WARMUP warmup passes (discarded), then N_TIMING_RUNS timed passes:
+#   baseline  — encoder at BASE_IMG_SIZE   → (H_GRID, W_GRID) patch grid
+#   tiled     — encode_tiled at EFFECTIVE_SIZE via N_TILES² batched crops
+#               → (N_TILES*H_GRID, N_TILES*W_GRID) grid
+#   full-size — fresh encoder at EFFECTIVE_SIZE, single forward pass
+#               → same (N_TILES*H_GRID, N_TILES*W_GRID) grid, no tiling overhead
+log.setLevel(logging.DEBUG)
+log.info("Experiment 8: Throughput comparison (%d runs each) …", N_TIMING_RUNS)
+
+# Full-size encoder: same weights, img_size = EFFECTIVE_SIZE.
+# This is the apples-to-apples single-pass reference at the tiled output resolution.
+log.info("  Instantiating full-size encoder (img_size=%d) …", EFFECTIVE_SIZE)
+encoder_full = DinoEncoder(
+    version=DINO_VERSION,
+    size=DINO_SIZE,
+    img_size=EFFECTIVE_SIZE,
+    weights_dir=DINO_WEIGHTS_DIR,
+)
+log.info(
+    "  Full-size encoder ready  grid=%dx%d  D=%d",
+    encoder_full.grid_h,
+    encoder_full.grid_w,
+    encoder_full.backbone.embed_dim,
+)
+
+
+def _sync(dev: torch.device) -> None:
+    """Flush the GPU queue so wall-clock time reflects actual compute."""
+    if dev.type == "cuda":
+        torch.cuda.synchronize(dev)
+
+
+def _time_runs(fn, dev: torch.device) -> np.ndarray:
+    """Warm up N_TIMING_WARMUP times, then return N_TIMING_RUNS wall-clock times in seconds."""
+    for _ in range(N_TIMING_WARMUP):
+        fn()
+    _sync(dev)
+    times: list[float] = []
+    for _ in range(N_TIMING_RUNS):
+        _sync(dev)
+        t0 = time.perf_counter()
+        fn()
+        _sync(dev)
+        times.append(time.perf_counter() - t0)
+    return np.array(times)
+
+
+log.info("  Timing baseline …")
+times_base = _time_runs(lambda: encoder(img, debias=with_debias), encoder.device)
+
+log.info("  Timing tiled (batched) …")
+times_tiled = _time_runs(
+    lambda: encode_tiled(
+        img, encoder, EFFECTIVE_SIZE,
+        n_tiles=N_TILES, overlap_px=DEFAULT_OVERLAP, blend="gaussian", debias=with_debias,
+    ),
+    encoder.device,
+)
+
+log.info("  Timing full-size …")
+times_full = _time_runs(lambda: encoder_full(img, debias=with_debias), encoder_full.device)
+
+for label, t_arr in zip(
+    ["Baseline", f"Tiled {N_TILES}×{N_TILES} (batched)", "Full-size"],
+    [times_base, times_tiled, times_full],
+):
+    log.info(
+        "  %-28s  mean=%6.1f ms  std=%5.1f ms  min=%6.1f ms  max=%6.1f ms",
+        label,
+        t_arr.mean() * 1e3,
+        t_arr.std() * 1e3,
+        t_arr.min() * 1e3,
+        t_arr.max() * 1e3,
+    )
+
+labels_8 = [
+    f"Baseline\n({BASE_IMG_SIZE}px  {H_GRID}×{W_GRID})",
+    f"Tiled {N_TILES}×{N_TILES}\n({EFFECTIVE_SIZE}px  {N_TILES*H_GRID}×{N_TILES*W_GRID})",
+    f"Full-size\n({EFFECTIVE_SIZE}px  {encoder_full.grid_h}×{encoder_full.grid_w})",
+]
+means_8 = np.array([times_base.mean(), times_tiled.mean(), times_full.mean()]) * 1e3
+stds_8 = np.array([times_base.std(), times_tiled.std(), times_full.std()]) * 1e3
+colors_8 = ["#3498db", "#e67e22", "#2ecc71"]
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+bars = axes[0].bar(labels_8, means_8, yerr=stds_8, color=colors_8, capsize=6, width=0.5)
+axes[0].set_ylabel("Wall time (ms)")
+axes[0].set_title(f"Mean ± std  ({N_TIMING_RUNS} runs, {N_TIMING_WARMUP} warmups)")
+axes[0].grid(axis="y", alpha=0.3)
+for bar, mean_ms, std_ms in zip(bars, means_8, stds_8):
+    axes[0].text(
+        bar.get_x() + bar.get_width() / 2.0,
+        mean_ms + std_ms + stds_8.max() * 0.05,
+        f"{mean_ms:.1f} ms",
+        ha="center",
+        va="bottom",
+        fontsize=9,
+    )
+
+axes[1].boxplot(
+    [times_base * 1e3, times_tiled * 1e3, times_full * 1e3],
+    patch_artist=True,
+    boxprops={"facecolor": "none"},
+    medianprops={"color": "black", "linewidth": 2},
+)
+axes[1].set_xticks([1, 2, 3])
+axes[1].set_xticklabels(labels_8)
+axes[1].set_ylabel("Wall time (ms)")
+axes[1].set_title("Per-run distribution")
+axes[1].grid(axis="y", alpha=0.3)
+
+plt.suptitle(
+    f"Exp 8: Throughput  |  DINOv{DINO_VERSION[1]}-{DINO_SIZE}  |  {N_TIMING_RUNS} runs each",
+    fontsize=12,
+)
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "exp8_throughput.png", dpi=150, bbox_inches="tight")
+plt.show()
 
 # %%

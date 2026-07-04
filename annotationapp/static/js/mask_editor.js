@@ -70,6 +70,9 @@ const _me = {
     // Polarity of the box/point currently being drawn (1 = positive, 0 = negative)
     boxPolarity: 1,
 
+    // Current mouse position in canvas-pixel coords (null when outside canvas)
+    mousePos: null,
+
     // ── Zoom / pan ─────────────────────────────────────────────────────────
     // CSS transform on .canvas-stack; canvasCoords() uses getBoundingClientRect()
     // so coordinate conversion stays correct at any zoom level.
@@ -146,6 +149,8 @@ function _applyTransform() {
         stack.style.transform = `translate(${_me.panX}px,${_me.panY}px) scale(${_me.zoom})`;
     }
     _updateCanvasInfo();
+    // Redraw so all prompt/crosshair sizes recalculate for the new zoom level.
+    if (_me.currentImagePath) redrawOverlay();
 }
 
 function _resetView() {
@@ -609,40 +614,43 @@ function onMouseDown(e) {
 }
 
 function onMouseMove(e) {
+    const coords = canvasCoords(e);
+    _me.mousePos = coords;
+
     if (_me.promptType === 'brush') {
-        const coords = canvasCoords(e);
         if (_me.isBrushing) {
             _brushPaint(coords.x, coords.y, _me.brushErasing);
-            redrawOverlay();
-        } else {
-            redrawOverlay();
         }
+        redrawOverlay();
         _drawBrushCursor(coords.x, coords.y);
         return;
     }
 
-    if (_me.promptType === 'points') return;
-
     if (_me.promptType === 'points_boxes') {
-        if (!_pxDown) return;
-        _me.boxEnd = canvasCoords(e);
-        const dx = _me.boxEnd.x - _pxDown.x;
-        const dy = _me.boxEnd.y - _pxDown.y;
-        // Promote to drag once the cursor moves more than 5 px
-        if (!_me.drawingBox && (Math.abs(dx) > 5 || Math.abs(dy) > 5)) {
-            _me.drawingBox = true;
+        if (_pxDown) {
+            _me.boxEnd = coords;
+            const dx = coords.x - _pxDown.x;
+            const dy = coords.y - _pxDown.y;
+            // Promote to drag once the cursor moves more than 5 px
+            if (!_me.drawingBox && (Math.abs(dx) > 5 || Math.abs(dy) > 5)) {
+                _me.drawingBox = true;
+            }
         }
-        if (_me.drawingBox) {
-            redrawOverlay();
-            _drawBoxPreview(_pxDown, _me.boxEnd, _me.boxPolarity);
+        redrawOverlay();
+        if (_me.drawingBox && _pxDown) {
+            _drawBoxPreview(_pxDown, coords, _me.boxPolarity);
         }
         return;
     }
 
-    if (!_me.drawingBox) return;
-    _me.boxEnd = canvasCoords(e);
+    // points / boxes / mixed / text: always redraw so the crosshair tracks the cursor
+    if (_me.drawingBox) {
+        _me.boxEnd = coords;
+    }
     redrawOverlay();
-    _drawBoxPreview(_me.boxStart, _me.boxEnd, _me.boxPolarity);
+    if (_me.drawingBox) {
+        _drawBoxPreview(_me.boxStart, _me.boxEnd, _me.boxPolarity);
+    }
 }
 
 function onMouseUp(e) {
@@ -694,6 +702,8 @@ function onMouseUp(e) {
 }
 
 function onMouseLeave() {
+    _me.mousePos = null;
+
     if (_me.promptType === 'brush') {
         _me.isBrushing = false;
         redrawOverlay();  // erase the cursor circle
@@ -703,10 +713,10 @@ function onMouseLeave() {
     if (_me.drawingBox) {
         _me.drawingBox = false;
         _pxDown = null;
-        redrawOverlay();
     } else if (_pxDown) {
         _pxDown = null;
     }
+    redrawOverlay();  // erase the crosshair
 }
 
 // ── Point handling ─────────────────────────────────────────────────────────
@@ -727,10 +737,11 @@ function onPointMouseDown(e) {
 
 // ── Box preview helper ─────────────────────────────────────────────────────
 function _drawBoxPreview(start, end, polarity) {
+    const invZ = 1 / _me.zoom;
     overlayCtx.save();
     overlayCtx.strokeStyle = polarity === 0 ? 'rgba(220,50,50,0.9)' : 'rgba(255,255,255,0.85)';
-    overlayCtx.lineWidth = 2;
-    overlayCtx.setLineDash([6, 3]);
+    overlayCtx.lineWidth = 2 * invZ;
+    overlayCtx.setLineDash([6 * invZ, 3 * invZ]);
     overlayCtx.strokeRect(
         Math.min(start.x, end.x), Math.min(start.y, end.y),
         Math.abs(end.x - start.x), Math.abs(end.y - start.y),
@@ -917,6 +928,11 @@ function redrawOverlay() {
     } else if (type !== 'brush') {
         drawBoxes();
     }
+
+    // 5. Draw crosshair cursor for all non-brush modes when the mouse is over the canvas
+    if (type !== 'brush' && _me.mousePos) {
+        _drawCrosshair(_me.mousePos.x, _me.mousePos.y);
+    }
 }
 
 function renderAllAnnotationMasks() {
@@ -1029,16 +1045,17 @@ function drawSelectedMaskMarker() {
     }
     if (minRow === Infinity) return;
 
+    const invZ = 1 / _me.zoom;
     const cx   = (minCol + maxCol) / 2;
     const cy   = (minRow + maxRow) / 2;
-    const size = Math.max(18, Math.min(overlayCanvas.width, overlayCanvas.height) * 0.025);
-    const lw   = Math.max(3, size * 0.22);
+    const size = Math.max(18, Math.min(overlayCanvas.width, overlayCanvas.height) * 0.025) * invZ;
+    const lw   = Math.max(3 * invZ, size * 0.22);
 
     const [r, g, b] = PALETTE[_me.selectedMaskIdx % PALETTE.length];
 
     overlayCtx.save();
     overlayCtx.strokeStyle = 'rgba(255,255,255,0.85)';
-    overlayCtx.lineWidth   = lw + 3;
+    overlayCtx.lineWidth   = lw + 3 * invZ;
     overlayCtx.lineCap     = 'round';
     overlayCtx.setLineDash([]);
     overlayCtx.beginPath();
@@ -1060,15 +1077,18 @@ function drawSelectedMaskMarker() {
 
 function drawPoints() {
     if (_me.points.length === 0) return;
+    const invZ = 1 / _me.zoom;
+    const baseRadius = Math.max(6, Math.round(Math.min(overlayCanvas.width, overlayCanvas.height) * 0.012));
+    const radius = baseRadius * invZ;
+    const strokeWidth = Math.max(2, baseRadius * 0.35) * invZ;
     overlayCtx.save();
-    const radius = Math.max(6, Math.round(Math.min(overlayCanvas.width, overlayCanvas.height) * 0.012));
     for (const pt of _me.points) {
         overlayCtx.beginPath();
         overlayCtx.arc(pt.x, pt.y, radius, 0, Math.PI * 2);
         overlayCtx.fillStyle   = pt.label === 1 ? '#22dd55' : '#dd2222';
         overlayCtx.fill();
         overlayCtx.strokeStyle = '#fff';
-        overlayCtx.lineWidth   = Math.max(2, radius * 0.35);
+        overlayCtx.lineWidth   = strokeWidth;
         overlayCtx.stroke();
     }
     overlayCtx.restore();
@@ -1076,14 +1096,15 @@ function drawPoints() {
 
 function drawBoxes() {
     if (_me.boxes.length === 0) return;
+    const invZ = 1 / _me.zoom;
     const [r, g, b] = classColor(_me.selectedClass);
     overlayCtx.save();
-    overlayCtx.lineWidth = 2;
+    overlayCtx.lineWidth = 2 * invZ;
     for (let i = 0; i < _me.boxes.length; i++) {
         const [x1, y1, x2, y2] = _me.boxes[i];
         const isNeg = _me.boxLabels[i] === 0;
         overlayCtx.strokeStyle = isNeg ? 'rgb(220,50,50)' : `rgb(${r},${g},${b})`;
-        overlayCtx.setLineDash(isNeg ? [6, 3] : []);
+        overlayCtx.setLineDash(isNeg ? [6 * invZ, 3 * invZ] : []);
         overlayCtx.strokeRect(x1, y1, x2 - x1, y2 - y1);
     }
     overlayCtx.restore();
@@ -1250,6 +1271,7 @@ async function saveAnnotation() {
             if (!resp.ok) { setStatus('Save failed'); return; }
             _me.instanceId++;
             $id('instance-id-input').value = _me.instanceId;
+            clearBrushCanvas();
             await loadAnnotations();
             setStatus('Brush annotation saved');
         } catch (err) {
@@ -1294,6 +1316,18 @@ async function saveAnnotation() {
         }
         _me.instanceId += maskCount;
         $id('instance-id-input').value = _me.instanceId;
+
+        // Clear all prompts and SAM results so the next instance starts fresh
+        _me.points      = [];
+        _me.boxes       = [];
+        _me.boxLabels   = [];
+        _me.textPrompt  = '';
+        _me.promptStack = [];
+        $id('text-prompt-input').value = '';
+        _me.currentMasks    = [];
+        _me.selectedMaskIdx = 0;
+        $id('mask-prev-container').innerHTML = '';
+
         await loadAnnotations();
         setStatus(`${maskCount} annotation(s) saved`);
     } catch (err) {
@@ -1505,8 +1539,45 @@ function initBrushFromSAMMask() {
     setStatus('Brush initialized from SAM mask');
 }
 
+// ── Crosshair cursor ────────────────────────────────────────────────────────
+// Drawn in canvas-pixel space; all sizes divided by _me.zoom so the visual
+// screen size stays constant regardless of how much the user has zoomed in.
+function _drawCrosshair(x, y) {
+    const invZ = 1 / _me.zoom;
+    const gap  = 4 * invZ;   // gap around the centre point
+    const lw   = 1 * invZ;   // line width
+    const W    = overlayCanvas.width;
+    const H    = overlayCanvas.height;
+
+    overlayCtx.save();
+    overlayCtx.setLineDash([]);
+    overlayCtx.lineCap = 'butt';
+
+    // Dark shadow for contrast on any background
+    overlayCtx.strokeStyle = 'rgba(0,0,0,0.4)';
+    overlayCtx.lineWidth   = lw * 3;
+    overlayCtx.beginPath();
+    overlayCtx.moveTo(0, y);     overlayCtx.lineTo(x - gap, y);
+    overlayCtx.moveTo(x + gap, y); overlayCtx.lineTo(W, y);
+    overlayCtx.moveTo(x, 0);     overlayCtx.lineTo(x, y - gap);
+    overlayCtx.moveTo(x, y + gap); overlayCtx.lineTo(x, H);
+    overlayCtx.stroke();
+
+    // Bright white lines on top
+    overlayCtx.strokeStyle = 'rgba(255,255,255,0.75)';
+    overlayCtx.lineWidth   = lw;
+    overlayCtx.beginPath();
+    overlayCtx.moveTo(0, y);     overlayCtx.lineTo(x - gap, y);
+    overlayCtx.moveTo(x + gap, y); overlayCtx.lineTo(W, y);
+    overlayCtx.moveTo(x, 0);     overlayCtx.lineTo(x, y - gap);
+    overlayCtx.moveTo(x, y + gap); overlayCtx.lineTo(x, H);
+    overlayCtx.stroke();
+
+    overlayCtx.restore();
+}
+
 function _updateBrushCursorStyle() {
-    overlayCanvas.style.cursor = (_me.promptType === 'brush') ? 'none' : 'crosshair';
+    // Cursor is always 'none' — custom crosshair / brush-circle are drawn on the canvas.
 }
 
 function _updateBrushUI() {

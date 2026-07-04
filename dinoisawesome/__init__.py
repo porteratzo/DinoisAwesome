@@ -1,6 +1,7 @@
 """DinoisAwesome: DINO ViT feature extraction and patch-level retrieval gallery."""
 
 from .anomaly_head import AnomalyHead
+from .annotation_utils import load_annotations
 from .encoder import DinoEncoder, ExtractorOutput
 from .foreground_head import ForegroundHead
 from .gallery import Gallery, GalleryConfig
@@ -22,6 +23,7 @@ from .keypoint_localization import (
 )
 
 __all__ = [
+    "load_annotations",
     "DinoEncoder",
     "ExtractorOutput",
     "Gallery",

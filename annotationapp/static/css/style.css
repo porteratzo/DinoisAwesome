@@ -126,7 +126,7 @@ body {
     left: 0;
     width: 100%;   /* CSS display size matches image-canvas */
     height: 100%;
-    cursor: crosshair;
+    cursor: none;  /* crosshair and brush-circle are drawn directly on the canvas */
 }
 
 /* ── Right sidebar ───────────────────────────────────────────────────────── */
