@@ -58,6 +58,8 @@ log = logging.getLogger(__name__)
 # ── reuse helpers from eval_sam_dino ───────────────────────────────────────
 _SCRIPTS = Path(__file__).parent
 sys.path.insert(0, str(_SCRIPTS))
+import torch  # noqa: E402
+import torch.nn.functional as F  # noqa: E402
 from eval_sam_dino import (  # noqa: E402
     ExemplarFeatures,
     MaskGenerator,
@@ -73,9 +75,8 @@ from eval_sam_dino import (  # noqa: E402
     score_method3,
 )
 
-import torch  # noqa: E402
-import torch.nn.functional as F  # noqa: E402
 from dinoisawesome import DinoEncoder  # noqa: E402
+from dinoisawesome.utils import mask_iou  # noqa: E402
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HuggingFace SAM2 mask generator (mirrors notebooks/sam_segmenter.ipynb)
@@ -274,12 +275,6 @@ class HFSAMTextGenerator:
         self._min_area_frac = min_area_frac
         self._sam_input_size = sam_input_size
 
-    @staticmethod
-    def _mask_iou(a: np.ndarray, b: np.ndarray) -> float:
-        inter = int((a & b).sum())
-        union = int((a | b).sum())
-        return inter / union if union else 0.0
-
     def generate(self, image: np.ndarray) -> list[dict]:
         H, W = image.shape[:2]
         min_area = int(H * W * self._min_area_frac)
@@ -328,7 +323,7 @@ class HFSAMTextGenerator:
         raw.sort(key=lambda t: t[1], reverse=True)
         kept: list[tuple[np.ndarray, float]] = []
         for mask, score in raw:
-            if all(self._mask_iou(mask, k[0]) < self._nms_iou_threshold for k in kept):
+            if all(mask_iou(mask, k[0]) < self._nms_iou_threshold for k in kept):
                 kept.append((mask, score))
 
         log.info(
@@ -407,18 +402,6 @@ def load_dataset(data_dir: Path) -> list[Sample]:
 
     log.info("Loaded %d samples from %s", len(samples), data_dir)
     return samples
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# IoU helper
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def mask_iou(a: np.ndarray, b: np.ndarray) -> float:
-    """Intersection-over-Union between two boolean masks of the same shape."""
-    intersection = np.logical_and(a, b).sum()
-    union = np.logical_or(a, b).sum()
-    return float(intersection) / (float(union) + 1e-8)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

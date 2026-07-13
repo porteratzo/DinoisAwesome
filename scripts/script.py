@@ -46,6 +46,7 @@ load_dotenv(Path("../../../.env"))
 import torch
 import torch.nn.functional as F
 from dinoisawesome import DinoEncoder
+from dinoisawesome.utils import mask_iou
 
 # ── pipeline helpers from the scripts directory ────────────────────────────
 _SCRIPTS = Path("").resolve()
@@ -216,12 +217,6 @@ class HFSAMTextGenerator:
         self._min_area_frac = min_area_frac
         self._sam_input_size = sam_input_size
 
-    @staticmethod
-    def _mask_iou(a, b):
-        inter = int((a & b).sum())
-        union = int((a | b).sum())
-        return inter / union if union else 0.0
-
     def generate(self, image):
         H, W = image.shape[:2]
         min_area = int(H * W * self._min_area_frac)
@@ -266,7 +261,7 @@ class HFSAMTextGenerator:
         raw.sort(key=lambda t: t[1], reverse=True)
         kept = []
         for mask, score in raw:
-            if all(self._mask_iou(mask, k[0]) < self._nms_iou_threshold for k in kept):
+            if all(mask_iou(mask, k[0]) < self._nms_iou_threshold for k in kept):
                 kept.append((mask, score))
 
         log.info(
@@ -511,12 +506,6 @@ plt.show()
 # | M1 — Global | Mean cosine similarity of candidate patches vs. exemplar prototype |
 # | M2 — PatchCross | Mean of best-match similarities: each candidate patch vs. all exemplar patches |
 # | M3 — Cluster | Mean cosine similarity vs. K-means cluster centroids (requires `N_CLUSTERS > 1`) |
-
-
-# %%
-def mask_iou(a, b):
-    """Intersection-over-Union between two boolean masks of the same shape."""
-    return float(np.logical_and(a, b).sum()) / (float(np.logical_or(a, b).sum()) + 1e-8)
 
 
 @dataclass

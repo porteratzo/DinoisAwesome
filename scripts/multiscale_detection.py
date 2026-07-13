@@ -36,7 +36,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("multiscale_detection")
 
-import matplotlib.patches as mpatches  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
@@ -48,6 +47,15 @@ from dinoisawesome.instance_detection import (  # noqa: E402
     compute_exemplar_features,
     extract_patch_tokens,
     extract_peaks,
+)
+from dinoisawesome.utils import (  # noqa: E402
+    draw_box,
+    heat_overlay,
+    load_instance_mask,
+    mask_bbox_rc,
+    pixel_mask_to_patch_mask,
+    thumb,
+    upsample_map,
 )
 
 # ── Experiment parameters ──────────────────────────────────────────────────────
@@ -73,12 +81,6 @@ DISPLAY_WIDTH = 900  # pixels wide for display thumbnails
 # ── Geometry helpers ───────────────────────────────────────────────────────────
 
 
-def mask_bbox(mask: np.ndarray) -> tuple[int, int, int, int]:
-    """Bounding box of the True region as (rmin, rmax, cmin, cmax)."""
-    rows, cols = np.where(mask)
-    return int(rows.min()), int(rows.max()), int(cols.min()), int(cols.max())
-
-
 def scale_crop_box(
     mask: np.ndarray,
     scale: str,
@@ -91,7 +93,7 @@ def scale_crop_box(
     full  – entire image
     """
     H, W = mask.shape
-    rmin, rmax, cmin, cmax = mask_bbox(mask)
+    rmin, rmax, cmin, cmax = mask_bbox_rc(mask)
 
     pad_r = int((rmax - rmin) * padding_frac)
     pad_c = int((cmax - cmin) * padding_frac)
@@ -124,81 +126,7 @@ def crop_mask(pixel_mask: np.ndarray, box: tuple[int, int, int, int]) -> np.ndar
     return pixel_mask[y0:y1, x0:x1]
 
 
-def pixel_mask_to_patch_mask(
-    pixel_mask: np.ndarray,
-    grid_h: int,
-    grid_w: int,
-    img_size: int,
-    threshold: float = MASK_PATCH_THRESHOLD,
-) -> np.ndarray:
-    """Resize a (H, W) bool pixel mask to (grid_h, grid_w) patch-grid bool array."""
-    mask_pil = Image.fromarray(pixel_mask.astype(np.uint8) * 255)
-    resized = np.array(mask_pil.resize((img_size, img_size), Image.NEAREST)) > 0
-    ph = img_size // grid_h
-    pw = img_size // grid_w
-    tiled = resized.reshape(grid_h, ph, grid_w, pw)
-    return tiled.mean(axis=(1, 3)) >= threshold  # (grid_h, grid_w) bool
-
-
-# ── Visualisation helpers ──────────────────────────────────────────────────────
-
-
-def thumb(img: Image.Image, width: int = DISPLAY_WIDTH) -> np.ndarray:
-    """Resize PIL image to `width` keeping aspect ratio, return uint8 array."""
-    h, w = img.height, img.width
-    new_h = int(h * width / w)
-    return np.array(img.resize((width, new_h), Image.BICUBIC))
-
-
-def upsample_map(arr: np.ndarray, target_h: int, target_w: int) -> np.ndarray:
-    """Normalise to [0, 1] and upsample a (H, W) map to (target_h, target_w)."""
-    norm = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
-    pil = Image.fromarray((norm * 255).astype(np.uint8))
-    return np.array(pil.resize((target_w, target_h), Image.NEAREST)) / 255.0
-
-
-def heat_overlay(
-    bg_uint8: np.ndarray,
-    heat: np.ndarray,
-    alpha: float = 0.55,
-) -> np.ndarray:
-    """Blend a jet heatmap over an uint8 RGB image."""
-    colored = plt.get_cmap("jet")(heat)[..., :3]
-    return np.clip(bg_uint8 / 255.0 * (1 - alpha) + colored * alpha, 0, 1)
-
-
-def mask_overlay(
-    base_uint8: np.ndarray, mask_bool: np.ndarray, color_rgba=(0.2, 0.9, 0.2, 0.45)
-) -> None:
-    """Imshow a semi-transparent colour overlay for a boolean mask on the current axes."""
-    ov = np.zeros((*mask_bool.shape, 4), dtype=np.float32)
-    ov[mask_bool] = color_rgba
-    plt.gca().imshow(ov)
-
-
-def draw_box(ax: plt.Axes, box: tuple[int, int, int, int], color: str, label: str) -> None:
-    """Draw a PIL-style (x0,y0,x1,y1) rectangle on an axes."""
-    x0, y0, x1, y1 = box
-    rect = mpatches.Rectangle(
-        (x0, y0),
-        x1 - x0,
-        y1 - y0,
-        linewidth=2,
-        edgecolor=color,
-        facecolor="none",
-        label=label,
-    )
-    ax.add_patch(rect)
-
-
 # ── Data loading ───────────────────────────────────────────────────────────────
-
-
-def load_pixel_mask(path: Path) -> np.ndarray:
-    """Load .npy annotation (N, H, W) bool → (H, W) union mask."""
-    raw = np.load(path)  # (N, H, W)
-    raw = raw.transpose(1, 2, 0)  # (H, W, N)
-    return raw.any(axis=2)  # (H, W) bool
 
 
 def find_images(data_dir: Path, part_type: str, ref_number: int) -> tuple[Path, list[Path]]:
@@ -284,7 +212,7 @@ def fig_crop_overview(
     fig, axes = plt.subplots(1, ncols, figsize=(ncols * 5, 5))
 
     # Full exemplar with all boxes
-    ex_arr = thumb(exemplar_img)
+    ex_arr = thumb(exemplar_img, DISPLAY_WIDTH)
     H_full, W_full = exemplar_img.height, exemplar_img.width
     scale_x = ex_arr.shape[1] / W_full
     scale_y = ex_arr.shape[0] / H_full
@@ -312,7 +240,7 @@ def fig_crop_overview(
 
     # One panel per crop scale
     for ax, info in zip(axes[1:], scale_infos):
-        crop_arr = thumb(info["crop_img"])
+        crop_arr = thumb(info["crop_img"], DISPLAY_WIDTH)
         mask_c_resized = (
             np.array(
                 Image.fromarray(info["mask_crop"].astype(np.uint8) * 255).resize(
@@ -382,7 +310,7 @@ def fig_detection_comparison(
         )
 
         # Col 0: exemplar crop with mask
-        crop_arr = thumb(info["crop_img"])
+        crop_arr = thumb(info["crop_img"], DISPLAY_WIDTH)
         mask_c_resized = (
             np.array(
                 Image.fromarray(info["mask_crop"].astype(np.uint8) * 255).resize(
@@ -656,7 +584,7 @@ def main() -> None:
 
     if not mask_path.exists():
         raise FileNotFoundError(f"Mask not found: {mask_path}")
-    pixel_mask = load_pixel_mask(mask_path)
+    pixel_mask = load_instance_mask(mask_path)
     n_instances = np.load(mask_path).shape[0]
     log.info(
         "Mask: %s  shape=%s  instances=%d  coverage=%.2f%%",
@@ -666,7 +594,7 @@ def main() -> None:
         100.0 * pixel_mask.mean(),
     )
 
-    rmin, rmax, cmin, cmax = mask_bbox(pixel_mask)
+    rmin, rmax, cmin, cmax = mask_bbox_rc(pixel_mask)
     log.info(
         "Mask bounding box: rows %d–%d  cols %d–%d  (%dx%d px)",
         rmin,
