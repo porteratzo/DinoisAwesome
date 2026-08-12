@@ -36,11 +36,3 @@ mypy dinoisawesome/
 ## Critical Thinking
 
 Evaluate requests on their technical merits before acting. If you spot a flaw, a simpler path, or a hidden cost, say so and explain why. When a plan is sound, confirm and proceed.
-
-
-## Pre-Push Checklist
-
-Before every `git push`:
-1. `ruff check .` — fix all errors
-2. `ruff format .` — apply formatting
-3. `mypy dinoisawesome/` — resolve type errors

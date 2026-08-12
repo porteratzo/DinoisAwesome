@@ -282,6 +282,29 @@ class Gallery:
             df = df[df["split"] == split]
         return df
 
+    def load_image_grid(self, image_id: str, block_idx: int | None = None) -> np.ndarray:
+        """Load one image's un-flattened patch embeddings as ``(H, W, D)``.
+
+        Unlike :meth:`load_embeddings`, which flattens to one row per
+        ``(image_id, row, col)``, this preserves spatial adjacency — needed by
+        callers that pool or convolve over the patch grid (e.g. neighbor
+        smoothing) before flattening themselves.
+
+        Args:
+            image_id:  Image identifier — must match a ``.npy`` file under
+                       ``embeddings/``.
+            block_idx: Transformer block to extract. Defaults to the last
+                       stored block.
+
+        Returns:
+            float32 array of shape ``(H, W, D)``.
+        """
+        if block_idx is None:
+            block_idx = self.config.block_indices[-1]
+        layer_idx = self.config.layer_idx(block_idx)
+        npy = np.load(self.root / self._EMB_DIR / f"{image_id}.npy", mmap_mode="r")
+        return np.asarray(npy[layer_idx])  # (H, W, D)
+
     def load_embeddings(self, df: pd.DataFrame, block_idx: int | None = None) -> np.ndarray:
         """Load patch embeddings for the rows in *df* as a float32 array of shape ``(N, D)``.
 
@@ -299,14 +322,12 @@ class Gallery:
         """
         if block_idx is None:
             block_idx = self.config.block_indices[-1]
-        layer_idx = self.config.layer_idx(block_idx)
 
         result = np.empty((len(df), self.config.embed_dim), dtype=np.float32)
         pos_map = {idx: i for i, idx in enumerate(df.index)}
 
         for img_id, group in df.groupby("image_id"):
-            npy = np.load(self.root / self._EMB_DIR / f"{img_id}.npy", mmap_mode="r")
-            layer = np.asarray(npy[layer_idx])  # (H, W, D)
+            layer = self.load_image_grid(img_id, block_idx)  # (H, W, D)
             out_pos = [pos_map[idx] for idx in group.index]
             result[out_pos] = layer[
                 group["row"].values.astype(int), group["col"].values.astype(int)

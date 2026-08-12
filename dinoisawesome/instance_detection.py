@@ -41,6 +41,7 @@ def extract_patch_tokens(
     encoder: DinoEncoder,
     image: Image.Image,
     layer_idx: int,
+    debias: bool = False,
 ) -> tuple[torch.Tensor, int, int]:
     """Return L2-normalised patch tokens from a single transformer block.
 
@@ -55,7 +56,7 @@ def extract_patch_tokens(
         grid_w:  Number of patch columns.
     """
     # layers=[layer_idx] → raw output shape (B, L=1, H, W, D)
-    out = encoder(image, layers=[layer_idx])
+    out = encoder(image, layers=[layer_idx], debias=debias)
     patches = out.patches[:, 0]  # (B, H, W, D) — drop the L=1 dimension
     _, H, W, D = patches.shape
     tokens = patches[0].reshape(H * W, D)  # (H*W, D)

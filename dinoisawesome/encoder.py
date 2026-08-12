@@ -37,6 +37,10 @@ _MODEL_NAMES: dict[tuple[str, str], str] = {
     ("v3", "giant"): "dinov3_vitg16",
 }
 
+_ALLOWED_DTYPES: frozenset[torch.dtype] = frozenset(
+    {torch.float32, torch.float16, torch.bfloat16, torch.float64}
+)
+
 _log = logging.getLogger(__name__)
 
 
@@ -116,13 +120,22 @@ class DinoEncoder(nn.Module):
                   list → explicit 0-based block indices (e.g. [8, 9, 10, 11]).
                   Can be overridden per-call in forward().
         device:      "cuda" / "cuda:N", "xpu" / "xpu:N", "cpu", or None for auto.
-        amp:         Enable torch.autocast (bfloat16) during inference.
-        dtype:       Cast model weights to this dtype. None keeps float32.
+        amp:         Enable torch.autocast during inference. When `dtype` is not given,
+                     amp also defaults the backbone's weight dtype to bfloat16 (an
+                     explicit `dtype` always takes precedence over amp's default).
+        dtype:       Cast backbone weights (and, when amp=False, the input tensor) to
+                     this dtype. One of torch.float32, torch.float16, torch.bfloat16,
+                     torch.float64. None keeps float32, unless amp=True defaults it to
+                     bfloat16.
         weights_dir: Directory containing local ``.pth`` weight files named
                      ``{model_name}_*.pth`` (e.g. ``dinov3_vitb16_pretrain_*.pth``).
                      When set, the architecture is still fetched from torch hub
                      (code only, no large download) and the weights are loaded from
                      this directory instead.  If ``None``, torch hub downloads both.
+        max_batch_size: Maximum images per forward pass. `forward()` splits any larger
+                     input list/tensor into chunks of at most this size and concatenates
+                     the results, so callers can pass an arbitrarily long list without
+                     batching manually or risking a CUDA OOM from one oversized pass.
     """
 
     def __init__(
@@ -136,6 +149,7 @@ class DinoEncoder(nn.Module):
         dtype: torch.dtype | None = None,
         svd_components: int = 8,
         weights_dir: str | Path | None = None,
+        max_batch_size: int = 16,
     ) -> None:
         super().__init__()
 
@@ -145,16 +159,31 @@ class DinoEncoder(nn.Module):
                 f"img_size must be divisible by {patch_size} for DINO {version}, got {img_size}"
             )
 
+        if dtype is not None and dtype not in _ALLOWED_DTYPES:
+            raise ValueError(
+                f"dtype must be one of {sorted(_ALLOWED_DTYPES, key=str)}, got {dtype}"
+            )
+
         self.version = version
         self.size = size
         self.img_size = img_size
         self.layers = layers
         self.amp = amp
-        self.model_dtype = dtype
         self.device = _resolve_device(device)
         self.patch_size = patch_size
         self.grid_h = img_size // patch_size
         self.grid_w = img_size // patch_size
+        self.max_batch_size = max_batch_size
+
+        # An explicit dtype always wins; otherwise amp defaults the effective weight/
+        # compute dtype to bfloat16 so amp=True actually halves backbone memory instead
+        # of just wrapping fp32 weights in an autocast region.
+        self.model_dtype = dtype if dtype is not None else (torch.bfloat16 if amp else None)
+        if self.model_dtype is torch.float16 and self.device.type == "cpu":
+            _log.warning(
+                "dtype=torch.float16 on CPU has limited PyTorch kernel support; "
+                "prefer torch.bfloat16 or torch.float32 for CPU inference."
+            )
 
         model_name = _MODEL_NAMES[(version, size)]
         if weights_dir is not None:
@@ -174,12 +203,14 @@ class DinoEncoder(nn.Module):
         else:
             backbone = torch.hub.load(_HUB_REPOS[version], model_name)
         backbone.eval()
-        if dtype is not None:
-            backbone = backbone.to(dtype=dtype)
+        if self.model_dtype is not None:
+            backbone = backbone.to(dtype=self.model_dtype)
         self.backbone = backbone.to(self.device)
 
         self.svd_components = svd_components
         self._positional_basis: torch.Tensor | None = None
+        self._p_perp: torch.Tensor | None = None
+        self._p_perp_key: tuple[torch.device, torch.dtype] | None = None
 
         self.preprocess = transforms.Compose(
             [
@@ -194,9 +225,10 @@ class DinoEncoder(nn.Module):
         )
 
     def _autocast_ctx(self) -> contextlib.AbstractContextManager:
-        """Return a bfloat16 autocast context manager when AMP is enabled, or a no-op."""
+        """Return an autocast context manager using `self.model_dtype` when AMP is
+        enabled, or a no-op. `__init__` guarantees `model_dtype` is set whenever amp=True."""
         if self.amp:
-            return torch.autocast(device_type=self.device.type, dtype=torch.bfloat16)
+            return torch.autocast(device_type=self.device.type, dtype=self.model_dtype)
         return contextlib.nullcontext()
 
     def _to_tensor_batch(
@@ -204,23 +236,34 @@ class DinoEncoder(nn.Module):
     ) -> torch.Tensor:
         """Normalise varied image inputs to a ``(B, 3, H, W)`` float tensor on device.
 
-        Accepts a pre-processed float tensor, a single PIL/numpy image, or a list
-        of PIL/numpy images.  When ``amp=False`` and a ``model_dtype`` is set, the
-        tensor is cast to that dtype before returning.
+        Accepts a pre-processed batch tensor, a single unbatched tensor/PIL/numpy
+        image, a batched numpy array, or a list of PIL/numpy images. When ``amp=False``
+        and a ``model_dtype`` is set, the tensor is cast to that dtype before returning.
 
         Args:
             images: One of:
                 - ``torch.Tensor`` of shape ``(B, 3, H, W)`` — used as-is (moved to device).
-                - ``PIL.Image.Image`` or ``np.ndarray`` (H, W, 3) uint8 — preprocessed.
-                - ``list`` of the above single-image types.
+                - ``torch.Tensor`` of shape ``(3, H, W)`` — a single image, unsqueezed to ``B=1``.
+                - ``np.ndarray`` of shape ``(B, H, W, 3)`` uint8 — a batch, split into ``B``
+                  single images before preprocessing.
+                - ``PIL.Image.Image`` or ``np.ndarray`` (H, W, 3) uint8 — a single image.
+                - ``list``/``tuple`` of the single-image types above.
 
         Returns:
             Float tensor of shape ``(B, 3, H, W)`` on ``self.device``.
         """
         if isinstance(images, torch.Tensor):
             x = images.to(device=self.device)
+            if x.ndim == 3:
+                x = x.unsqueeze(0)
+            elif x.ndim != 4:
+                raise ValueError(
+                    f"Tensor input must be (3, H, W) or (B, 3, H, W), got shape {tuple(x.shape)}"
+                )
         else:
-            if not isinstance(images, (list, tuple)):
+            if isinstance(images, np.ndarray) and images.ndim == 4:
+                images = list(images)  # (B, H, W, 3) -> B individual (H, W, 3) arrays
+            elif not isinstance(images, (list, tuple)):
                 images = [images]
             pil = [img if isinstance(img, Image.Image) else Image.fromarray(img) for img in images]
             x = torch.stack([self.preprocess(img) for img in pil]).to(self.device)
@@ -306,10 +349,38 @@ class DinoEncoder(nn.Module):
         # Flatten all dims except the last into (N, H*W, D)
         x = patches.reshape(-1, self.grid_h * self.grid_w, D)
 
-        basis = self.positional_basis.to(device=x.device, dtype=x.dtype)  # (D, k)
-        P_perp = torch.eye(D, device=x.device, dtype=x.dtype) - basis @ basis.T  # (D, D)
-        x_deb = x @ P_perp.T  # (N, H*W, D)
+        # P_perp only depends on positional_basis (cached for the encoder's lifetime) and the
+        # (device, dtype) of the incoming patches, so it's cached here too, keyed on that pair —
+        # otherwise this (D, D) eye + matmul gets rebuilt on every single forward() call.
+        key = (x.device, x.dtype)
+        if self._p_perp is None or self._p_perp_key != key:
+            basis = self.positional_basis.to(device=x.device, dtype=x.dtype)  # (D, k)
+            self._p_perp = torch.eye(D, device=x.device, dtype=x.dtype) - basis @ basis.T
+            self._p_perp_key = key
+
+        x_deb = x @ self._p_perp.T  # (N, H*W, D)
         return F.normalize(x_deb, p=2, dim=-1).reshape(shape)
+
+    def _split_into_chunks(self, images: torch.Tensor | Image.Image | np.ndarray | list) -> list:
+        """Split *images* into chunks of at most `self.max_batch_size` items each.
+
+        Mirrors `_to_tensor_batch`'s shape handling so slicing always happens along the
+        batch axis: a single unbatched tensor/PIL/numpy image becomes one chunk of size
+        1 (never sliced along its channel/height axis), while a ``(B, ...)`` tensor,
+        ``(B, H, W, 3)`` ndarray, or list/tuple is sliced along its leading dimension.
+        """
+        items: torch.Tensor | np.ndarray | list | tuple
+        if isinstance(images, torch.Tensor):
+            items = images.unsqueeze(0) if images.ndim == 3 else images
+        elif isinstance(images, np.ndarray) and images.ndim == 4:
+            items = images
+        elif isinstance(images, (list, tuple)):
+            items = images
+        else:
+            items = [images]  # single PIL Image or (H, W, 3) ndarray
+        return [
+            items[i : i + self.max_batch_size] for i in range(0, len(items), self.max_batch_size)
+        ]
 
     @torch.inference_mode()
     def forward(
@@ -319,6 +390,11 @@ class DinoEncoder(nn.Module):
         debias: bool = False,
     ) -> ExtractorOutput:
         """Extract CLS and patch features via get_intermediate_layers.
+
+        Internally splits *images* into chunks of at most `self.max_batch_size` and runs
+        one forward pass per chunk, concatenating the results — callers can pass an
+        arbitrarily long list without batching manually or risking a CUDA OOM from one
+        oversized forward pass.
 
         Args:
             images: PIL Image / list of PIL Images, numpy (H,W,3) uint8 array /
@@ -333,6 +409,23 @@ class DinoEncoder(nn.Module):
             ExtractorOutput with shapes as documented on that class.
             Patches are in (y, x) / (height, width) spatial order.
         """
+        chunks = self._split_into_chunks(images)
+        if len(chunks) == 1:
+            return self._forward_single_batch(chunks[0], layers, debias)
+
+        outputs = [self._forward_single_batch(chunk, layers, debias) for chunk in chunks]
+        return ExtractorOutput(
+            cls=torch.cat([o.cls for o in outputs], dim=0),
+            patches=torch.cat([o.patches for o in outputs], dim=0),
+        )
+
+    def _forward_single_batch(
+        self,
+        images: torch.Tensor | Image.Image | np.ndarray | list,
+        layers: int | list[int] | None,
+        debias: bool,
+    ) -> ExtractorOutput:
+        """Single un-chunked forward pass. See `forward()` for the public, chunked entry point."""
         n = layers if layers is not None else self.layers
         single = isinstance(n, int) and n == 1
         x = self._to_tensor_batch(images)

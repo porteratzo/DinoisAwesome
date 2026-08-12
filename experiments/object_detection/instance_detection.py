@@ -31,9 +31,11 @@ import torch
 import torch.nn.functional as F
 from dotenv import load_dotenv
 from PIL import Image
+from sklearn.cluster import DBSCAN, HDBSCAN
 from sklearn.decomposition import PCA
 
 from dinoisawesome import DinoEncoder
+from dinoisawesome.annotation_utils import load_annotations
 from dinoisawesome.instance_detection import (
     compute_density_map,
     compute_exemplar_features,
@@ -42,12 +44,12 @@ from dinoisawesome.instance_detection import (
 )
 
 # %% Parameters
-_REPO_ROOT = Path(__file__).parent.parent
+_REPO_ROOT = Path(__file__).parent.parent.parent
 load_dotenv(_REPO_ROOT / ".env")
 
-part_type = "LHb"
+part_type = "LHa"
 ref_number = 1
-data_dir = _REPO_ROOT / "data" / "abc2"
+data_dir = _REPO_ROOT / "data" / "abc3"
 
 all_images = glob(str(data_dir / f"{part_type}_*.jpg"))
 REF_IMAGE_PATH: str = [i for i in all_images if f"{part_type}_{ref_number}.jpg" in i][0]
@@ -55,11 +57,13 @@ TAR_IMAGE_PATH: list[str] = [i for i in all_images if f"{part_type}_{ref_number}
 
 EXEMPLAR_PATH = REF_IMAGE_PATH
 QUERY_PATHS = TAR_IMAGE_PATH
-EXEMPLAR_MASK_PATH: str | None = str(data_dir / "annotations" / f"{part_type}_{ref_number}.npy")
+EXEMPLAR_MASK_PATH: Path | None = data_dir / "annotations" / f"{part_type}_{ref_number}"
+#EXEMPLAR_CLASS: list[str] | None = ['donut foam single', 'donut foam']  # None = use all masks; e.g. ["donut foam"]
+EXEMPLAR_CLASS: list[str] | None = ['donut foam single', 'donut foam']  # None = use all masks; e.g. ["donut foam"]
 
 DINO_VERSION = "v3"
 DINO_SIZE = "large"
-IMG_SIZE = 1024
+IMG_SIZE = 512 * 3
 LAYER_IDX = 23
 DINO_WEIGHTS_DIR: str | None = os.environ.get("DINO_WEIGHTS_DIR")
 
@@ -147,76 +151,26 @@ for p, qi in zip(QUERY_PATHS, query_imgs):
 pixel_mask: np.ndarray | None = None
 fg_mask: np.ndarray | None = None
 n_instances = 0
-if EXEMPLAR_MASK_PATH is not None and Path(EXEMPLAR_MASK_PATH).exists():
-    if EXEMPLAR_MASK_PATH.endswith(".npy"):
-        raw_seg = np.load(EXEMPLAR_MASK_PATH)
-        # Detect (N, H, W) by requiring dim-0 to be smaller than *both* spatial dims.
-        # Checking only shape[0] < shape[1] is ambiguous for landscape images (H < W),
-        # where an already-correct (H, W, N) array would be wrongly transposed.
-        if raw_seg.ndim == 3 and raw_seg.shape[0] < raw_seg.shape[1] and raw_seg.shape[0] < raw_seg.shape[2]:
-            raw_seg = raw_seg.transpose(1, 2, 0)
-    elif EXEMPLAR_MASK_PATH.endswith(".npz"):
-        raw_seg = np.load(EXEMPLAR_MASK_PATH)["segmaps"]
-    else:
-        raw_seg = np.array(Image.open(EXEMPLAR_MASK_PATH).convert("L"))[:, :, None] > 0
-
-    # --- Foreground crop ---
-    # The largest mask is treated as the foreground region. Crop all images to its tight
-    # bounding box plus a 5% border, then discard that mask. The remaining instance masks
-    # (also cropped) drive the rest of the pipeline.
-    mask_sizes = [int(raw_seg[:, :, i].sum()) for i in range(raw_seg.shape[2])]
-    fg_idx = int(np.argmax(mask_sizes))
-    fg_mask = raw_seg[:, :, fg_idx].astype(bool)
-    # apply erosion then dilation to clean up the foreground mask (removing small spurious masks can cause issues downstream)
-    import cv2
-    fg_mask = cv2.morphologyEx(fg_mask.astype(np.uint8), cv2.MORPH_OPEN, kernel=np.ones((3, 3), dtype=np.uint8)).astype(bool)
-    log.info("Foreground mask: index=%d  size=%d px", fg_idx, mask_sizes[fg_idx])
-
-    rows = np.where(fg_mask.any(axis=1))[0]
-    cols = np.where(fg_mask.any(axis=0))[0]
-    r_min, r_max = int(rows[0]), int(rows[-1]) + 1
-    c_min, c_max = int(cols[0]), int(cols[-1]) + 1
-    border_h = max(1, int(0.05 * (r_max - r_min)))
-    border_w = max(1, int(0.05 * (c_max - c_min)))
-    orig_h, orig_w = raw_seg.shape[:2]
-    crop_r_min = max(0, r_min - border_h)
-    crop_r_max = min(orig_h, r_max + border_h)
-    crop_c_min = max(0, c_min - border_w)
-    crop_c_max = min(orig_w, c_max + border_w)
-    log.info(
-        "Crop box (fg + 5%% border): rows=[%d,%d) cols=[%d,%d)  → %dx%d px",
-        crop_r_min,
-        crop_r_max,
-        crop_c_min,
-        crop_c_max,
-        crop_c_max - crop_c_min,
-        crop_r_max - crop_r_min,
-    )
-
-    # Save originals for Step 0 display, then crop in-place (PIL order: left, upper, right, lower)
-    exemplar_img_orig = exemplar_img
-    query_imgs_orig = list(query_imgs)
-    exemplar_img = exemplar_img.crop((crop_c_min, crop_r_min, crop_c_max, crop_r_max))
-    query_imgs = [qi.crop((crop_c_min, crop_r_min, crop_c_max, crop_r_max)) for qi in query_imgs]
-
-    # Discard the foreground mask; crop and union the remaining instance masks
-    other_idx = [i for i in range(raw_seg.shape[2]) if i != fg_idx]
-    if other_idx:
-        raw_seg_cropped = raw_seg[crop_r_min:crop_r_max, crop_c_min:crop_c_max, :][:, :, other_idx]
-        pixel_mask = raw_seg_cropped.any(axis=2)
-        n_instances = raw_seg_cropped.shape[2]
-        log.info(
-            "Instance masks after fg crop: shape=%s  instances=%d  coverage=%.1f%%",
-            raw_seg_cropped.shape,
-            n_instances,
-            100.0 * pixel_mask.mean(),
-        )
-    else:
-        log.warning("Only one mask found (used as foreground) — no instance masks remain.")
-else:
-    log.warning("Mask not found at %s — running without mask.", EXEMPLAR_MASK_PATH)
-    exemplar_img_orig = exemplar_img
-    query_imgs_orig = list(query_imgs)
+exemplar_img_orig = exemplar_img
+query_imgs_orig = list(query_imgs)
+if EXEMPLAR_MASK_PATH is not None:
+    try:
+        anns = load_annotations(EXEMPLAR_MASK_PATH)
+        detection_masks = [
+            a for a in anns if EXEMPLAR_CLASS is None or a["class"] in EXEMPLAR_CLASS
+        ]
+        if detection_masks:
+            pixel_mask = np.stack([a["mask"] for a in detection_masks]).any(axis=0)
+            n_instances = len(detection_masks)
+            log.info(
+                "Instance masks loaded: %d  coverage=%.1f%%",
+                n_instances,
+                100.0 * pixel_mask.mean(),
+            )
+        else:
+            log.warning("No masks matched classes %s — running without mask.", EXEMPLAR_CLASS)
+    except FileNotFoundError:
+        log.warning("Mask not found at %s — running without mask.", EXEMPLAR_MASK_PATH)
 
 display_ex = np.array(exemplar_img.resize((IMG_SIZE, IMG_SIZE), Image.BICUBIC))
 
@@ -276,8 +230,8 @@ plt.tight_layout()
 plt.show()
 
 # %% Step 1 — Patch token extraction + mask projection
-exemplar_tokens, ex_h, ex_w = extract_patch_tokens(encoder, exemplar_img, LAYER_IDX)
-query_tokens, q_h, q_w = extract_patch_tokens(encoder, query_imgs[0], LAYER_IDX)
+exemplar_tokens, ex_h, ex_w = extract_patch_tokens(encoder, exemplar_img, LAYER_IDX, debias=True)
+query_tokens, q_h, q_w = extract_patch_tokens(encoder, query_imgs[0], LAYER_IDX, debias=True)
 
 log.info(
     "Exemplar tokens: %s  (grid %dx%d)  device=%s",
@@ -439,7 +393,9 @@ feat_unmasked = compute_exemplar_features(exemplar_tokens, mode=EXEMPLAR_MODE, k
 def raw_sim_2d(q_tok: torch.Tensor, feat: torch.Tensor) -> np.ndarray:
     return (q_tok @ feat.T).mean(dim=-1).reshape(q_h, q_w).cpu().numpy()
 
-
+PEAK_KERNEL_SIZE = 7
+MIN_PEAK_THRESHOLD = 0.1
+DENSITY_THRESHOLD = 0.7
 sim_masked_raw = raw_sim_2d(query_tokens, feat_masked)
 sim_unmasked_raw = raw_sim_2d(query_tokens, feat_unmasked)
 dm_masked = compute_density_map(query_tokens, feat_masked, q_h, q_w, DENSITY_THRESHOLD)
@@ -596,58 +552,6 @@ axes[2].axis("off")
 plt.tight_layout()
 plt.show()
 
-# %% Sweep 1 — Mask patch threshold
-MASK_THRESHOLDS = [0.05, 0.15, 0.30, 0.50, 0.75, 0.95]
-fig, axes = plt.subplots(3, len(MASK_THRESHOLDS), figsize=(len(MASK_THRESHOLDS) * 4, 13))
-
-for col, mthr in enumerate(MASK_THRESHOLDS):
-    if pixel_mask is not None:
-        pm = pixel_mask_to_patch_mask(pixel_mask, ex_h, ex_w, IMG_SIZE, threshold=mthr)
-        pm_flat = torch.from_numpy(pm.reshape(-1)).to(exemplar_tokens.device)
-        ex_tok_m = exemplar_tokens[pm_flat] if pm_flat.any() else exemplar_tokens
-    else:
-        pm, ex_tok_m = np.ones((ex_h, ex_w), dtype=bool), exemplar_tokens
-
-    feat_m = compute_exemplar_features(ex_tok_m, mode=EXEMPLAR_MODE, k=EXEMPLAR_K)
-    dm_m = compute_density_map(query_tokens, feat_m, q_h, q_w, DENSITY_THRESHOLD)
-    pk_m = extract_peaks(dm_m, PEAK_KERNEL_SIZE, MIN_PEAK_THRESHOLD)
-    dm_np_m = dm_m.cpu().numpy()
-
-    axes[0, col].imshow(pm.astype(np.float32), cmap="Greens", vmin=0, vmax=1, aspect="auto")
-    axes[0, col].set_title(f"mask_thr={mthr}\n{pm.sum()}/{ex_h * ex_w} patches", fontsize=9)
-    axes[0, col].axis("off")
-
-    im = axes[1, col].imshow(dm_np_m, cmap="jet", aspect="auto")
-    axes[1, col].set_title(f"{(dm_np_m > 0).sum()} active patches", fontsize=9)
-    axes[1, col].axis("off")
-    plt.colorbar(im, ax=axes[1, col], shrink=0.75, pad=0.02)
-
-    axes[2, col].imshow(display_q0)
-    axes[2, col].imshow(heat_overlay(display_q0, upsample_map(dm_np_m, IMG_SIZE)))
-    if len(pk_m):
-        px_m = (pk_m[:, 0].float() + 0.5) * PATCH_SIZE
-        py_m = (pk_m[:, 1].float() + 0.5) * PATCH_SIZE
-        axes[2, col].scatter(
-            px_m.cpu(),
-            py_m.cpu(),
-            c="red",
-            s=80,
-            marker="o",
-            linewidths=1.5,
-            edgecolors="white",
-            zorder=5,
-        )
-    axes[2, col].set_title(f"{len(pk_m)} peak(s)", fontsize=9)
-    axes[2, col].axis("off")
-
-plt.suptitle(
-    f"Sweep: mask_patch_threshold  |  mode={EXEMPLAR_MODE}  density_thr={DENSITY_THRESHOLD}",
-    fontsize=12,
-    y=1.01,
-)
-plt.tight_layout()
-plt.show()
-
 # %% Sweep 2 — Density threshold
 THRESHOLDS = [0.10, 0.20, 0.30, 0.40, 0.50, 0.60]
 fig, axes = plt.subplots(2, len(THRESHOLDS), figsize=(len(THRESHOLDS) * 4, 9))
@@ -690,8 +594,8 @@ LAYER_INDICES = [6, 12, 16, 20, 22, 23]
 fig, axes = plt.subplots(2, len(LAYER_INDICES), figsize=(len(LAYER_INDICES) * 4, 9))
 
 for col, layer in enumerate(LAYER_INDICES):
-    ex_tok_l, ex_h_l, ex_w_l = extract_patch_tokens(encoder, exemplar_img, layer)
-    q_tok_l, q_h_l, q_w_l = extract_patch_tokens(encoder, query_imgs[0], layer)
+    ex_tok_l, ex_h_l, ex_w_l = extract_patch_tokens(encoder, exemplar_img, layer, debias=True)
+    q_tok_l, q_h_l, q_w_l = extract_patch_tokens(encoder, query_imgs[0], layer, debias=True)
 
     if pixel_mask is not None:
         pm_l = pixel_mask_to_patch_mask(pixel_mask, ex_h_l, ex_w_l, IMG_SIZE, MASK_PATCH_THRESHOLD)
@@ -777,7 +681,7 @@ plt.show()
 # %% Multi-query detection
 query_results: list[dict] = []
 for path, q_img in zip(QUERY_PATHS, query_imgs):
-    q_tok_f, q_h_f, q_w_f = extract_patch_tokens(encoder, q_img, LAYER_IDX)
+    q_tok_f, q_h_f, q_w_f = extract_patch_tokens(encoder, q_img, LAYER_IDX, debias=True)
     dm_f = compute_density_map(q_tok_f, feat_masked, q_h_f, q_w_f, DENSITY_THRESHOLD)
     pk_f = extract_peaks(dm_f, PEAK_KERNEL_SIZE, MIN_PEAK_THRESHOLD)
     query_results.append({"path": path, "img": q_img, "density": dm_f, "peaks": pk_f})
@@ -872,5 +776,562 @@ else:
     )
     plt.tight_layout()
     plt.show()
+
+# %% Experiment — Region-growing IoU NMS
+# Pipeline:
+#   1. Extract raw peak candidates with a relaxed score threshold.
+#   2. Flood-fill the density map from each peak (4-connected, >= GROW_THRESHOLD)
+#      to get a per-instance binary mask.
+#   3. Sort candidates by score, then greedily suppress any peak whose mask
+#      overlaps a higher-scoring kept mask above IOU_THRESHOLD.
+#   4. Visualise: grown masks | original NMS result | IoU-NMS result.
+
+RELAXED_MIN_PEAK = 0.3   # lower than MIN_PEAK_THRESHOLD to get more candidates
+GROW_THRESHOLD = DENSITY_THRESHOLD  # flood-fill boundary — same as density cutoff
+IOU_THRESHOLD = 0.3      # suppress if intersection/union exceeds this
+
+
+def region_grow(
+    density_arr: np.ndarray, seed_y: int, seed_x: int, threshold: float
+) -> np.ndarray:
+    """4-connected flood-fill from (seed_y, seed_x) into patches >= threshold."""
+    h, w = density_arr.shape
+    visited = np.zeros((h, w), dtype=bool)
+    mask = np.zeros((h, w), dtype=bool)
+    stack = [(seed_y, seed_x)]
+    visited[seed_y, seed_x] = True
+    while stack:
+        y, x = stack.pop()
+        if density_arr[y, x] >= threshold:
+            mask[y, x] = True
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < h and 0 <= nx < w and not visited[ny, nx]:
+                    visited[ny, nx] = True
+                    stack.append((ny, nx))
+    return mask
+
+
+def mask_iou(a: np.ndarray, b: np.ndarray) -> float:
+    inter = int((a & b).sum())
+    union = int((a | b).sum())
+    return inter / (union + 1e-8)
+
+
+# 1. Relaxed candidate peaks
+RELAXED_MIN_PEAK = 0.1
+raw_peaks = extract_peaks(density_map, PEAK_KERNEL_SIZE, RELAXED_MIN_PEAK)
+if len(raw_peaks) == 0:
+    log.warning("No candidates found at relaxed threshold=%.2f — skipping experiment.", RELAXED_MIN_PEAK)
+else:
+    raw_peaks_np = raw_peaks.cpu().numpy()  # (N, 2): col 0 = x, col 1 = y
+    raw_scores = density_np[raw_peaks_np[:, 1], raw_peaks_np[:, 0]]
+    log.info("Candidates (relaxed thr=%.2f): %d peaks", RELAXED_MIN_PEAK, len(raw_peaks_np))
+
+    # 2. Grow a region mask from each candidate
+    instance_masks = [
+        region_grow(density_np, int(p[1]), int(p[0]), GROW_THRESHOLD)
+        for p in raw_peaks_np
+    ]
+    log.info("Grown region areas (patches): %s", [int(m.sum()) for m in instance_masks])
+
+    # 3. Greedy IoU suppression (highest score kept first)
+    order = np.argsort(raw_scores)[::-1]
+    keep: list[int] = []
+    suppressed: set[int] = set()
+
+    for idx in order:
+        if idx in suppressed:
+            continue
+        keep.append(idx)
+        for other in order:
+            if other == idx or other in suppressed:
+                continue
+            iou = mask_iou(instance_masks[idx], instance_masks[other])
+            if iou > IOU_THRESHOLD:
+                suppressed.add(other)
+                log.info(
+                    "  suppressed peak %d (score=%.3f)  IoU=%.3f  with kept peak %d (score=%.3f)",
+                    other, raw_scores[other], iou, idx, raw_scores[idx],
+                )
+
+    kept_np = raw_peaks_np[keep]
+    log.info(
+        "After IoU-NMS: %d / %d candidates kept  (iou_thr=%.2f)",
+        len(keep), len(raw_peaks_np), IOU_THRESHOLD,
+    )
+
+    # 4. Visualise
+    CMAP_INST = plt.get_cmap("tab10")
+
+    # Build coloured mask canvases (patch-grid resolution)
+    all_canvas = np.zeros((*density_np.shape, 3), dtype=np.float32)
+    kept_canvas = np.zeros((*density_np.shape, 3), dtype=np.float32)
+
+    for rank, idx in enumerate(order):
+        color = np.array(CMAP_INST(rank % 10)[:3], dtype=np.float32)
+        alpha = 1.0 if idx not in suppressed else 0.35
+        all_canvas[instance_masks[idx]] = color * alpha
+
+    for rank, idx in enumerate(keep):
+        color = np.array(CMAP_INST(rank % 10)[:3], dtype=np.float32)
+        kept_canvas[instance_masks[idx]] = color
+
+    # Pixel-space coordinates for overlays on the original query image
+    img_scale = [s / IMG_SIZE for s in query_imgs[0].size]  # (w_scale, h_scale)
+
+    def patches_to_px(arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        px_x = (arr[:, 0] + 0.5) * PATCH_SIZE * img_scale[0]
+        px_y = (arr[:, 1] + 0.5) * PATCH_SIZE * img_scale[1]
+        return px_x, px_y
+
+    disp_q = np.array(query_imgs[0])
+    fig, axes = plt.subplots(2, 3, figsize=(21, 12))
+
+    # Row 0: patch-grid views ---------------------------------------------------
+    im0 = axes[0, 0].imshow(density_np, cmap="jet", aspect="auto")
+    axes[0, 0].set_title("Density map (input)", fontsize=10)
+    axes[0, 0].axis("off")
+    plt.colorbar(im0, ax=axes[0, 0], shrink=0.75, pad=0.02)
+
+    axes[0, 1].imshow(all_canvas, aspect="auto")
+    for i, (px, py) in enumerate(zip(raw_peaks_np[:, 0], raw_peaks_np[:, 1])):
+        marker, color = ("x", "white") if i in suppressed else ("o", "red")
+        axes[0, 1].scatter(px, py, c=color, s=80, marker=marker, linewidths=1.5, zorder=5)
+        axes[0, 1].text(px + 0.3, py - 0.4, f"{raw_scores[i]:.2f}", fontsize=6, color="white")
+    axes[0, 1].set_title(
+        f"All grown regions  (white × = suppressed)\n"
+        f"{len(raw_peaks_np)} candidates  →  {len(keep)} kept  iou_thr={IOU_THRESHOLD}",
+        fontsize=9,
+    )
+    axes[0, 1].axis("off")
+
+    axes[0, 2].imshow(kept_canvas, aspect="auto")
+    axes[0, 2].scatter(
+        kept_np[:, 0], kept_np[:, 1],
+        c="red", s=100, marker="o", linewidths=1.5, edgecolors="white", zorder=5,
+    )
+    axes[0, 2].set_title(f"Kept regions after IoU-NMS  ({len(keep)} instances)", fontsize=10)
+    axes[0, 2].axis("off")
+
+    # Row 1: overlaid on original query image ------------------------------------
+    axes[1, 0].imshow(disp_q)
+    axes[1, 0].set_title("Query image", fontsize=10)
+    axes[1, 0].axis("off")
+
+    # Original max-pool NMS (Step 4)
+    axes[1, 1].imshow(disp_q)
+    if len(peaks_np):
+        ox, oy = patches_to_px(peaks_np)
+        axes[1, 1].scatter(ox, oy, c="red", s=120, marker="o", linewidths=1.5, edgecolors="white", zorder=5)
+    axes[1, 1].set_title(f"Original max-pool NMS  ({len(peaks_np)} peaks)", fontsize=10)
+    axes[1, 1].axis("off")
+
+    # IoU-NMS result
+    axes[1, 2].imshow(disp_q)
+    if len(kept_np):
+        kx, ky = patches_to_px(kept_np)
+        axes[1, 2].scatter(kx, ky, c="lime", s=120, marker="o", linewidths=1.5, edgecolors="white", zorder=5)
+    axes[1, 2].set_title(
+        f"Region-grow IoU-NMS  ({len(keep)} peaks)\n"
+        f"grow_thr={GROW_THRESHOLD}  iou_thr={IOU_THRESHOLD}",
+        fontsize=10,
+    )
+    axes[1, 2].axis("off")
+
+    plt.suptitle(
+        f"Experiment: Region-growing IoU NMS  |  relaxed_min_peak={RELAXED_MIN_PEAK}  "
+        f"iou_thr={IOU_THRESHOLD}  grow_thr={GROW_THRESHOLD}",
+        fontsize=12,
+        y=1.01,
+    )
+    plt.tight_layout()
+    plt.show()
+
+# %% Experiment — HDBSCAN clustering on density map (GT-driven cluster-size bounds)
+# Pipeline:
+#   1. Threshold the density map to keep only patches above CLUSTER_DENSITY_THRESHOLD.
+#      Only the *spatial* position (x, y) of each kept patch is used as a clustering
+#      feature — the density/similarity score is used solely for this thresholding
+#      step, never as an HDBSCAN input dimension.
+#   2. Load the ground-truth instance masks for the query image being clustered
+#      (query_imgs[0]), project each instance mask onto the query patch grid, and
+#      measure its area in patches → `gt_sizes`, one value per GT instance.
+#   3. Derive (min_cluster_size, max_cluster_size) from `gt_sizes` via one of several
+#      methods (median ± margin, min/max ± margin, mean ± k·std, IQR ± margin).
+#   4. Run sklearn HDBSCAN with those bounds, once per method.
+#   5. Visualise, per method: normalised-coordinate scatter | cluster overlay on query image.
+import numpy as np
+
+CLUSTER_DENSITY_THRESHOLD = 0.8
+HDBSCAN_MIN_CLUSTER_SIZE = 3  # fallback floor; also reused by the DBSCAN sweep below
+
+CLUSTER_SIZE_MARGIN = 3  # patches; used by the *_margin methods
+CLUSTER_SIZE_STD_K = 1.0  # std multiplier; used by the mean_std method
+GT_BOUND_METHODS = ["median_margin", "minmax_margin", "mean_std", "quantile_margin"]
+
+
+def gt_instance_patch_sizes(
+    query_path: str,
+    class_filter: list[str] | None,
+    grid_h: int,
+    grid_w: int,
+    img_size: int,
+    patch_threshold: float,
+) -> np.ndarray:
+    """GT instance sizes (in patches) for the query image, using its own annotation set."""
+    ann_stem = data_dir / "annotations" / Path(query_path).stem
+    try:
+        anns = load_annotations(ann_stem)
+    except FileNotFoundError:
+        log.warning("No GT annotations at %s — cannot derive cluster-size bounds.", ann_stem)
+        return np.array([])
+
+    instances = [a for a in anns if class_filter is None or a["class"] in class_filter]
+    if not instances:
+        log.warning("No GT instances matched classes %s at %s.", class_filter, ann_stem)
+        return np.array([])
+
+    sizes = np.array(
+        [
+            pixel_mask_to_patch_mask(a["mask"], grid_h, grid_w, img_size, patch_threshold).sum()
+            for a in instances
+        ]
+    )
+    log.info("GT instance patch-sizes for %s: %s", Path(query_path).name, sizes.tolist())
+    return sizes
+
+
+def gt_cluster_size_bounds(
+    sizes: np.ndarray, method: str, margin: float, std_k: float
+) -> tuple[int, int]:
+    """Derive (min_cluster_size, max_cluster_size) from GT instance patch-sizes.
+
+    - "median_margin":   [median - margin,        median + margin]
+    - "minmax_margin":   [min(sizes) - margin,     max(sizes) + margin]
+    - "mean_std":        [mean - std_k*std,        mean + std_k*std]
+    - "quantile_margin": [p25 - margin,             p75 + margin]
+    """
+    if method == "median_margin":
+        center = np.median(sizes)
+        lo, hi = center - margin, center + margin
+    elif method == "minmax_margin":
+        lo, hi = sizes.min() - margin, sizes.max() + margin
+    elif method == "mean_std":
+        mean, std = sizes.mean(), sizes.std()
+        lo, hi = mean - std_k * std, mean + std_k * std
+    elif method == "quantile_margin":
+        p25, p75 = np.percentile(sizes, [25, 75])
+        lo, hi = p25 - margin, p75 + margin
+    else:
+        raise ValueError(f"Unknown GT bound method: {method}")
+
+    min_cluster_size = max(2, int(round(lo)))
+    max_cluster_size = max(min_cluster_size, int(round(hi)))
+    return min_cluster_size, max_cluster_size
+
+
+redone_density_np = density_np + DENSITY_THRESHOLD
+ys_grid, xs_grid = np.where(redone_density_np > CLUSTER_DENSITY_THRESHOLD)
+scores_grid = redone_density_np[ys_grid, xs_grid]
+log.info(
+    "HDBSCAN input: %d / %d patches above threshold=%.2f",
+    len(xs_grid),
+    density_np.size,
+    CLUSTER_DENSITY_THRESHOLD,
+)
+
+gt_sizes = gt_instance_patch_sizes(
+    QUERY_PATHS[0], EXEMPLAR_CLASS, q_h, q_w, IMG_SIZE, MASK_PATCH_THRESHOLD
+)
+
+if len(xs_grid) < HDBSCAN_MIN_CLUSTER_SIZE:
+    log.warning("Too few points above threshold — skipping HDBSCAN experiment.")
+elif len(gt_sizes) == 0:
+    log.warning("No GT instance sizes available — skipping GT-driven HDBSCAN experiment.")
+else:
+    xs_norm = xs_grid / max(q_w - 1, 1)
+    ys_norm = ys_grid / max(q_h - 1, 1)
+    features = np.stack([xs_norm, ys_norm], axis=1)  # spatial-only — no similarity feature
+
+    disp_q_c = np.array(query_imgs[0])
+    img_scale_c = [s / IMG_SIZE for s in query_imgs[0].size]
+
+    def patch_to_px(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        return (x + 0.5) * PATCH_SIZE * img_scale_c[0], (y + 0.5) * PATCH_SIZE * img_scale_c[1]
+
+    CMAP_HDB = plt.get_cmap("tab10")
+    fig, axes = plt.subplots(2, len(GT_BOUND_METHODS), figsize=(len(GT_BOUND_METHODS) * 4.5, 9))
+
+    for col, method in enumerate(GT_BOUND_METHODS):
+        min_cs, max_cs = gt_cluster_size_bounds(
+            gt_sizes, method, CLUSTER_SIZE_MARGIN, CLUSTER_SIZE_STD_K
+        )
+        labels = HDBSCAN(min_cluster_size=min_cs, max_cluster_size=max_cs).fit_predict(features)
+        n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+        n_noise = int((labels == -1).sum())
+        log.info(
+            "method=%s -> min_cluster_size=%d max_cluster_size=%d -> %d cluster(s) (%d noise)",
+            method,
+            min_cs,
+            max_cs,
+            n_clusters,
+            n_noise,
+        )
+
+        colors = np.array(
+            [CMAP_HDB(lbl % 10) if lbl >= 0 else (0.6, 0.6, 0.6, 1.0) for lbl in labels]
+        )
+
+        axes[0, col].scatter(xs_norm, ys_norm, c=colors, s=25)
+        axes[0, col].set_xlim(-0.05, 1.05)
+        axes[0, col].set_ylim(1.05, -0.05)
+        axes[0, col].set_aspect("equal")
+        axes[0, col].set_title(
+            f"{method}\nsize=[{min_cs},{max_cs}]  {n_clusters} cluster(s)", fontsize=9
+        )
+
+        axes[1, col].imshow(disp_q_c)
+        px_x, px_y = patch_to_px(xs_grid, ys_grid)
+        axes[1, col].scatter(px_x, px_y, c=colors, s=30, edgecolors="white", linewidths=0.3)
+        axes[1, col].set_title(f"{n_noise} noise pt(s)", fontsize=9)
+        axes[1, col].axis("off")
+
+    plt.suptitle(
+        f"Experiment: HDBSCAN on density map  |  density_thr={CLUSTER_DENSITY_THRESHOLD}  "
+        f"gt_sizes(n={len(gt_sizes)})={gt_sizes.tolist()}  margin={CLUSTER_SIZE_MARGIN}  "
+        f"std_k={CLUSTER_SIZE_STD_K}",
+        fontsize=11,
+        y=1.01,
+    )
+    plt.tight_layout()
+    plt.show()
+
+# %% Experiment — HDBSCAN with a programmatic density threshold (minmax_margin sizing)
+# Pipeline:
+#   1. Recompute a *raw*, unthresholded cosine-similarity density map (compute_density_map()
+#      clamps below its own threshold, which would hide most of the background distribution).
+#   2. Project the query's GT instance masks onto the patch grid, then split every patch's
+#      raw density value into two populations: "true" (inside a GT instance) and
+#      "false" (outside all GT instances).
+#   3. Derive the density threshold *from those two distributions* instead of a hand-tuned
+#      constant, via one of several strategies (see `gt_density_threshold` below).
+#   4. Threshold the raw density map at the derived value -> candidate patches -> spatial-only
+#      features (density is never a clustering feature, only a filter).
+#   5. Size HDBSCAN with the "minmax_margin" cluster-size bounds derived from `gt_sizes`
+#      (reused from the previous cell).
+#   6. Visualise, per threshold strategy: true/false score histogram with the chosen cutoff |
+#      cluster overlay on the query image.
+
+
+def gt_patch_true_false_values(
+    query_path: str,
+    class_filter: list[str] | None,
+    density_map: np.ndarray,
+    grid_h: int,
+    grid_w: int,
+    img_size: int,
+    patch_threshold: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """(true_values, false_values, patch_mask) — density_map values split by GT membership."""
+    ann_stem = data_dir / "annotations" / Path(query_path).stem
+    empty_mask = np.zeros(density_map.shape, dtype=bool)
+    try:
+        anns = load_annotations(ann_stem)
+    except FileNotFoundError:
+        log.warning("No GT annotations at %s — cannot derive a density threshold.", ann_stem)
+        return np.array([]), np.array([]), empty_mask
+
+    instances = [a for a in anns if class_filter is None or a["class"] in class_filter]
+    if not instances:
+        log.warning("No GT instances matched classes %s at %s.", class_filter, ann_stem)
+        return np.array([]), np.array([]), empty_mask
+
+    patch_mask = empty_mask.copy()
+    for a in instances:
+        patch_mask |= pixel_mask_to_patch_mask(a["mask"], grid_h, grid_w, img_size, patch_threshold)
+
+    return density_map[patch_mask], density_map[~patch_mask], patch_mask
+
+
+def gt_density_threshold(
+    true_vals: np.ndarray, false_vals: np.ndarray, method: str, margin: float
+) -> float:
+    """Derive a density-map cutoff from GT true/false patch-score distributions.
+
+    - "mean_minus_margin":     mean(true) - margin
+    - "median_minus_margin":   median(true) - margin
+    - "min_minus_margin":      min(true) - margin
+    - "max_false_plus_margin": max(false) + margin  (push above the hardest negatives)
+    - "midpoint":              halfway between min(true) and max(false) — margin-free
+    - "youden_optimal":        threshold maximising TPR - FPR over both distributions
+                                (Youden's J statistic) — margin-free, ROC-style
+    """
+    if method == "mean_minus_margin":
+        thr = true_vals.mean() - margin
+    elif method == "median_minus_margin":
+        thr = np.median(true_vals) - margin
+    elif method == "min_minus_margin":
+        thr = true_vals.min() - margin
+    elif method == "max_false_plus_margin":
+        thr = (false_vals.max() if len(false_vals) else true_vals.min()) + margin
+    elif method == "midpoint":
+        false_max = false_vals.max() if len(false_vals) else true_vals.min()
+        thr = (true_vals.min() + false_max) / 2.0
+    elif method == "youden_optimal":
+        candidates = np.unique(np.concatenate([true_vals, false_vals]))
+        best_thr, best_j = float(candidates.min()), -np.inf
+        for c in candidates:
+            tpr = (true_vals >= c).mean()
+            fpr = (false_vals >= c).mean() if len(false_vals) else 0.0
+            j = tpr - fpr
+            if j > best_j:
+                best_j, best_thr = j, float(c)
+        thr = best_thr
+    else:
+        raise ValueError(f"Unknown density threshold method: {method}")
+    return float(thr)
+
+
+DENSITY_THRESHOLD_MARGIN = 0.05
+DENSITY_THRESHOLD_METHODS = [
+    "mean_minus_margin",
+    "median_minus_margin",
+    "min_minus_margin",
+    "max_false_plus_margin",
+    "midpoint",
+    "youden_optimal",
+]
+
+# compute_density_map() clamps everything below its own `threshold` arg to zero, which would
+# collapse most of the background distribution to a single spike at 0 — useless for searching a
+# threshold. Recompute the raw, unclamped cosine-similarity map so every patch keeps its true value.
+raw_density_np = raw_sim_2d(query_tokens, feat_masked)
+
+true_vals, false_vals, gt_patch_mask_grid = gt_patch_true_false_values(
+    QUERY_PATHS[0], EXEMPLAR_CLASS, raw_density_np, q_h, q_w, IMG_SIZE, MASK_PATCH_THRESHOLD
+)
+
+fig, axes = plt.subplots(1, 3, figsize=(17, 5))
+
+im0 = axes[0].imshow(raw_density_np, cmap="jet", interpolation="nearest")
+axes[0].set_title("Raw (unthresholded) cosine-similarity density map — query 1", fontsize=10)
+axes[0].axis("off")
+plt.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+
+axes[1].imshow(gt_patch_mask_grid, cmap="Greys_r", interpolation="nearest")
+axes[1].set_title("GT binary mask (patch grid)", fontsize=10)
+axes[1].axis("off")
+
+im2 = axes[2].imshow(raw_density_np, cmap="jet", interpolation="nearest")
+axes[2].contour(gt_patch_mask_grid.astype(float), levels=[0.5], colors="white", linewidths=1.5)
+axes[2].set_title("Density map + GT mask overlay", fontsize=10)
+axes[2].axis("off")
+plt.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+
+plt.tight_layout()
+plt.show()
+
+log.info("GT true patches: %d  false patches: %d", len(true_vals), len(false_vals))
+if len(true_vals):
+    log.info(
+        "true  density  min=%.3f  mean=%.3f  median=%.3f  max=%.3f",
+        true_vals.min(),
+        true_vals.mean(),
+        np.median(true_vals),
+        true_vals.max(),
+    )
+if len(false_vals):
+    log.info(
+        "false density  min=%.3f  mean=%.3f  median=%.3f  max=%.3f",
+        false_vals.min(),
+        false_vals.mean(),
+        np.median(false_vals),
+        false_vals.max(),
+    )
+
+if len(true_vals) == 0:
+    log.warning("No GT-true patches — skipping programmatic-threshold HDBSCAN experiment.")
+else:
+    min_cs, max_cs = gt_cluster_size_bounds(
+        gt_sizes, "minmax_margin", CLUSTER_SIZE_MARGIN, CLUSTER_SIZE_STD_K
+    )
+    log.info("HDBSCAN size bounds (minmax_margin): [%d, %d]", min_cs, max_cs)
+
+    fig, axes = plt.subplots(
+        3, len(DENSITY_THRESHOLD_METHODS), figsize=(len(DENSITY_THRESHOLD_METHODS) * 4.5, 13.5)
+    )
+
+    for col, method in enumerate(DENSITY_THRESHOLD_METHODS):
+        thr = gt_density_threshold(true_vals, false_vals, method, DENSITY_THRESHOLD_MARGIN)
+        binary_map = raw_density_np > thr
+        ys_grid_t, xs_grid_t = np.where(binary_map)
+        n_points = len(xs_grid_t)
+
+        ax_false = axes[0, col]
+        ax_true = ax_false.twinx()
+        ax_false.hist(false_vals, bins=20, alpha=0.5, color="gray", label="false (outside GT)")
+        ax_true.hist(true_vals, bins=20, alpha=0.5, color="green", label="true (inside GT)")
+        ax_false.tick_params(axis="y", labelcolor="gray", labelsize=7)
+        ax_true.tick_params(axis="y", labelcolor="green", labelsize=7)
+        ax_false.axvline(thr, color="red", linestyle="--", linewidth=1.5)
+        ax_false.set_title(f"{method}\nthr={thr:.3f}  n={n_points} patches", fontsize=9)
+        if col == 0:
+            lines_false, labels_false = ax_false.get_legend_handles_labels()
+            lines_true, labels_true = ax_true.get_legend_handles_labels()
+            ax_false.legend(
+                lines_false + lines_true, labels_false + labels_true, fontsize=7, loc="upper left"
+            )
+
+        axes[1, col].imshow(binary_map, cmap="Greys_r", aspect="auto")
+        axes[1, col].set_title(f"binary map (density > {thr:.3f})", fontsize=9)
+        axes[1, col].axis("off")
+
+        if n_points < min_cs:
+            axes[2, col].imshow(np.array(query_imgs[0]))
+            axes[2, col].set_title("too few points for min_cluster_size", fontsize=9)
+            axes[2, col].axis("off")
+            log.warning(
+                "method=%s thr=%.3f -> only %d point(s) (< min_cluster_size=%d) — skipping HDBSCAN",
+                method,
+                thr,
+                n_points,
+                min_cs,
+            )
+            continue
+
+        xs_norm_t = xs_grid_t / max(q_w - 1, 1)
+        ys_norm_t = ys_grid_t / max(q_h - 1, 1)
+        features_t = np.stack([xs_norm_t, ys_norm_t], axis=1)
+        labels_t = HDBSCAN(min_cluster_size=min_cs, max_cluster_size=max_cs).fit_predict(features_t)
+        n_clusters_t = len(set(labels_t)) - (1 if -1 in labels_t else 0)
+        n_noise_t = int((labels_t == -1).sum())
+        log.info(
+            "method=%s thr=%.3f -> %d patch(es) -> %d cluster(s)  (%d noise)",
+            method,
+            thr,
+            n_points,
+            n_clusters_t,
+            n_noise_t,
+        )
+
+        colors_t = np.array(
+            [CMAP_HDB(lbl % 10) if lbl >= 0 else (0.6, 0.6, 0.6, 1.0) for lbl in labels_t]
+        )
+        axes[2, col].imshow(disp_q_c)
+        px_x_t, px_y_t = patch_to_px(xs_grid_t, ys_grid_t)
+        axes[2, col].scatter(px_x_t, px_y_t, c=colors_t, s=30, edgecolors="white", linewidths=0.3)
+        axes[2, col].set_title(f"{n_clusters_t} cluster(s), {n_noise_t} noise", fontsize=9)
+        axes[2, col].axis("off")
+
+    plt.suptitle(
+        f"Experiment: HDBSCAN  |  programmatic density threshold  |  "
+        f"size_bounds(minmax_margin)=[{min_cs},{max_cs}]  thr_margin={DENSITY_THRESHOLD_MARGIN}",
+        fontsize=11,
+        y=1.01,
+    )
+    plt.tight_layout()
+    plt.show()
+
 
 # %%

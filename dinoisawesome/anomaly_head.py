@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -15,6 +16,19 @@ from .encoder import DinoEncoder
 from .gallery import Gallery
 
 logger = logging.getLogger(__name__)
+
+
+def _box_smooth(grid: torch.Tensor) -> torch.Tensor:
+    """3x3 box average over a ``(H, W, D)`` patch grid, center included.
+
+    Ports PatchCore's own ``AvgPool2d(3, 1, 1)`` local-smoothing trick (applied
+    there to CNN feature maps) onto ViT patch tokens. At the grid borders, only
+    in-bounds neighbors are averaged (``count_include_pad=False``) so edge/corner
+    patches aren't biased toward zero by implicit zero-padding.
+    """
+    x = grid.permute(2, 0, 1).unsqueeze(0)  # (1, D, H, W)
+    smoothed = F.avg_pool2d(x, kernel_size=3, stride=1, padding=1, count_include_pad=False)
+    return smoothed.squeeze(0).permute(1, 2, 0)  # (H, W, D)
 
 
 def _greedy_coreset(embeddings: torch.Tensor, n_samples: int) -> torch.Tensor:
@@ -75,6 +89,9 @@ class AnomalyHead:
                         k-center after loading.
         split:          Pre-filter — only load gallery patches from this split.
         has_labels:     Pre-filter — only load patches that carry all of these labels.
+        smoothing:      If True, replace every patch feature (bank and query alike)
+                        with its 3x3 box average (center included, edge-safe) over
+                        the patch grid before scoring — see :func:`_box_smooth`.
     """
 
     def __init__(
@@ -86,6 +103,7 @@ class AnomalyHead:
         coreset_ratio: float | None = None,
         split: str | None = None,
         has_labels: list[str] | None = None,
+        smoothing: bool = False,
     ) -> None:
         self.gallery = gallery
         self.encoder = encoder
@@ -94,6 +112,7 @@ class AnomalyHead:
         self._filter_split = split
         self._filter_has_labels = has_labels
         self._coreset_ratio = coreset_ratio
+        self.smoothing = smoothing
 
         self._memory_bank: torch.Tensor = self._build_memory_bank()
 
@@ -117,6 +136,7 @@ class AnomalyHead:
         coreset_ratio: float | None = None,
         filter_split: str | None = "train",
         filter_has_labels: list[str] | None = None,
+        smoothing: bool = False,
     ) -> AnomalyHead:
         """Build a Gallery from *images* and return a ready-to-use AnomalyHead.
 
@@ -134,6 +154,7 @@ class AnomalyHead:
             coreset_ratio:      Memory-bank subsampling ratio (None = keep all).
             filter_split:       Only load patches from this split into the bank.
             filter_has_labels:  Only load patches with all of these labels into the bank.
+            smoothing:          See :class:`AnomalyHead`.
         """
         gallery = Gallery.build(
             encoder=encoder,
@@ -153,6 +174,7 @@ class AnomalyHead:
             coreset_ratio=coreset_ratio,
             split=filter_split,
             has_labels=filter_has_labels,
+            smoothing=smoothing,
         )
 
     # ------------------------------------------------------------------
@@ -175,7 +197,10 @@ class AnomalyHead:
             raise ValueError(
                 "No gallery patches match the filter — check split/has_labels arguments."
             )
-        embs = self.gallery.load_embeddings(df, self.block_idx)  # (N, D) float32
+        if self.smoothing:
+            embs = self._load_smoothed_embeddings(df)  # (N, D) float32
+        else:
+            embs = self.gallery.load_embeddings(df, self.block_idx)  # (N, D) float32
         bank = F.normalize(torch.from_numpy(embs), p=2, dim=1)
 
         if self._coreset_ratio is not None:
@@ -191,6 +216,22 @@ class AnomalyHead:
 
         logger.info("Memory bank ready: %d patches, D=%d", len(bank), bank.shape[1])
         return bank
+
+    def _load_smoothed_embeddings(self, df: pd.DataFrame) -> np.ndarray:
+        """Like :meth:`Gallery.load_embeddings`, but each patch is pulled from its
+        3x3 box-smoothed grid (see :func:`_box_smooth`) instead of the raw grid.
+        """
+        result = np.empty((len(df), self.gallery.config.embed_dim), dtype=np.float32)
+        pos_map = {idx: i for i, idx in enumerate(df.index)}
+
+        for img_id, group in df.groupby("image_id"):
+            grid = self.gallery.load_image_grid(img_id, self.block_idx)  # (H, W, D)
+            smoothed = _box_smooth(torch.from_numpy(np.array(grid))).numpy()
+            out_pos = [pos_map[idx] for idx in group.index]
+            result[out_pos] = smoothed[
+                group["row"].values.astype(int), group["col"].values.astype(int)
+            ]
+        return result
 
     def reload(self) -> None:
         """Rebuild the in-RAM memory bank from the gallery on disk.
@@ -229,6 +270,8 @@ class AnomalyHead:
         # layers=[...] keeps multi-layer form → patches: (B, 1, H, W, D)
         out = self.encoder([pil_img], layers=[self.block_idx], debias=debias)
         patches = out.patches[0, 0]  # (H, W, D)
+        if self.smoothing:
+            patches = _box_smooth(patches)
         H, W, D = patches.shape
 
         flat = F.normalize(patches.reshape(H * W, D), p=2, dim=1)

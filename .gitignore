@@ -219,3 +219,5 @@ __marimo__/
 data/
 notes.txt
 results/high_res_tiling/
+outputs/
+scripts/multiscale_results/

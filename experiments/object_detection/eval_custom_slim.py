@@ -37,7 +37,7 @@ import numpy as np
 from dotenv import load_dotenv
 from PIL import Image
 
-_REPO_ROOT = Path(__file__).parent.parent
+_REPO_ROOT = Path(__file__).parent.parent.parent
 load_dotenv(_REPO_ROOT / ".env")
 sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 
