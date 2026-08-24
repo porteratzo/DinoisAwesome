@@ -34,6 +34,7 @@
 # %% Logging — must be before torch import
 import logging
 import os
+import sys
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,6 +54,9 @@ from matplotlib.patches import Rectangle
 from PIL import Image
 
 from dinoisawesome import DinoEncoder, compute_exemplar_features, load_annotations
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _shared.mask_geometry import mask_bbox_px, pixel_mask_to_patch_mask  # noqa: E402
 
 # %% Parameters
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -97,25 +101,6 @@ log.info(
 )
 
 # %% Mask / geometry helpers
-
-
-def mask_bbox_px(mask: np.ndarray) -> tuple[int, int, int, int]:
-    """Bounding box of the True region as (rmin, rmax, cmin, cmax)."""
-    rows, cols = np.where(mask)
-    return int(rows.min()), int(rows.max()), int(cols.min()), int(cols.max())
-
-
-def pixel_mask_to_patch_mask(
-    pixel_mask: np.ndarray, grid_h: int, grid_w: int, img_size: int, threshold: float
-) -> np.ndarray:
-    """Resize a pixel-space mask to patch-grid resolution, (grid_h, grid_w) bool."""
-    mask_pil = Image.fromarray(pixel_mask.astype(np.uint8) * 255)
-    mask_resized = np.array(mask_pil.resize((img_size, img_size), Image.NEAREST)) > 0
-    ph = img_size // grid_h
-    pw = img_size // grid_w
-    tiled = mask_resized.reshape(grid_h, ph, grid_w, pw)
-    patch_density = tiled.mean(axis=(1, 3))
-    return patch_density >= threshold
 
 
 def scale_crop_boxes(

@@ -27,6 +27,7 @@ mypy dinoisawesome/
 - **No hardcoded paths via `os.getcwd()`** — anchor to `Path(__file__).parent` or a config-provided storage path.
 - **No unbounded array loads** — gallery vectors are memory-mapped; keep it that way.
 - **Initialize logging before importing torch** — torch registers handlers at import time on some builds.
+- **Wrap long-running loops in `tqdm`** — encoding passes, per-pair/per-image processing, batch inference, etc. need visible progress feedback; bare `for` loops over more than a handful of items should use `tqdm(...)` (or `tqdm.write()` if logging inside the loop).
 
 ## Working Assumptions
 

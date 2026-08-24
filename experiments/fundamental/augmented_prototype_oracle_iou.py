@@ -54,9 +54,9 @@
 #      the more realistic "clean exemplar, noisy factory frame" scenario.
 
 # %% Logging — must be before torch import
-import io
 import logging
 import os
+import sys
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,7 +65,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("augmented_prototype_oracle_iou")
 
-from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -73,11 +73,24 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from dotenv import load_dotenv
-from PIL import Image, ImageFilter
-from torchvision import transforms
+from PIL import Image
 
 from dinoisawesome import DinoEncoder, compute_exemplar_features, load_annotations
 from dinoisawesome.instance_detection import extract_patch_tokens
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _shared.augmentations import (  # noqa: E402
+    apply_blur,
+    apply_color_jitter,
+    apply_gamma,
+    apply_jpeg,
+    apply_noise,
+    apply_rotation,
+    mean_color,
+    pixel_only,
+)
+from _shared.mask_geometry import pixel_mask_to_patch_mask, scale_crop_box  # noqa: E402
+from _shared.thresholding import iou_threshold_curve  # noqa: E402
 
 # %% Parameters
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -126,75 +139,6 @@ log.info(
 )
 
 # %% Mask / geometry / IoU helpers (same as multiscale_crop_ablation.py)
-
-
-def mask_bbox_px(mask: np.ndarray) -> tuple[int, int, int, int]:
-    """Bounding box of the True region as (rmin, rmax, cmin, cmax)."""
-    rows, cols = np.where(mask)
-    return int(rows.min()), int(rows.max()), int(cols.min()), int(cols.max())
-
-
-def pixel_mask_to_patch_mask(
-    pixel_mask: np.ndarray, grid_h: int, grid_w: int, img_size: int, threshold: float
-) -> np.ndarray:
-    """Resize a pixel-space mask to patch-grid resolution, (grid_h, grid_w) bool."""
-    mask_pil = Image.fromarray(pixel_mask.astype(np.uint8) * 255)
-    mask_resized = np.array(mask_pil.resize((img_size, img_size), Image.NEAREST)) > 0
-    ph = img_size // grid_h
-    pw = img_size // grid_w
-    tiled = mask_resized.reshape(grid_h, ph, grid_w, pw)
-    patch_density = tiled.mean(axis=(1, 3))
-    return patch_density >= threshold
-
-
-def scale_crop_box(
-    pixel_mask: np.ndarray, scale: str, padding_frac: float
-) -> tuple[int, int, int, int]:
-    """PIL-style crop box (x0, y0, x1, y1) for the "close" or "mid" prototype scale.
-
-    close — tight bbox around the mask, padded by *padding_frac* of its own extent.
-    mid   — midpoint between the close box and the full image.
-    """
-    H, W = pixel_mask.shape
-    rmin, rmax, cmin, cmax = mask_bbox_px(pixel_mask)
-    pad_r = int((rmax - rmin) * padding_frac)
-    pad_c = int((cmax - cmin) * padding_frac)
-    close_box = (
-        max(0, cmin - pad_c),
-        max(0, rmin - pad_r),
-        min(W, cmax + pad_c),
-        min(H, rmax + pad_r),
-    )
-    if scale == "close":
-        return close_box
-    if scale == "mid":
-        global_box = (0, 0, W, H)
-        return (
-            (close_box[0] + global_box[0]) // 2,
-            (close_box[1] + global_box[1]) // 2,
-            (close_box[2] + global_box[2]) // 2,
-            (close_box[3] + global_box[3]) // 2,
-        )
-    raise ValueError(f"Unknown scale: {scale!r}")
-
-
-def mean_color(img: Image.Image) -> tuple[int, int, int]:
-    return tuple(int(c) for c in np.array(img).reshape(-1, 3).mean(axis=0))
-
-
-def mask_iou(a: np.ndarray, b: np.ndarray) -> float:
-    inter = int((a & b).sum())
-    union = int((a | b).sum())
-    return inter / (union + 1e-8)
-
-
-def iou_threshold_curve(
-    raw: np.ndarray, gt_mask: np.ndarray, steps: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Patch-mask IoU of `(raw > c)` vs. `gt_mask` for `steps` candidates spanning raw's range."""
-    candidates = np.linspace(raw.min(), raw.max(), steps)
-    ious = np.array([mask_iou(raw > c, gt_mask) for c in candidates])
-    return candidates, ious
 
 
 def oracle_iou(raw: np.ndarray, gt_mask: np.ndarray, steps: int) -> float:
@@ -258,109 +202,36 @@ log.info(
 # severity index 0 is pixel-identical to the scale's *base_crop* — one no-augmentation
 # baseline per scale, shared by every family's severity=0 entry.
 
-AugmentFn = Callable[
-    [Image.Image, np.ndarray, float, tuple[int, int, int]], tuple[Image.Image, np.ndarray]
-]
-
-
-def _pixel_only(fn: Callable[[Image.Image, float], Image.Image]) -> AugmentFn:
-    """Wrap a pixel-value-only augmentation to the (img, mask, val, fill) -> (img, mask) shape."""
-
-    def wrapped(
-        img: Image.Image, mask_px: np.ndarray, val: float, fill: tuple[int, int, int]
-    ) -> tuple[Image.Image, np.ndarray]:
-        return fn(img, val), mask_px
-
-    return wrapped
-
-
-def _apply_rotation(
-    img: Image.Image, mask_px: np.ndarray, angle: float, fill: tuple[int, int, int]
-) -> tuple[Image.Image, np.ndarray]:
-    if angle == 0:
-        return img, mask_px
-    rotated_img = img.rotate(angle, resample=Image.BICUBIC, expand=False, fillcolor=fill)
-    mask_pil = Image.fromarray(mask_px.astype(np.uint8) * 255)
-    rotated_mask = (
-        np.array(mask_pil.rotate(angle, resample=Image.NEAREST, expand=False, fillcolor=0)) > 0
-    )
-    return rotated_img, rotated_mask
-
-
-def _apply_gamma(img: Image.Image, gamma: float) -> Image.Image:
-    if gamma == 1.0:
-        return img
-    arr = (np.array(img).astype(np.float32) / 255.0) ** gamma
-    return Image.fromarray((arr * 255.0).clip(0, 255).astype(np.uint8))
-
-
-def _apply_color_jitter(img: Image.Image, magnitude: float) -> Image.Image:
-    if magnitude == 0:
-        return img
-    torch.manual_seed(SEED)  # deterministic draw per severity level
-    jitter = transforms.ColorJitter(
-        brightness=magnitude,
-        contrast=magnitude,
-        saturation=magnitude,
-        hue=min(magnitude * 0.5, 0.5),
-    )
-    return jitter(img)
-
-
-def _apply_blur(img: Image.Image, radius: float) -> Image.Image:
-    if radius == 0:
-        return img
-    return img.filter(ImageFilter.GaussianBlur(radius=radius))
-
-
-def _apply_noise(img: Image.Image, sigma: float) -> Image.Image:
-    if sigma == 0:
-        return img
-    rng = np.random.default_rng(SEED)
-    arr = np.array(img).astype(np.float32)
-    noisy = np.clip(arr + rng.normal(0.0, sigma, arr.shape), 0, 255).astype(np.uint8)
-    return Image.fromarray(noisy)
-
-
-def _apply_jpeg(img: Image.Image, quality: float) -> Image.Image:
-    if quality >= 100:
-        return img
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=int(quality))
-    buf.seek(0)
-    return Image.open(buf).convert("RGB")
-
-
 AUGMENTATIONS: dict[str, dict] = {
     "rotation": {
         "values": [0, 8, 16, 30, 50, 75],
         "unit": "deg",
-        "apply": _apply_rotation,
+        "apply": apply_rotation,
     },
     "illumination (gamma)": {
         "values": [1.0, 1.3, 1.7, 2.2, 2.8, 3.5],
         "unit": "gamma",
-        "apply": _pixel_only(_apply_gamma),
+        "apply": pixel_only(apply_gamma),
     },
     "color jitter": {
         "values": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5],
         "unit": "magnitude",
-        "apply": _pixel_only(_apply_color_jitter),
+        "apply": pixel_only(partial(apply_color_jitter, seed=SEED)),
     },
     "gaussian blur": {
         "values": [0, 1, 2, 4, 7, 11],
         "unit": "px radius",
-        "apply": _pixel_only(_apply_blur),
+        "apply": pixel_only(apply_blur),
     },
     "gaussian noise": {
         "values": [0, 8, 16, 28, 45, 70],
         "unit": "sigma (0-255)",
-        "apply": _pixel_only(_apply_noise),
+        "apply": pixel_only(partial(apply_noise, seed=SEED)),
     },
     "jpeg compression": {
         "values": [100, 80, 60, 35, 15, 3],
         "unit": "quality",
-        "apply": _pixel_only(_apply_jpeg),
+        "apply": pixel_only(apply_jpeg),
     },
 }
 

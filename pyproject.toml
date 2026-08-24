@@ -19,6 +19,7 @@ dependencies = [
     "flask>=3.0",
     "transformers>=4.38",
     "accelerate>=0.30",
+    "tqdm>=4.66",
 ]
 
 [project.optional-dependencies]

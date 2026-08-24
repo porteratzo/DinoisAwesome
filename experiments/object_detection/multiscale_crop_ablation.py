@@ -35,13 +35,12 @@
 
 # %% Logging — must be before torch import
 import logging
-import math
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -51,12 +50,56 @@ from dotenv import load_dotenv
 from matplotlib.patches import Rectangle
 from PIL import Image
 from scipy import ndimage
-from sklearn.cluster import DBSCAN
 
 from dinoisawesome import DinoEncoder
 from dinoisawesome.abc3 import PART_TYPES, load_instance_pixel_mask, load_instance_pixel_masks
-from dinoisawesome.annotation_utils import load_annotations
 from dinoisawesome.instance_detection import compute_exemplar_features, extract_patch_tokens
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _shared.clustering import (  # noqa: E402
+    dbscan_clusters as _shared_dbscan_clusters,
+)
+from _shared.clustering import (
+    dbscan_clusters_from_mask,
+    match_and_score,
+    patch_radius_to_eps,
+)
+from _shared.clustering import (
+    min_cluster_size_bound as _shared_min_cluster_size_bound,
+)
+from _shared.crop_utils import pad_and_floor_crop_box  # noqa: E402
+from _shared.gt_utils import (
+    gt_instance_patch_sizes as _shared_gt_instance_patch_sizes,  # noqa: E402
+)
+from _shared.mask_geometry import (  # noqa: E402
+    blob_patch_bbox,
+    connected_component_blobs,
+    mask_iou,
+    patch_bbox_to_native_px,
+    pixel_mask_to_patch_mask,
+    scale_crop_box,
+)
+from _shared.prototype_ops import extract_patch_tokens_batch, knn_fgbg_score  # noqa: E402
+from _shared.thresholding import iou_threshold_curve, iou_tuned_threshold  # noqa: E402
+from _shared.thresholding import roi_binary_mask as _shared_roi_binary_mask  # noqa: E402
+from _shared.two_stage import (  # noqa: E402
+    annotate_cluster_rejection,
+    crop_patch_centers_to_native_px,
+    merge_overlapping_clusters,
+    project_crop_mask_to_query_grid,
+)
+from _shared.two_stage import (
+    blob_crop_gt_mask as _shared_blob_crop_gt_mask,
+)
+from _shared.two_stage import (
+    cross_score_blobs as _shared_cross_score_blobs,
+)
+from _shared.two_stage import (
+    tune_cluster_reject_threshold as _shared_tune_cluster_reject_threshold,
+)
+from _shared.two_stage import (
+    two_stage_predicted_clusters as _shared_two_stage_predicted_clusters,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -124,20 +167,24 @@ ABLATION_COMBOS: dict[str, list[str]] = {
     # "global+mid+close": ["global", "mid", "close"],
 }
 
-# fg-bg-mean and fg-bg-knn are built separately from the single-scale combos above (they need
-# per-scale foreground/background prototypes or galleries, not just scale_protos[m].prototype
-# — see build_fgbg_states and build_knn_fgbg_states) and are configurable the same way
-# ABLATION_COMBOS is: each key names a (fg source scales, bg source scales) pair, and both the
-# mean-collapsed ("fg-bg-mean(...)") and patch-gallery ("fg-bg-knn(...)") variants are built for
-# every key here, so a method's name always says exactly which scales fed its fg and bg sides.
-# "mid-close/all" reproduces the original hardcoded fg-bg/fg-bg-knn behaviour (fg-bg-mean used
-# mid+close for fg; fg-bg-knn used all three scales for fg — both used all three for bg).
+# fg-bg-mean, fg-bg-proto and fg-bg-knn are built separately from the single-scale combos above
+# (they need per-scale foreground/background prototypes or galleries, not just
+# scale_protos[m].prototype — see build_fgbg_states, build_fgbg_multiproto_states and
+# build_knn_fgbg_states) and are configurable the same way ABLATION_COMBOS is: each key names a
+# (fg source scales, bg source scales) pair. Single-fg-scale combos build a "fg-bg-mean(...)"
+# (both sides collapsed to one mean vector); multi-fg-scale combos build a "fg-bg-proto(...)"
+# instead (each fg scale's own mean prototype kept as a separate row, not averaged into one —
+# see build_fgbg_multiproto_states for why). "fg-bg-knn(...)" is built for every combo either
+# way, since it never collapses to a mean on either side.
 FGBG_SOURCE_COMBOS: dict[str, dict[str, list[str]]] = {
-    # 'global/all': {"fg": ["global"], "bg": ["global", "mid", "close"]},
-    # 'global+mid/all': {"fg": ["global", "mid"], "bg": ["global", "mid", "close"]},
-    # 'global+mid+close/all': {"fg": ["global", "mid", "close"], "bg": ["global", "mid", "close"]},
-    # "mid-close/all": {"fg": ["mid", "close"], "bg": ["global", "mid", "close"]},
+    "global/all": {"fg": ["global"], "bg": ["global", "mid", "close"]},
     "mid/all": {"fg": ["mid"], "bg": ["global", "mid", "close"]},
+    "global+mid/all": {"fg": ["global", "mid"], "bg": ["global", "mid", "close"]},
+    "mid+close/all": {"fg": ["mid", "close"], "bg": ["global", "mid", "close"]},
+    "global+mid+close/all": {
+        "fg": ["global", "mid", "close"],
+        "bg": ["global", "mid", "close"],
+    },
 }
 
 # How a multi-scale combo's per-scale prototypes are combined (single-scale entries are
@@ -149,6 +196,18 @@ FGBG_SOURCE_COMBOS: dict[str, dict[str, list[str]]] = {
 # multi-scale combo, so e.g. "mid+close-max" and "mid+close-mean" can both be compared in the
 # same ablation run. See build_ablation_states / score_method / ablation_method_names.
 MULTI_SCALE_COMBINE: list[Literal["max", "mean"]] = ["max", "mean"]
+
+# k-means variant of the single-scale mean methods above: same pooled foreground patches
+# per scale, but k centroids (multi-row, max-cosine per query patch) instead of one mean
+# vector. One "<scale>-kmeans<k>" method per (scale in SCALES, k in KMEANS_KS) — see
+# build_kmeans_states.
+KMEANS_KS: tuple[int, ...] = (3, 8)
+
+# The k-means families (build_kmeans_states' "<scale>-kmeans<k>" and build_kmeans_fgbg_states'
+# "fg-bg-kmeans<k>(...)") consistently score worse than the mean/proto/knn families in these
+# runs, so they're skipped by default. Flip to True to re-enable them for a comparison run —
+# nothing else needs to change, both builders stay registered below.
+INCLUDE_KMEANS_METHODS: bool = False
 
 
 def ablation_method_names(
@@ -178,13 +237,28 @@ def ablation_method_names(
 # separate again — it's the diagonal of the cross-scale matrix (that scale finds its own ROI
 # blobs *and* re-scores them), added per scale in SCALES rather than as an ABLATION_COMBOS entry
 # since it isn't a single-pass prototype method — see two_stage_predicted_clusters.
+_KMEANS_SCALE_NAMES = [f"{scale}-kmeans{k}" for scale in SCALES for k in KMEANS_KS]
+
 METHOD_DISPLAY_ORDER: list[str] = (
     ablation_method_names(ABLATION_COMBOS, MULTI_SCALE_COMBINE)
-    + [f"fg-bg-mean({name})" for name in FGBG_SOURCE_COMBOS]
+    + (_KMEANS_SCALE_NAMES if INCLUDE_KMEANS_METHODS else [])
+    + [f"fg-bg-mean({n})" for n, c in FGBG_SOURCE_COMBOS.items() if len(c["fg"]) == 1]
+    + [f"fg-bg-proto({n})" for n, c in FGBG_SOURCE_COMBOS.items() if len(c["fg"]) > 1]
     + [f"fg-bg-knn({name})" for name in FGBG_SOURCE_COMBOS]
+    + (
+        [f"fg-bg-kmeans{k}({name})" for name in FGBG_SOURCE_COMBOS for k in KMEANS_KS]
+        if INCLUDE_KMEANS_METHODS
+        else []
+    )
     + [f"two-stage({s})" for s in SCALES]
-    + [f"two-stage(fg-bg-mean({name}))" for name in FGBG_SOURCE_COMBOS]
+    + [f"two-stage(fg-bg-mean({n}))" for n, c in FGBG_SOURCE_COMBOS.items() if len(c["fg"]) == 1]
+    + [f"two-stage(fg-bg-proto({n}))" for n, c in FGBG_SOURCE_COMBOS.items() if len(c["fg"]) > 1]
     + [f"two-stage(fg-bg-knn({name}))" for name in FGBG_SOURCE_COMBOS]
+    + (
+        [f"two-stage(fg-bg-kmeans{k}({name}))" for name in FGBG_SOURCE_COMBOS for k in KMEANS_KS]
+        if INCLUDE_KMEANS_METHODS
+        else []
+    )
 )
 
 # fg-bg-knn: k for the per-patch kNN gallery lookup (see build_knn_fgbg_states / knn_fgbg_score).
@@ -195,20 +269,15 @@ KNN_FGBG_NUM_NEIGHBOURS = 10
 REF_THRESHOLD_STEPS = 25  # ref_iou: number of candidate thresholds searched
 
 
-def patch_radius_to_eps(n_pixels: float) -> float:
-    """Convert an 8-connected pixel/patch radius to a DBSCAN eps (Euclidean).
-
-    DBSCAN's eps is a Euclidean radius, but "n pixels away, counting diagonals" is a
-    Chebyshev (chessboard) distance — the two only agree at the block's corner. A point
-    n pixels out on the diagonal sits at Euclidean distance n*sqrt(2), the largest gap
-    DBSCAN must bridge to treat an n-pixel step as "connected". n=1 -> eps spans the
-    immediate 8-neighborhood (matches GT_DBSCAN_EPS's own ~1.4142, rounded up to 1.5).
-    Only exact for n<=2 — at n>=3 the corner distance n*sqrt(2) exceeds n+1 (the nearest
-    excluded axis-aligned point), so eps starts leaking in points beyond the intended
-    square block; treat larger n as "bridges gaps up to n pixels", not a hard radius.
-    """
-    return n_pixels * math.sqrt(2)
-
+# patch_radius_to_eps (imported from _shared.clustering above): DBSCAN's eps is a Euclidean
+# radius, but "n pixels away, counting diagonals" is a Chebyshev (chessboard) distance — the
+# two only agree at the block's corner. A point n pixels out on the diagonal sits at Euclidean
+# distance n*sqrt(2), the largest gap DBSCAN must bridge to treat an n-pixel step as
+# "connected". n=1 -> eps spans the immediate 8-neighborhood (matches GT_DBSCAN_EPS's own
+# ~1.4142, rounded up to 1.5). Only exact for n<=2 — at n>=3 the corner distance n*sqrt(2)
+# exceeds n+1 (the nearest excluded axis-aligned point), so eps starts leaking in points
+# beyond the intended square block; treat larger n as "bridges gaps up to n pixels", not a
+# hard radius.
 
 # CLUSTER_SIZE_MARGIN: int -> flat patch-count offset (k_min - margin);
 # float -> fraction of the bound (k_min - margin*k_min). See min_cluster_size_bound.
@@ -270,23 +339,6 @@ log.info(
 # annotation_stem, unlike this file's own bare `stem` convention.
 
 
-def pixel_mask_to_patch_mask(
-    pixel_mask: np.ndarray,
-    grid_h: int,
-    grid_w: int,
-    img_size: int,
-    threshold: float = 0.3,
-) -> np.ndarray:
-    """Resize a pixel-space mask to patch-grid resolution, (grid_h, grid_w) bool."""
-    mask_pil = Image.fromarray(pixel_mask.astype(np.uint8) * 255)
-    mask_resized = np.array(mask_pil.resize((img_size, img_size), Image.NEAREST)) > 0
-    ph = img_size // grid_h
-    pw = img_size // grid_w
-    tiled = mask_resized.reshape(grid_h, ph, grid_w, pw)
-    patch_density = tiled.mean(axis=(1, 3))
-    return patch_density >= threshold
-
-
 def gt_instance_patch_sizes(
     stem: str,
     class_filter: list[str] | None,
@@ -296,68 +348,9 @@ def gt_instance_patch_sizes(
     patch_threshold: float,
 ) -> np.ndarray:
     """Per-instance GT sizes in patches, using that image's own annotation set."""
-    ann_stem = data_dir / "annotations" / stem
-    try:
-        anns = load_annotations(ann_stem)
-    except FileNotFoundError:
-        return np.array([])
-    instances = [a for a in anns if class_filter is None or a["class"] in class_filter]
-    if not instances:
-        return np.array([])
-    return np.array(
-        [
-            pixel_mask_to_patch_mask(a["mask"], grid_h, grid_w, img_size, patch_threshold).sum()
-            for a in instances
-        ]
+    return _shared_gt_instance_patch_sizes(
+        stem, class_filter, grid_h, grid_w, img_size, patch_threshold, data_dir
     )
-
-
-def mask_iou(a: np.ndarray, b: np.ndarray) -> float:
-    inter = int((a & b).sum())
-    union = int((a | b).sum())
-    return inter / (union + 1e-8)
-
-
-def mask_bbox_px(mask: np.ndarray) -> tuple[int, int, int, int]:
-    """Bounding box of the True region as (rmin, rmax, cmin, cmax)."""
-    rows, cols = np.where(mask)
-    return int(rows.min()), int(rows.max()), int(cols.min()), int(cols.max())
-
-
-def scale_crop_box(
-    pixel_mask: np.ndarray, scale: str, padding_frac: float
-) -> tuple[int, int, int, int]:
-    """PIL-style crop box (x0, y0, x1, y1) for one of the three prototype scales.
-
-    close  — tight bbox around the mask, padded by *padding_frac* of its own extent.
-    mid    — midpoint between the close box and the full image.
-    global — the entire image (no crop).
-    """
-    H, W = pixel_mask.shape
-    rmin, rmax, cmin, cmax = mask_bbox_px(pixel_mask)
-    pad_r = int((rmax - rmin) * padding_frac)
-    pad_c = int((cmax - cmin) * padding_frac)
-
-    close_box = (
-        max(0, cmin - pad_c),
-        max(0, rmin - pad_r),
-        min(W, cmax + pad_c),
-        min(H, rmax + pad_r),
-    )
-    global_box = (0, 0, W, H)
-
-    if scale == "close":
-        return close_box
-    if scale == "global":
-        return global_box
-    if scale == "mid":
-        return (
-            (close_box[0] + global_box[0]) // 2,
-            (close_box[1] + global_box[1]) // 2,
-            (close_box[2] + global_box[2]) // 2,
-            (close_box[3] + global_box[3]) // 2,
-        )
-    raise ValueError(f"Unknown scale: {scale!r}")
 
 
 # %% Multi-scale exemplar prototype builder
@@ -397,22 +390,12 @@ class ScalePrototype:
     prototype: torch.Tensor  # (1, C) L2-normalised — mean of all cluster prototypes for mid/close
     bg_prototype: torch.Tensor  # (1, C) L2-normalised — same mean, over each cluster's background
     cluster_crops: list[ClusterCrop] | None = None  # per-instance crops; None for "global"
-
-
-def extract_patch_tokens_batch(
-    encoder: DinoEncoder,
-    images: list[Image.Image],
-    layer_idx: int,
-    debias: bool = False,
-) -> list[tuple[torch.Tensor, int, int]]:
-    """Batched ``extract_patch_tokens``: encodes all *images* in a single forward pass."""
-    out = encoder(images, layers=[layer_idx], debias=debias)
-    patches = out.patches[:, 0]  # (B, H, W, D)
-    _, grid_h, grid_w, D = patches.shape
-    return [
-        (F.normalize(patches[b].reshape(grid_h * grid_w, D), p=2, dim=-1), grid_h, grid_w)
-        for b in range(patches.shape[0])
-    ]
+    # (width_frac, height_frac): median training-time crop size for this scale, as a fraction of
+    # the reference image's own width/height. Only populated for "mid" (see
+    # build_all_scale_prototypes) — used at inference to pull stage-2 ROI blob crops toward the
+    # same field of view the mid prototype was actually built from, instead of the scale-agnostic
+    # fixed floor every scale used before (see find_roi_blobs). None for "close"/"global".
+    target_size_frac: tuple[float, float] | None = None
 
 
 def build_all_scale_prototypes(
@@ -579,6 +562,15 @@ def build_all_scale_prototypes(
             dim=-1,
         )
         rep = max(clusters, key=lambda c: int(c.patch_mask.sum()))
+
+        target_size_frac = None
+        if scale == "mid":
+            # Median, not mean — robust to one outlier-sized instance skewing the target that
+            # every query blob then gets pulled toward.
+            widths = np.array([c.box[2] - c.box[0] for c in clusters], dtype=float)
+            heights = np.array([c.box[3] - c.box[1] for c in clusters], dtype=float)
+            target_size_frac = (float(np.median(widths)) / W, float(np.median(heights)) / H)
+
         protos[scale] = ScalePrototype(
             scale,
             rep.box,
@@ -590,6 +582,7 @@ def build_all_scale_prototypes(
             avg,
             bg_avg,
             cluster_crops=clusters,
+            target_size_frac=target_size_frac,
         )
 
     all_instance_protos = clusters_by_scale["mid"] + clusters_by_scale["close"]
@@ -608,12 +601,16 @@ def build_all_scale_prototypes(
 @dataclass
 class MethodState:
     name: str
-    kind: Literal["single", "multi", "fgbg", "knn_fgbg"]
-    # (K, C) L2-normalised prototype(s); "fgbg" is (2, C) = [fg, bg]; None for "knn_fgbg"
-    # (uses fg_bank/bg_bank instead — see build_knn_fgbg_states / knn_fgbg_score).
+    kind: Literal["single", "multi", "fgbg", "knn_fgbg", "kmeans_fgbg"]
+    # (K, C) L2-normalised prototype(s); "fgbg" is (2, C) = [fg, bg]; None for "knn_fgbg"/
+    # "kmeans_fgbg" (both use fg_bank/bg_bank instead — see build_knn_fgbg_states/
+    # build_kmeans_fgbg_states / knn_fgbg_score / kmeans_fgbg_score).
     payload: torch.Tensor | None = None
-    fg_bank: torch.Tensor | None = None  # (Nfg, C) L2-normalised patch gallery; "knn_fgbg" only
-    bg_bank: torch.Tensor | None = None  # (Nbg, C) L2-normalised patch gallery; "knn_fgbg" only
+    # "knn_fgbg": (Nfg, C) raw patch gallery. "kmeans_fgbg": (k, C) k-means centroids.
+    fg_bank: torch.Tensor | None = None
+    # "knn_fgbg": (Nbg, C) raw patch gallery. "kmeans_fgbg": (1, C) collapsed mean bg vector
+    # (same bg side as "fgbg"/fg-bg-mean) — only the fg side is k-means for this kind.
+    bg_bank: torch.Tensor | None = None
 
 
 def build_ablation_states(
@@ -657,25 +654,27 @@ def build_fgbg_states(
 ) -> dict[str, MethodState]:
     """Mean-collapsed contrastive fg-bg: score = cos(query, fg) - cos(query, bg).
 
-    One MethodState per *combos* entry, named "fg-bg-mean(<combo_name>)" — the "-mean" makes
-    explicit that both sides are collapsed to a single mean vector, unlike the "-max"/"-mean"
-    combine modes on multi-scale single-side combos (see MULTI_SCALE_COMBINE), and unlike
-    fg-bg-knn which never collapses. For each entry, fg is the
-    L2-renormalised average of the named "fg" scales' foreground (masked-mean) prototypes, and
-    bg is the L2-renormalised average of the named "bg" scales' own background prototypes (the
-    masked mean of the *non*-mask patches within that scale's own crop(s)). A scale in "bg" that
-    only appears there (e.g. "global") contributes far-field background from the rest of the
-    reference image — without it, bg only ever sees a narrow local neighborhood and fails to
-    discriminate once the query has background content outside that neighborhood.
+    One MethodState per *combos* entry with a single fg scale, named
+    "fg-bg-mean(<combo_name>)" — the "-mean" makes explicit that both sides are collapsed to a
+    single mean vector, unlike the "-max"/"-mean" combine modes on multi-scale single-side
+    combos (see MULTI_SCALE_COMBINE), and unlike fg-bg-knn which never collapses. fg is the
+    L2-renormalised (here, trivially, since there's only one scale) foreground (masked-mean)
+    prototype of the named "fg" scale, and bg is the L2-renormalised average of the named "bg"
+    scales' own background prototypes (the masked mean of the *non*-mask patches within that
+    scale's own crop(s)). A scale in "bg" that only appears there (e.g. "global") contributes
+    far-field background from the rest of the reference image — without it, bg only ever sees a
+    narrow local neighborhood and fails to discriminate once the query has background content
+    outside that neighborhood.
 
-    A combo is skipped (not included in the returned dict) if any of its fg/bg scales was
-    dropped for this reference image (e.g. "close" below MIN_CROP_SIZE) — build_ablation_states
-    skips combos the same way.
+    Combos with more than one fg scale are built by build_fgbg_multiproto_states instead (kept
+    as separate prototype rows, not averaged here) — see that function. A combo is skipped (not
+    included in the returned dict) if any of its fg/bg scales was dropped for this reference
+    image (e.g. "close" below MIN_CROP_SIZE) — build_ablation_states skips combos the same way.
     """
     states = {}
     for combo_name, sources in combos.items():
         fg_scales, bg_scales = sources["fg"], sources["bg"]
-        if not all(s in scale_protos for s in [*fg_scales, *bg_scales]):
+        if len(fg_scales) != 1 or not all(s in scale_protos for s in [*fg_scales, *bg_scales]):
             continue
         fg = F.normalize(
             torch.cat([scale_protos[s].prototype for s in fg_scales], dim=0).mean(
@@ -694,6 +693,41 @@ def build_fgbg_states(
         payload = torch.cat([fg, bg], dim=0)  # (2, C): row 0 = fg, row 1 = bg
         name = f"fg-bg-mean({combo_name})"
         states[name] = MethodState(name, "fgbg", payload)
+    return states
+
+
+def build_fgbg_multiproto_states(
+    scale_protos: dict[str, ScalePrototype], combos: dict[str, dict[str, list[str]]]
+) -> dict[str, MethodState]:
+    """Multi-datasource contrastive fg-bg: one prototype row per fg scale, kept separate
+    instead of averaged into one vector like build_fgbg_states.
+
+    Reuses the "kmeans_fgbg" MethodState shape/scoring (fg_bank of (K, C) rows scored via
+    per-patch max cosine similarity, minus a single collapsed bg vector — see
+    kmeans_fgbg_score) — the mechanism is identical to build_kmeans_fgbg_states' k-means
+    centroids, just fed each fg scale's own mean prototype instead of learned centroids, so a
+    query patch can match whichever scale's prototype fits best rather than an average of them.
+
+    One MethodState per *combos* entry with more than one fg scale, named
+    "fg-bg-proto(<combo_name>)" — a single fg scale has nothing to keep separate, so it's just
+    build_fgbg_states' "fg-bg-mean(...)". Combos are skipped the same way build_fgbg_states
+    skips them (a dropped fg/bg scale for this reference image).
+    """
+    states: dict[str, MethodState] = {}
+    for combo_name, sources in combos.items():
+        fg_scales, bg_scales = sources["fg"], sources["bg"]
+        if len(fg_scales) < 2 or not all(s in scale_protos for s in [*fg_scales, *bg_scales]):
+            continue
+        fg_protos = torch.cat([scale_protos[s].prototype for s in fg_scales], dim=0)  # (K, C)
+        bg = F.normalize(
+            torch.cat([scale_protos[s].bg_prototype for s in bg_scales], dim=0).mean(
+                dim=0, keepdim=True
+            ),
+            p=2,
+            dim=-1,
+        )
+        name = f"fg-bg-proto({combo_name})"
+        states[name] = MethodState(name, "kmeans_fgbg", fg_bank=fg_protos, bg_bank=bg)
     return states
 
 
@@ -724,6 +758,32 @@ def _pool_scale_patches(
             sel_flat = torch.from_numpy(sel_mask.reshape(-1)).to(cell.tokens.device)
             chunks.append(cell.tokens[sel_flat] if want_fg else cell.tokens[~sel_flat])
     return torch.cat(chunks, dim=0)
+
+
+def build_kmeans_states(
+    scale_protos: dict[str, ScalePrototype], scales: list[str], ks: tuple[int, ...]
+) -> dict[str, MethodState]:
+    """One k-means(k) method per (scale, k): same pooled foreground patches as that
+    scale's single-scale mean method (see ``_pool_scale_patches``), but *k* centroids
+    instead of one mean vector. Scoring reuses the "multi" kind's per-patch max-cosine
+    (see ``score_method``), same as a "max"-combined multi-scale combo.
+
+    A scale dropped for this reference image (e.g. "close" below MIN_CROP_SIZE) is
+    skipped, same as ``build_ablation_states``. *k* is clamped to the pooled patch
+    count so a scale with fewer foreground patches than *k* doesn't error out of
+    ``compute_exemplar_features``'s k-means.
+    """
+    states: dict[str, MethodState] = {}
+    for scale in scales:
+        if scale not in scale_protos:
+            continue
+        fg_patches = _pool_scale_patches(scale_protos, [scale], want_fg=True)
+        for k in ks:
+            kk = min(k, fg_patches.shape[0])
+            centroids = compute_exemplar_features(fg_patches, mode="kmeans", k=kk)  # (kk, C)
+            name = f"{scale}-kmeans{k}"
+            states[name] = MethodState(name, "multi", centroids)
+    return states
 
 
 def build_knn_fgbg_states(
@@ -764,20 +824,64 @@ def build_knn_fgbg_states(
     return states
 
 
-def knn_fgbg_score(
-    query_tokens: torch.Tensor, fg_bank: torch.Tensor, bg_bank: torch.Tensor, k: int
-) -> np.ndarray:
-    """Per-query-patch contrastive kNN score: mean top-k fg similarity minus mean top-k bg one.
+def build_kmeans_fgbg_states(
+    scale_protos: dict[str, ScalePrototype],
+    combos: dict[str, dict[str, list[str]]],
+    ks: tuple[int, ...],
+) -> dict[str, MethodState]:
+    """Background-contrastive variant of build_kmeans_states.
 
-    ``fg_bank``/``bg_bank`` are patch-level galleries (Nfg, C) / (Nbg, C), not collapsed
-    prototypes — the kNN analogue of build_fgbg_states' ("fg-bg-mean") single-mean contrastive
-    score.
+    build_kmeans_states' "<scale>-kmeans<k>" methods score a query patch as the max cosine
+    similarity to any of k foreground centroids, with nothing pulling background patches back
+    down — unlike every other multi-vector method here (fg-bg-mean, fg-bg-knn), which
+    contrasts against a background side. This builds that missing bg term: the fg side is
+    still k learned centroids (see compute_exemplar_features's kmeans mode, pooled the same
+    way build_knn_fgbg_states pools its fg gallery), scored with a per-query-patch max
+    (kmeans_fgbg_score) — a query patch only needs to match ONE learned appearance mode, not
+    average well across all of them, so this deliberately isn't knn_fgbg_score's mean-of-top-k.
+    The bg side stays a single collapsed mean, identical to fg-bg-mean's bg — the point is
+    only to give kmeans' foreground gallery a contrast term, not to redesign the bg side too.
+
+    One MethodState per (combo, k) in *combos* x *ks*, named "fg-bg-kmeans<k>(<combo_name>)".
+    A combo is skipped for this reference image if any of its fg/bg scales was dropped,
+    exactly like build_fgbg_states/build_knn_fgbg_states. *k* is clamped to the pooled fg
+    patch count, same as build_kmeans_states.
     """
-    fg_sim = query_tokens @ fg_bank.T  # (N, Nfg)
-    bg_sim = query_tokens @ bg_bank.T  # (N, Nbg)
-    fg_topk = fg_sim.topk(min(k, fg_sim.shape[1]), dim=1).values.mean(dim=1)
-    bg_topk = bg_sim.topk(min(k, bg_sim.shape[1]), dim=1).values.mean(dim=1)
-    return (fg_topk - bg_topk).cpu().float().numpy()
+    states: dict[str, MethodState] = {}
+    for combo_name, sources in combos.items():
+        fg_scales, bg_scales = sources["fg"], sources["bg"]
+        if not all(s in scale_protos for s in [*fg_scales, *bg_scales]):
+            continue
+        fg_patches = _pool_scale_patches(scale_protos, fg_scales, want_fg=True)
+        bg = F.normalize(
+            torch.cat([scale_protos[s].bg_prototype for s in bg_scales], dim=0).mean(
+                dim=0, keepdim=True
+            ),
+            p=2,
+            dim=-1,
+        )
+        for k in ks:
+            kk = min(k, fg_patches.shape[0])
+            centroids = compute_exemplar_features(fg_patches, mode="kmeans", k=kk)  # (kk, C)
+            name = f"fg-bg-kmeans{k}({combo_name})"
+            states[name] = MethodState(name, "kmeans_fgbg", fg_bank=centroids, bg_bank=bg)
+    return states
+
+
+def kmeans_fgbg_score(
+    query_tokens: torch.Tensor, fg_centroids: torch.Tensor, bg_vec: torch.Tensor
+) -> np.ndarray:
+    """Per-query-patch contrastive score for "kmeans_fgbg": max cosine similarity to any of
+    the k fg centroids, minus cosine similarity to the single collapsed bg vector.
+
+    Deliberately a max on the fg side (like build_kmeans_states' plain kmeans methods),
+    not knn_fgbg_score's mean-of-top-k — a query patch should count as foreground if it
+    matches ANY one learned appearance mode strongly, not if it matches all k on average.
+    """
+    fg_sim = query_tokens @ fg_centroids.T  # (N, k)
+    fg_max = fg_sim.max(dim=1).values
+    bg_sim = (query_tokens @ bg_vec.T).squeeze(-1)  # (N,)
+    return (fg_max - bg_sim).cpu().float().numpy()
 
 
 def score_method(state: MethodState, query_tokens: torch.Tensor) -> np.ndarray:
@@ -787,10 +891,15 @@ def score_method(state: MethodState, query_tokens: torch.Tensor) -> np.ndarray:
     "fgbg": fg cosine similarity minus bg cosine similarity (contrastive, mean-based).
     "knn_fgbg": same contrastive idea, but each side is a patch gallery scored via kNN
     (see knn_fgbg_score) instead of a single mean vector.
+    "kmeans_fgbg": fg side is k learned centroids scored via per-patch max, bg side is a
+    single collapsed mean (see kmeans_fgbg_score).
     """
     if state.kind == "knn_fgbg":
         assert state.fg_bank is not None and state.bg_bank is not None
         return knn_fgbg_score(query_tokens, state.fg_bank, state.bg_bank, KNN_FGBG_NUM_NEIGHBOURS)
+    if state.kind == "kmeans_fgbg":
+        assert state.fg_bank is not None and state.bg_bank is not None
+        return kmeans_fgbg_score(query_tokens, state.fg_bank, state.bg_bank)
     assert state.payload is not None
     sim = query_tokens @ state.payload.T  # (N, K)
     if state.kind == "single":
@@ -805,94 +914,13 @@ def score_method(state: MethodState, query_tokens: torch.Tensor) -> np.ndarray:
 # prediction clusters; this file defaults to DBSCAN throughout instead (see dbscan_clusters).
 
 
-def iou_threshold_curve(
-    raw: np.ndarray, gt_mask: np.ndarray, steps: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Patch-mask IoU of `(raw > c)` vs. `gt_mask` for `steps` candidates spanning raw's range."""
-    candidates = np.linspace(raw.min(), raw.max(), steps)
-    ious = np.array([mask_iou(raw > c, gt_mask) for c in candidates])
-    return candidates, ious
-
-
-def iou_tuned_threshold(raw: np.ndarray, gt_mask: np.ndarray, steps: int) -> float:
-    """Threshold that maximises patch-mask IoU against *gt_mask*.
-
-    Fit on the exemplar's own mid-crop score map + GT mask, self-supervised — no
-    dependence on the query's GT — then reused as-is to threshold queries.
-    """
-    candidates, ious = iou_threshold_curve(raw, gt_mask, steps)
-    best_idx = int(np.argmax(ious))
-    return float(candidates[best_idx])
-
-
 def min_cluster_size_bound(sizes: np.ndarray, margin: int | float) -> int:
     """Minimum cluster size from the smallest GT instance size, margin-relaxed downward.
 
     ``margin`` as an int is a flat patch-count offset: k_min - margin. As a float it's
     read as a fraction of the bound: k_min - margin*k_min.
     """
-    if len(sizes) == 0:
-        return MIN_POINTS_FLOOR
-    k_min = float(sizes.min())
-    lo = k_min - margin * k_min if isinstance(margin, float) else k_min - margin
-    return max(MIN_POINTS_FLOOR, int(round(lo)))
-
-
-def dbscan_clusters_from_mask(
-    patch_mask: np.ndarray,
-    max_px_separation: float,
-    min_samples: int,
-    crop_w_px: float | None = None,
-    crop_h_px: float | None = None,
-    raw: np.ndarray | None = None,
-) -> list[dict]:
-    """Cluster foreground patch coords with plain DBSCAN.
-
-    ``max_px_separation`` is interpreted two ways depending on whether the crop's absolute
-    size is given:
-
-    - ``crop_w_px``/``crop_h_px`` omitted (default) — legacy patch-index-space eps. Patch
-      coordinates are used as-is, so e.g. 1.5 means "adjacent or diagonal patch in this
-      mask's own grid" regardless of that grid's physical scale. Correct for recovering
-      connected components from a *known* mask (``GT_DBSCAN_EPS``, ``min_samples=1``) since
-      grid adjacency, not physical distance, is what defines one instance there.
-    - ``crop_w_px``/``crop_h_px`` given — patch coordinates are first projected to real
-      native-pixel coordinates via the crop's own absolute size (normalized grid position
-      x crop size), then ``max_px_separation`` is a genuine native-pixel linking distance.
-      Needed when clustering *predicted* foreground points into instances: a fixed
-      patch-count eps means a different physical distance depending on how zoomed-in the
-      crop is (a "mid" crop's patches cover far fewer native px than a full-image crop's),
-      so the same numeric eps behaves inconsistently across scales unless converted like
-      this.
-
-    ``raw`` is optional and only needed when the result will be used as *predicted* clusters
-    (i.e. passed to ``match_and_score`` as ``pred_clusters``, which ranks by score) — it attaches
-    each cluster's own max raw score, matching ``dbscan_clusters``'s cluster dict shape. GT
-    clusters never need it since ``match_and_score`` only reads ``score`` off ``pred_clusters``.
-    """
-    ys, xs = np.where(patch_mask)
-    if len(xs) == 0:
-        return []
-    if crop_w_px is not None and crop_h_px is not None:
-        grid_h, grid_w = patch_mask.shape
-        xs_c = xs / max(grid_w - 1, 1) * crop_w_px
-        ys_c = ys / max(grid_h - 1, 1) * crop_h_px
-    else:
-        xs_c, ys_c = xs.astype(float), ys.astype(float)
-    coords = np.stack([xs_c, ys_c], axis=1)
-    labels = DBSCAN(eps=max_px_separation, min_samples=min_samples).fit_predict(coords)
-    clusters = []
-    for lbl in sorted(set(labels)):
-        if lbl == -1:
-            continue
-        sel = labels == lbl
-        mask = np.zeros(patch_mask.shape, dtype=bool)
-        mask[ys[sel], xs[sel]] = True
-        cluster: dict = {"mask": mask}
-        if raw is not None:
-            cluster["score"] = float(raw[ys[sel], xs[sel]].max())
-        clusters.append(cluster)
-    return clusters
+    return _shared_min_cluster_size_bound(sizes, margin, MIN_POINTS_FLOOR)
 
 
 def dbscan_clusters(
@@ -915,62 +943,7 @@ def dbscan_clusters(
     ``min_cluster_size`` did (that split/merged *during* clustering itself), so an
     undersized DBSCAN cluster here is dropped rather than merged into a neighbour.
     """
-    mask = np.zeros((grid_h, grid_w), dtype=bool)
-    mask[ys, xs] = True
-    clusters = dbscan_clusters_from_mask(mask, eps, min_samples, raw=raw)
-    if min_cs is not None:
-        clusters = [c for c in clusters if c["mask"].sum() >= min_cs]
-    return clusters
-
-
-def match_and_score(pred_clusters: list[dict], gt_clusters: list[dict], iou_thr: float) -> dict:
-    n_pred, n_gt = len(pred_clusters), len(gt_clusters)
-    if n_gt == 0:
-        return {
-            "precision": np.nan,
-            "recall": np.nan,
-            "f1": np.nan,
-            "mean_iou": np.nan,
-            "tp": 0,
-            "fp": n_pred,
-            "fn": 0,
-            "count_error": n_pred,
-            "n_pred": n_pred,
-            "n_gt": 0,
-        }
-    order = sorted(range(n_pred), key=lambda i: -pred_clusters[i]["score"])
-    matched_gt: set[int] = set()
-    tp = 0
-    ious: list[float] = []
-    for i in order:
-        best_j, best_iou = -1, 0.0
-        for j in range(n_gt):
-            if j in matched_gt:
-                continue
-            iou = mask_iou(pred_clusters[i]["mask"], gt_clusters[j]["mask"])
-            if iou > best_iou:
-                best_iou, best_j = iou, j
-        if best_j >= 0 and best_iou >= iou_thr:
-            matched_gt.add(best_j)
-            tp += 1
-            ious.append(best_iou)
-    fp = n_pred - tp
-    fn = n_gt - tp
-    precision = tp / n_pred if n_pred else 0.0
-    recall = tp / n_gt if n_gt else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
-    return {
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "mean_iou": float(np.mean(ious)) if ious else 0.0,
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
-        "count_error": abs(n_pred - n_gt),
-        "n_pred": n_pred,
-        "n_gt": n_gt,
-    }
+    return _shared_dbscan_clusters(xs, ys, grid_h, grid_w, raw, eps, min_samples, min_cs)
 
 
 # %% Cluster mean-patch reject — a cluster-level sanity check on top of the per-patch score
@@ -980,21 +953,6 @@ def match_and_score(pred_clusters: list[dict], gt_clusters: list[dict], iou_thr:
 # patch token against ``mean_patch_prototype`` (built once, at training time, from the mean of
 # every ref instance cluster's own mean patch — see ``build_all_scale_prototypes``) and rejects
 # clusters that fall below a tuned cosine-similarity cutoff.
-
-
-def cluster_mean_patch_score(
-    cluster_mask: np.ndarray, tokens: torch.Tensor, mean_patch_prototype: torch.Tensor
-) -> float:
-    """Cosine similarity between one predicted cluster's own mean patch token (mean-pooled
-    over the cluster's member patches, in *tokens*' own embedding space) and the training-time
-    ``mean_patch_prototype``.
-    """
-    flat = torch.from_numpy(cluster_mask.reshape(-1)).to(tokens.device)
-    cluster_tokens = tokens[flat]
-    if cluster_tokens.shape[0] == 0:
-        return float("-inf")
-    mean_tok = F.normalize(cluster_tokens.mean(dim=0, keepdim=True), p=2, dim=-1)
-    return float((mean_tok @ mean_patch_prototype.T).item())
 
 
 def tune_cluster_reject_threshold(
@@ -1014,172 +972,50 @@ def tune_cluster_reject_threshold(
 
     Pools across *every* mid-scale instance crop in ``ref_crops`` (``ScalePrototype.
     cluster_crops``), not just the single representative/biggest one — mirrors the "pooled
-    accumulation across mid crops" idea used for the patch-level threshold. Using only the
-    biggest crop caps the tuning sample at whatever DBSCAN clusters happen to land inside one
-    padded box (as few as a couple), which is a weak, incidental basis for picking a cutoff.
-
-    Each crop's ``exclude_patch_mask`` (union of every GT instance inside that crop's own box)
-    may itself contain several instances, so it is split into per-instance clusters
-    (``dbscan_clusters_from_mask`` with ``GT_DBSCAN_EPS``/``GT_DBSCAN_MIN_SAMPLES``, same as
-    ``gt_clusters`` elsewhere) and each predicted cluster is IoU'd against its *best-matching*
-    single instance — mirroring how ``match_and_score`` compares predicted to GT clusters
-    (IoU against the flat multi-instance mask would be capped near ``1/n_instances`` even for a
-    pixel-perfect cluster).
+    accumulation across mid crops" idea used for the patch-level threshold.
 
     Returns ``(threshold, ref_clusters)`` — each ref cluster dict gains ``mean_patch_score``,
     ``gt_iou`` (best IoU against any single GT instance in its own source crop), ``gt_good``
     (``gt_iou >= iou_thr``), and ``crop_idx``/``crop_img``/``crop_gt_mask`` identifying which
-    ``ref_crops`` entry it came from (clusters are pooled from crops of different sizes, so
-    callers need this to plot/inspect a cluster against its own crop rather than assuming a
-    single shared grid). If no ref cluster is "good" (nothing to anchor a margin to), falls back
-    to a cutoff just below the global min score — permissive rather than rejecting everything.
-    Otherwise the cutoff is ``CLUSTER_REJECT_MARGIN_FRACTION`` below the smallest good score
-    (proportional to that score's own magnitude), regardless of whether any bad ref cluster
-    exists — and, when at least one bad cluster does exist, clamped up so it never drops to or
-    below the largest bad score.
+    ``ref_crops`` entry it came from. If no ref cluster is "good" (nothing to anchor a margin
+    to), falls back to a cutoff just below the global min score — permissive rather than
+    rejecting everything. Otherwise the cutoff is ``CLUSTER_REJECT_MARGIN_FRACTION`` below the
+    smallest good score, clamped so it never drops to or below the largest bad score.
     """
-    ref_clusters: list[dict] = []
-    for cc in ref_crops:
-        raw = score_method(state, cc.tokens).reshape(cc.grid_h, cc.grid_w)
-        ys, xs = np.where(raw > patch_thr)
-        if len(xs) < max(MIN_POINTS_FLOOR, min_cs):
-            continue
-        crop_clusters = dbscan_clusters(xs, ys, cc.grid_h, cc.grid_w, raw, min_cs)
-        gt_instances = dbscan_clusters_from_mask(
-            cc.exclude_patch_mask, GT_DBSCAN_EPS, GT_DBSCAN_MIN_SAMPLES
-        )
-        for cl in crop_clusters:
-            cl["mean_patch_score"] = cluster_mean_patch_score(
-                cl["mask"], cc.tokens, mean_patch_prototype
-            )
-            cl["gt_iou"] = max(
-                (mask_iou(cl["mask"], gt_inst["mask"]) for gt_inst in gt_instances), default=0.0
-            )
-            cl["gt_good"] = cl["gt_iou"] >= iou_thr
-            cl["crop_idx"] = cc.cluster_idx
-            cl["crop_img"] = cc.crop_img
-            cl["crop_gt_mask"] = cc.exclude_patch_mask
-        ref_clusters.extend(crop_clusters)
-
-    if not ref_clusters:
-        return float("-inf"), ref_clusters  # nothing to fit against — accept everything
-
-    scores = np.array([cl["mean_patch_score"] for cl in ref_clusters])
-    good = np.array([cl["gt_good"] for cl in ref_clusters])
-    if not good.any():
-        return float(scores.min()) - 1e-3, ref_clusters  # nothing good to anchor a margin to
-
-    min_good = float(scores[good].min())
-    margin_thr = min_good - CLUSTER_REJECT_MARGIN_FRACTION * abs(min_good)
-    if (~good).any():
-        max_bad = float(scores[~good].max())
-        margin_thr = max(margin_thr, max_bad + 1e-3)  # never drop to/below a known-bad cluster
-    return margin_thr, ref_clusters
-
-
-def annotate_cluster_rejection(
-    clusters: list[dict],
-    tokens: torch.Tensor,
-    mean_patch_prototype: torch.Tensor,
-    threshold: float,
-) -> None:
-    """Mutates *clusters* in place: adds ``mean_patch_score`` and ``rejected`` (score below
-    *threshold*) to every cluster dict, using *tokens*' own embedding space (query- or
-    crop-space — cluster masks are always local to whichever grid *tokens* came from).
-    """
-    for cl in clusters:
-        cl["mean_patch_score"] = cluster_mean_patch_score(cl["mask"], tokens, mean_patch_prototype)
-        cl["rejected"] = cl["mean_patch_score"] < threshold
+    return _shared_tune_cluster_reject_threshold(
+        ref_crops,
+        lambda tokens: score_method(state, tokens),
+        mean_patch_prototype,
+        patch_thr,
+        min_cs,
+        iou_thr,
+        PRED_DBSCAN_EPS,
+        PRED_DBSCAN_MIN_SAMPLES,
+        GT_DBSCAN_EPS,
+        GT_DBSCAN_MIN_SAMPLES,
+        CLUSTER_REJECT_MARGIN_FRACTION,
+        MIN_POINTS_FLOOR,
+        include_crop_viz_fields=True,
+    )
 
 
 # %% ROI blob helpers — unsupervised (no-GT) crop discovery, reused for the
 # cross-scale similarity experiment below.
 
 
-def otsu_threshold(raw: np.ndarray) -> float:
-    """Otsu's threshold on *raw*, computed via cv2 on a rescaled 8-bit copy."""
-    lo, hi = float(raw.min()), float(raw.max())
-    if hi - lo < 1e-8:
-        return lo
-    scaled = ((raw - lo) / (hi - lo) * 255).astype(np.uint8)
-    otsu_val, _ = cv2.threshold(scaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return lo + (float(otsu_val) / 255.0) * (hi - lo)
-
-
 def roi_binary_mask(
     raw: np.ndarray, method: str, single_threshold: float, percentile: float = ROI_PERCENTILE
 ) -> np.ndarray:
     """Unsupervised (no-GT) foreground/ROI mask used to decide where to zoom in."""
-    if method == "otsu":
-        thr = otsu_threshold(raw)
-    elif method == "single":
-        thr = single_threshold
-    elif method == "percentile":
-        thr = float(np.percentile(raw, percentile))
-    else:
-        raise ValueError(f"Unknown ROI_BINARIZE_METHOD: {method!r}")
-    return raw > thr
-
-
-def connected_component_blobs(mask: np.ndarray) -> list[dict]:
-    """8-connected components of a boolean patch mask -> list of {'mask': ...}."""
-    structure = ndimage.generate_binary_structure(2, 2)
-    labeled, n = ndimage.label(mask, structure=structure)
-    return [{"mask": labeled == lbl} for lbl in range(1, n + 1)]
-
-
-def blob_patch_bbox(mask: np.ndarray) -> tuple[int, int, int, int]:
-    """Half-open patch-grid bbox (y0, y1, x0, x1) of a boolean blob mask."""
-    ys, xs = np.where(mask)
-    return int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
-
-
-def patch_bbox_to_native_px(
-    y0: int, y1: int, x0: int, x1: int, patch_size: int, scale_x: float, scale_y: float
-) -> tuple[float, float, float, float]:
-    """Patch-grid bbox -> native (original, full-resolution image) pixel bbox."""
-    px0 = x0 * patch_size * scale_x
-    px1 = x1 * patch_size * scale_x
-    py0 = y0 * patch_size * scale_y
-    py1 = y1 * patch_size * scale_y
-    return px0, py0, px1, py1
-
-
-def pad_and_floor_crop_box(
-    px0: float,
-    py0: float,
-    px1: float,
-    py1: float,
-    pad_fraction: float,
-    floor_side_px: float,
-    native_w: int,
-    native_h: int,
-) -> tuple[int, int, int, int]:
-    """Pad a native-pixel bbox by *pad_fraction* per side, then enforce a centred
-    minimum side length of *floor_side_px* (bounds encoder resize upscaling), then clip.
-    """
-    w, h = px1 - px0, py1 - py0
-    pad_w, pad_h = w * pad_fraction, h * pad_fraction
-    px0, px1 = px0 - pad_w, px1 + pad_w
-    py0, py1 = py0 - pad_h, py1 + pad_h
-
-    w, h = px1 - px0, py1 - py0
-    if w < floor_side_px:
-        cx = (px0 + px1) / 2
-        px0, px1 = cx - floor_side_px / 2, cx + floor_side_px / 2
-    if h < floor_side_px:
-        cy = (py0 + py1) / 2
-        py0, py1 = cy - floor_side_px / 2, cy + floor_side_px / 2
-
-    px0_i = max(0, int(round(px0)))
-    py0_i = max(0, int(round(py0)))
-    px1_i = min(native_w, int(round(px1)))
-    py1_i = min(native_h, int(round(py1)))
-    return px0_i, py0_i, px1_i, py1_i
+    return _shared_roi_binary_mask(raw, method, single_threshold, percentile=percentile)
 
 
 def find_roi_blobs(
-    raw: np.ndarray, query_img: Image.Image, encoder: DinoEncoder, crop_mode: str = ROI_CROP_MODE
+    raw: np.ndarray,
+    query_img: Image.Image,
+    encoder: DinoEncoder,
+    crop_mode: str = ROI_CROP_MODE,
+    target_size_frac: tuple[float, float] | None = None,
 ) -> tuple[list[dict], np.ndarray]:
     """Unsupervised ROI blobs from *raw* (binarised, morphologically closed, then
     connected components), each cropped at native resolution and re-encoded — the
@@ -1189,6 +1025,18 @@ def find_roi_blobs(
     ``crop_mode="per_blob"`` (default) crops each connected ROI component separately.
     ``crop_mode="single_bbox"`` merges every ROI pixel into one blob, so exactly one
     crop (bounding all segmented parts) is produced instead of one per part.
+
+    ``target_size_frac`` (width_frac, height_frac), when given (currently only for "mid" —
+    see ``ScalePrototype.target_size_frac``), is the median crop size that scale's
+    prototype was actually built from at reference time, as a fraction of the reference
+    image's own width/height. Projected onto *this* query image's resolution, it becomes a
+    per-axis floor (on top of the existing ``MAX_UPSCALE_FACTOR`` floor) that
+    ``pad_and_floor_crop_box`` pulls undersized blob crops up toward — so a "mid" query
+    crop reproduces the field of view the mid prototype was trained on, rather than
+    whatever the fixed ``MAX_UPSCALE_FACTOR`` floor and a small blob happen to produce.
+    Like that floor, it only ever expands a crop — a blob already bigger than the target
+    (e.g. several nearby instances merged into one blob) is left as-is. None (the default)
+    keeps the old scale-agnostic behaviour.
 
     Returns ``(crops, roi_mask)``; each crop dict also carries ``mask`` (the blob's own
     connected-component mask, in the full query patch grid — used to build two-stage
@@ -1214,7 +1062,13 @@ def find_roi_blobs(
     else:
         raise ValueError(f"Unknown ROI_CROP_MODE: {crop_mode!r}")
 
-    floor_side_px = IMG_SIZE / MAX_UPSCALE_FACTOR
+    base_floor_px = IMG_SIZE / MAX_UPSCALE_FACTOR
+    if target_size_frac is not None:
+        floor_w_px = max(base_floor_px, target_size_frac[0] * native_w)
+        floor_h_px = max(base_floor_px, target_size_frac[1] * native_h)
+    else:
+        floor_w_px = floor_h_px = base_floor_px
+
     pending: list[dict] = []
     for blob in blobs:
         y0, y1, x0, x1 = blob_patch_bbox(blob["mask"])
@@ -1227,7 +1081,8 @@ def find_roi_blobs(
             raw_px1,
             raw_py1,
             BLOB_CROP_PADDING_FRACTION,
-            floor_side_px,
+            floor_w_px,
+            floor_h_px,
             native_w,
             native_h,
         )
@@ -1259,26 +1114,7 @@ def find_roi_blobs(
 
 def blob_crop_gt_mask(blob: dict, q_pixel_mask: np.ndarray | None) -> np.ndarray:
     """Patch-grid GT mask for one ROI blob crop, aligned to its own re-encoded grid."""
-    px0, py0, px1, py1 = blob["px_bbox"]
-    c_h, c_w = blob["c_h"], blob["c_w"]
-    crop_pixel_mask = q_pixel_mask[py0:py1, px0:px1] if q_pixel_mask is not None else None
-    if crop_pixel_mask is None or not crop_pixel_mask.any():
-        return np.zeros((c_h, c_w), dtype=bool)
-    return pixel_mask_to_patch_mask(crop_pixel_mask, c_h, c_w, IMG_SIZE, MASK_PATCH_THRESHOLD)
-
-
-def crop_patch_centers_to_native_px(
-    xs: np.ndarray, ys: np.ndarray, px_bbox: tuple[int, int, int, int], c_h: int, c_w: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Crop-grid patch centers -> pixel coords in the *original* (uncropped) query image.
-
-    Used to optionally project a crop-space cluster back onto the full query image for
-    display, without touching the crop's own raw map or any full-image grid.
-    """
-    px0, py0, px1, py1 = px_bbox
-    cell_w = (px1 - px0) / c_w
-    cell_h = (py1 - py0) / c_h
-    return px0 + (xs + 0.5) * cell_w, py0 + (ys + 0.5) * cell_h
+    return _shared_blob_crop_gt_mask(blob, q_pixel_mask, IMG_SIZE, MASK_PATCH_THRESHOLD)
 
 
 def crop_patch_centers_to_px(
@@ -1301,71 +1137,16 @@ def cross_score_blobs(
     (the one fit during the ablation pass, against the exemplar's global-scale GT
     mask) and measures IoU against the crop's own ground-truth patch mask.
     """
-    rows: list[dict] = []
-    for blob in blobs:
-        c_h, c_w = blob["c_h"], blob["c_w"]
-        crop_gt_mask = blob_crop_gt_mask(blob, q_pixel_mask)
-        for score_scale in SCALES:
-            state = ablation_states[score_scale]
-            crop_raw = score_method(state, blob["crop_tokens"]).reshape(c_h, c_w)
-            thr = per_method[score_scale]["threshold"]
-            iou = mask_iou(crop_raw > thr, crop_gt_mask)
-            rows.append(
-                {"score_scale": score_scale, "iou": iou, "gt_present": bool(crop_gt_mask.any())}
-            )
-    return rows
-
-
-def project_crop_mask_to_query_grid(
-    cluster_mask: np.ndarray,
-    px_bbox: tuple[int, int, int, int],
-    c_h: int,
-    c_w: int,
-    q_h: int,
-    q_w: int,
-    scale_x: float,
-    scale_y: float,
-) -> np.ndarray:
-    """Project one crop-local cluster mask onto the full query's own (q_h, q_w) patch grid.
-
-    Each foreground crop patch is placed at its own center's native-pixel position (see
-    ``crop_patch_centers_to_native_px``) and snapped to the nearest full-query patch — the
-    same coarse-grid placement ``density_map_methods.py``'s ``refine_raw_with_crops`` uses to
-    splat crop-local scores back onto the full grid, applied here to a boolean cluster mask
-    instead of a raw score. Needed because stage-2 clusters live in each crop's own (usually
-    much finer) re-encoded grid, but ``match_and_score`` needs every predicted cluster's mask
-    in the one shared grid ``gt_clusters`` also lives in.
-    """
-    ys, xs = np.where(cluster_mask)
-    mask = np.zeros((q_h, q_w), dtype=bool)
-    if len(xs) == 0:
-        return mask
-    native_x, native_y = crop_patch_centers_to_native_px(xs, ys, px_bbox, c_h, c_w)
-    cols = np.clip((native_x / (PATCH_SIZE * scale_x)).astype(int), 0, q_w - 1)
-    rows = np.clip((native_y / (PATCH_SIZE * scale_y)).astype(int), 0, q_h - 1)
-    mask[rows, cols] = True
-    return mask
-
-
-def merge_overlapping_clusters(clusters: list[dict]) -> list[dict]:
-    """Greedy largest-first merge: drop any cluster whose (already-projected) ``mask`` shares
-    a patch with a bigger cluster already kept.
-
-    A single crop's own per-crop DBSCAN pass can yield several clusters, and since
-    ``project_crop_mask_to_query_grid`` snaps a (usually finer) crop-local grid down onto the
-    coarser full-query grid, distinct clusters — whether from the same crop or from
-    neighbouring crops whose padded native-pixel boxes overlap — can collide onto the same
-    query-grid patches. ``size`` (each cluster's own patch count *before* projection, i.e. in
-    its native crop-local grid) ranks candidates so a collision is resolved by keeping
-    whichever cluster is actually bigger, not however the projection happened to alias.
-    """
-    ordered = sorted(clusters, key=lambda c: -c["size"])
-    kept: list[dict] = []
-    for cl in ordered:
-        if any((cl["mask"] & k["mask"]).any() for k in kept):
-            continue
-        kept.append(cl)
-    return kept
+    scale_states = {s: ablation_states[s] for s in SCALES}
+    return _shared_cross_score_blobs(
+        blobs,
+        scale_states,
+        q_pixel_mask,
+        per_method,
+        score_fn_for=lambda state: (lambda tokens: score_method(state, tokens)),
+        img_size=IMG_SIZE,
+        mask_patch_threshold=MASK_PATCH_THRESHOLD,
+    )
 
 
 def two_stage_predicted_clusters(
@@ -1396,29 +1177,23 @@ def two_stage_predicted_clusters(
     is what ``match_and_score`` matches against ``gt_clusters``, exactly like every other
     ablation method's DBSCAN clusters.
     """
-    candidates: list[dict] = []
-    for blob in blobs:
-        c_h, c_w = blob["c_h"], blob["c_w"]
-        crop_raw = score_method(state, blob["crop_tokens"]).reshape(c_h, c_w)
-        ys, xs = np.where(crop_raw > threshold)
-        if len(xs) < max(MIN_POINTS_FLOOR, min_cs):
-            continue
-        crop_clusters = dbscan_clusters(xs, ys, c_h, c_w, crop_raw, min_cs)
-        annotate_cluster_rejection(
-            crop_clusters, blob["crop_tokens"], mean_patch_prototype, cluster_reject_thr
-        )
-        for cl in crop_clusters:
-            if cl["rejected"]:
-                continue
-            projected = project_crop_mask_to_query_grid(
-                cl["mask"], blob["px_bbox"], c_h, c_w, q_h, q_w, scale_x, scale_y
-            )
-            if not projected.any():
-                continue
-            candidates.append(
-                {"mask": projected, "score": cl["score"], "size": int(cl["mask"].sum())}
-            )
-    return merge_overlapping_clusters(candidates)
+    merged, _diagnostics = _shared_two_stage_predicted_clusters(
+        blobs,
+        lambda tokens: score_method(state, tokens),
+        threshold,
+        mean_patch_prototype,
+        cluster_reject_thr,
+        min_cs,
+        q_h,
+        q_w,
+        PATCH_SIZE,
+        scale_x,
+        scale_y,
+        PRED_DBSCAN_EPS,
+        PRED_DBSCAN_MIN_SAMPLES,
+        MIN_POINTS_FLOOR,
+    )
+    return merged
 
 
 # %% Load encoder (shared across all pairs)
@@ -1481,7 +1256,13 @@ def run_pair(part_type: str, ref_number: int, query_number: int) -> dict | None:
 
     ablation_states = build_ablation_states(scale_protos, ABLATION_COMBOS, MULTI_SCALE_COMBINE)
     ablation_states.update(build_fgbg_states(scale_protos, FGBG_SOURCE_COMBOS))
+    ablation_states.update(build_fgbg_multiproto_states(scale_protos, FGBG_SOURCE_COMBOS))
     ablation_states.update(build_knn_fgbg_states(scale_protos, FGBG_SOURCE_COMBOS))
+    if INCLUDE_KMEANS_METHODS:
+        ablation_states.update(build_kmeans_states(scale_protos, SCALES, KMEANS_KS))
+        ablation_states.update(
+            build_kmeans_fgbg_states(scale_protos, FGBG_SOURCE_COMBOS, KMEANS_KS)
+        )
 
     q_tokens, q_h, q_w = extract_patch_tokens(encoder, query_img, LAYER_IDX, debias=DEBIAS)
 
@@ -1581,7 +1362,15 @@ def run_pair(part_type: str, ref_number: int, query_number: int) -> dict | None:
     for scale in SCALES:
         if scale not in per_method:
             continue  # dropped scale (e.g. "close" below MIN_CROP_SIZE) — nothing to do
-        blobs, roi_mask = find_roi_blobs(per_method[scale]["raw"], query_img, encoder)
+        # scale_protos[scale].target_size_frac is None for every scale except "mid" (see
+        # build_all_scale_prototypes), so this naturally only pulls "mid" blob crops toward
+        # their training-time field of view — other scales keep the old fixed floor.
+        blobs, roi_mask = find_roi_blobs(
+            per_method[scale]["raw"],
+            query_img,
+            encoder,
+            target_size_frac=scale_protos[scale].target_size_frac,
+        )
         blobs_by_scale[scale] = blobs
         roi_mask_by_scale[scale] = roi_mask
         log.info("[%s] roi_source=%s -> %d blob(s)", part_type, scale, len(blobs))
@@ -1655,15 +1444,21 @@ for pt in RUN_PART_TYPES:
             {"part_type": pt, "method": f"two-stage({roi_source})", **two_stage_metrics}
         )
 
-    # fg-bg-mean/fg-bg-knn two-stage variants: not scale-keyed like the SCALES loop above. ROI
-    # blobs come from the combo's first "fg" scale (the scale that state's foreground side is
-    # actually built from).
+    # fg-bg-mean/fg-bg-knn/fg-bg-kmeans two-stage variants: not scale-keyed like the SCALES loop
+    # above. ROI blobs come from the combo's first "fg" scale (the scale that state's foreground
+    # side is actually built from).
     for combo_name, combo in FGBG_SOURCE_COMBOS.items():
         roi_source_scale = combo["fg"][0]
         if roi_source_scale not in result["blobs_by_scale"]:
             continue  # dropped scale (e.g. "close" below MIN_CROP_SIZE)
         blobs = result["blobs_by_scale"][roi_source_scale]
-        for method_name in (f"fg-bg-mean({combo_name})", f"fg-bg-knn({combo_name})"):
+        fgbg_method_names = (
+            f"fg-bg-mean({combo_name})",
+            f"fg-bg-proto({combo_name})",
+            f"fg-bg-knn({combo_name})",
+            *(f"fg-bg-kmeans{k}({combo_name})" for k in KMEANS_KS),
+        )
+        for method_name in fgbg_method_names:
             if method_name not in result["ablation_states"]:
                 continue  # combo skipped for this ref image (see build_fgbg_states)
             state = result["ablation_states"][method_name]
@@ -1730,12 +1525,12 @@ fig, axes = plt.subplots(1, 2, figsize=(13, 5), constrained_layout=True)
 summary_df[["precision", "recall", "f1"]].plot.bar(ax=axes[0])
 axes[0].set_ylim(0, 1.05)
 axes[0].set_title("Precision / Recall / F1 (mean across part types)")
-axes[0].tick_params(axis="x", rotation=30)
+axes[0].tick_params(axis="x", rotation=90)
 
 summary_df["mean_iou"].plot.bar(ax=axes[1], color="teal")
 axes[1].set_ylim(0, 1.0)
 axes[1].set_title("Mean matched IoU (mean across part types)")
-axes[1].tick_params(axis="x", rotation=30)
+axes[1].tick_params(axis="x", rotation=90)
 
 plt.suptitle(
     f"Multi-scale crop prototype ablation | {len(results)} part types | "
@@ -2068,8 +1863,8 @@ plt.show()
 # %% Visualisation — per-crop maps/binary/histogram for every mid crop (FOCUS_PART_TYPE). GT per
 # crop is exclude_patch_mask (union of every instance's mask within that crop) — the same "don't
 # hide neighbouring instances" mask ClusterCrop already carries.
-prototype_to_use = "fg-bg-knn(mid/all)"
-# prototype_to_use = "fg-bg-mean(mid/all)"
+# prototype_to_use = "fg-bg-knn(mid/all)"
+prototype_to_use = "fg-bg-mean(mid/all)"
 mid_state = focus["ablation_states"][prototype_to_use]
 
 mid_clusters = focus_scale_protos["mid"].cluster_crops
@@ -2644,7 +2439,7 @@ for blob in mid_blobs:
         if cl["rejected"]:
             continue
         projected = project_crop_mask_to_query_grid(
-            cl["mask"], blob["px_bbox"], c_h, c_w, q_h, q_w, scale_x, scale_y
+            cl["mask"], blob["px_bbox"], c_h, c_w, q_h, q_w, PATCH_SIZE, scale_x, scale_y
         )
         if not projected.any():
             continue

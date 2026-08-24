@@ -1,7 +1,8 @@
 """DinoisAwesome: DINO ViT feature extraction and patch-level retrieval gallery."""
 
-from .anomaly_head import AnomalyHead
 from .annotation_utils import load_annotations
+from .anomaly_head import AnomalyHead
+from .background_mask import compute_foreground_mask
 from .encoder import DinoEncoder, ExtractorOutput
 from .foreground_head import ForegroundHead
 from .gallery import Gallery, GalleryConfig
@@ -21,6 +22,7 @@ from .keypoint_localization import (
     rescale_coords_to_image,
     temperature_softmax,
 )
+from .prototype_head import PrototypeAnomalyHead
 
 __all__ = [
     "load_annotations",
@@ -29,7 +31,9 @@ __all__ = [
     "Gallery",
     "GalleryConfig",
     "AnomalyHead",
+    "PrototypeAnomalyHead",
     "ForegroundHead",
+    "compute_foreground_mask",
     "KeypointHead",
     "apply_gaussian_suppression",
     "localize_keypoint",

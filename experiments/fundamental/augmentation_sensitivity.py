@@ -10,27 +10,32 @@
 # imagery (abc3 is uncontrolled shop-floor lighting, not a studio).
 #
 # Steps:
-#   1. Load one abc3 image + the mask of a single annotated instance (same
-#      image/class as `scale_crop_similarity.py`, for comparability).
-#   2. Build one fixed "mid" crop — padded around the instance bbox, partway between
-#      the tight bbox and the whole image (no scale sweep here; scale is the other
-#      experiment's axis).
+#   1. Load every abc3 image and every annotated instance of every class in it (not
+#      just one image/instance) — more instances and more part types means the drift
+#      curves reflect the dataset instead of one lucky/unlucky crop.
+#   2. Build one fixed "mid" crop per instance — padded around its bbox, partway
+#      between the tight bbox and the whole image (no scale sweep here; scale is the
+#      other experiment's axis).
 #   3. For each augmentation family (rotation, illumination/gamma, color jitter,
 #      Gaussian blur, Gaussian noise, JPEG compression), apply a severity sweep from
-#      "no-op" up to a visibly strong perturbation.
+#      "no-op" up to a visibly strong perturbation, on every instance's crop.
 #   4. Re-encode every augmented crop, pool the object's own patch tokens (mask
 #      projected into that crop's grid — reprojected per-rotation, since rotation is
 #      the only family that moves the object within the frame) into one masked-mean
 #      embedding per crop.
-#   5. Compare each severity level's embedding to the unperturbed (severity=0)
-#      embedding via cosine similarity, and plot drift curves for all six families on
-#      one axis (x-axis normalized to a 0..1 "severity fraction" per family so they're
-#      comparable despite different native units).
-#   6. Visualize the augmented crop grid alongside the drift plot.
+#   5. Compare each severity level's embedding to that instance's own unperturbed
+#      (severity=0) embedding via cosine similarity, then aggregate across all
+#      instances per family/severity (mean ± std band) and plot drift curves for all
+#      six families on one axis (x-axis normalized to a 0..1 "severity fraction" per
+#      family so they're comparable despite different native units).
+#   6. Visualize the augmented crop grid for one representative instance (same
+#      image/class as `scale_crop_similarity.py`, for comparability) alongside the
+#      aggregated drift plot.
 
 # %% Logging — must be before torch import
 import logging
 import os
+import sys
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,8 +44,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("augmentation_sensitivity")
 
-import io
-from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -48,10 +52,23 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from dotenv import load_dotenv
-from PIL import Image, ImageFilter
-from torchvision import transforms
+from PIL import Image
+from tqdm import tqdm
 
 from dinoisawesome import DinoEncoder, compute_exemplar_features, load_annotations
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _shared.augmentations import (  # noqa: E402
+    apply_blur,
+    apply_color_jitter,
+    apply_gamma,
+    apply_jpeg,
+    apply_noise,
+    apply_rotation,
+    mean_color,
+    pixel_only,
+)
+from _shared.mask_geometry import mask_bbox_px, pixel_mask_to_patch_mask  # noqa: E402
 
 # %% Parameters
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -59,11 +76,17 @@ load_dotenv(_REPO_ROOT / ".env")
 
 data_dir = _REPO_ROOT / "data" / "abc3"
 
-# Same object as scale_crop_similarity.py — one instance per abc3 image, small bbox
-# relative to the full frame. Swap IMAGE_STEM / TARGET_CLASS to try others.
-IMAGE_STEM = "LHa_1"
-TARGET_CLASS = "donut foam single"
-INSTANCE_INDEX = 0
+# Every abc3 image, every annotated instance of every class in it — not just one
+# image/instance. IMAGE_STEMS is discovered from disk so a new abc3 capture is picked
+# up automatically.
+IMAGE_STEMS = sorted(p.stem for p in data_dir.glob("*.jpg"))
+
+# Reference instance used only for the augmented-crop-grid visualization (a full grid
+# across all instances would be unreadable) — same object as scale_crop_similarity.py,
+# for comparability. Drift curves aggregate every instance, not just this one.
+REFERENCE_IMAGE_STEM = "LHa_1"
+REFERENCE_TARGET_CLASS = "donut foam single"
+REFERENCE_INSTANCE_ID = 1  # annotation "instance_id" (1-based, per class per image)
 
 DINO_VERSION = "v3"
 DINO_SIZE = "large"
@@ -81,9 +104,8 @@ OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental" / "augmentation_sensitivity"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 log.info(
-    "image=%s class=%r  |  DINO%s-%s img_size=%d layer=%d",
-    IMAGE_STEM,
-    TARGET_CLASS,
+    "images=%s  |  DINO%s-%s img_size=%d layer=%d",
+    IMAGE_STEMS,
     DINO_VERSION,
     DINO_SIZE,
     IMG_SIZE,
@@ -91,25 +113,6 @@ log.info(
 )
 
 # %% Mask / geometry helpers (same as scale_crop_similarity.py)
-
-
-def mask_bbox_px(mask: np.ndarray) -> tuple[int, int, int, int]:
-    """Bounding box of the True region as (rmin, rmax, cmin, cmax)."""
-    rows, cols = np.where(mask)
-    return int(rows.min()), int(rows.max()), int(cols.min()), int(cols.max())
-
-
-def pixel_mask_to_patch_mask(
-    pixel_mask: np.ndarray, grid_h: int, grid_w: int, img_size: int, threshold: float
-) -> np.ndarray:
-    """Resize a pixel-space mask to patch-grid resolution, (grid_h, grid_w) bool."""
-    mask_pil = Image.fromarray(pixel_mask.astype(np.uint8) * 255)
-    mask_resized = np.array(mask_pil.resize((img_size, img_size), Image.NEAREST)) > 0
-    ph = img_size // grid_h
-    pw = img_size // grid_w
-    tiled = mask_resized.reshape(grid_h, ph, grid_w, pw)
-    patch_density = tiled.mean(axis=(1, 3))
-    return patch_density >= threshold
 
 
 def mid_bbox_crop(pixel_mask: np.ndarray, padding_frac: float) -> tuple[int, int, int, int]:
@@ -127,26 +130,45 @@ def mid_bbox_crop(pixel_mask: np.ndarray, padding_frac: float) -> tuple[int, int
     )
 
 
-def mean_color(img: Image.Image) -> tuple[int, int, int]:
-    return tuple(int(c) for c in np.array(img).reshape(-1, 3).mean(axis=0))
+# %% Load every abc3 image + every annotated instance, build each one's fixed mid crop
+instances: list[dict] = []
+for image_stem in tqdm(IMAGE_STEMS, desc="Loading images/annotations"):
+    anns = load_annotations(data_dir / "annotations" / image_stem)
+    ref_img = Image.open(data_dir / f"{image_stem}.jpg").convert("RGB")
+    for ann in anns:
+        mask = ann["mask"]  # (H, W) bool, full native resolution
+        mid_box = mid_bbox_crop(mask, MID_PADDING_FRACTION)
+        x0, y0, x1, y1 = mid_box
+        base_crop = ref_img.crop(mid_box)
+        base_mask_px = mask[y0:y1, x0:x1]
+        instances.append(
+            {
+                "image_stem": image_stem,
+                "class": ann["class"],
+                "instance_id": ann["instance_id"],
+                "base_crop": base_crop,
+                "base_mask_px": base_mask_px,
+                "fill": mean_color(base_crop),
+            }
+        )
 
+reference_instance = next(
+    (
+        inst
+        for inst in instances
+        if inst["image_stem"] == REFERENCE_IMAGE_STEM
+        and inst["class"] == REFERENCE_TARGET_CLASS
+        and inst["instance_id"] == REFERENCE_INSTANCE_ID
+    ),
+    None,
+)
+if reference_instance is None:
+    raise ValueError(
+        f"Reference instance image={REFERENCE_IMAGE_STEM!r} class={REFERENCE_TARGET_CLASS!r} "
+        f"instance_id={REFERENCE_INSTANCE_ID} not found among loaded instances"
+    )
 
-# %% Load image + single instance mask, build the fixed mid crop
-anns = load_annotations(data_dir / "annotations" / IMAGE_STEM)
-instances = [a for a in anns if a["class"] == TARGET_CLASS]
-if not instances:
-    raise ValueError(f"No instances of class {TARGET_CLASS!r} in {IMAGE_STEM}")
-instance = instances[INSTANCE_INDEX]
-mask = instance["mask"]  # (H, W) bool, full native resolution
-
-ref_img = Image.open(data_dir / f"{IMAGE_STEM}.jpg").convert("RGB")
-mid_box = mid_bbox_crop(mask, MID_PADDING_FRACTION)
-x0, y0, x1, y1 = mid_box
-base_crop = ref_img.crop(mid_box)
-base_mask_px = mask[y0:y1, x0:x1]
-fill = mean_color(base_crop)
-
-log.info("Mid crop box=%s size=%dx%dpx", mid_box, x1 - x0, y1 - y0)
+log.info("Loaded %d instances across %d images", len(instances), len(IMAGE_STEMS))
 
 # %% Augmentation families
 #
@@ -156,134 +178,86 @@ log.info("Mid crop box=%s size=%dx%dpx", mid_box, x1 - x0, y1 - y0)
 # All families are pixel-only (mask unchanged) except rotation, which moves the object
 # within the frame and rotates the mask by the same angle.
 
-AugmentFn = Callable[[Image.Image, np.ndarray, float], tuple[Image.Image, np.ndarray]]
-
-
-def _pixel_only(fn: Callable[[Image.Image, float], Image.Image]) -> AugmentFn:
-    """Wrap a pixel-value-only augmentation to the (img, mask, val) -> (img, mask) shape."""
-
-    def wrapped(
-        img: Image.Image, mask_px: np.ndarray, val: float
-    ) -> tuple[Image.Image, np.ndarray]:
-        return fn(img, val), mask_px
-
-    return wrapped
-
-
-def _apply_rotation(
-    img: Image.Image, mask_px: np.ndarray, angle: float
-) -> tuple[Image.Image, np.ndarray]:
-    if angle == 0:
-        return img, mask_px
-    rotated_img = img.rotate(angle, resample=Image.BICUBIC, expand=False, fillcolor=fill)
-    mask_pil = Image.fromarray(mask_px.astype(np.uint8) * 255)
-    rotated_mask = (
-        np.array(mask_pil.rotate(angle, resample=Image.NEAREST, expand=False, fillcolor=0)) > 0
-    )
-    return rotated_img, rotated_mask
-
-
-def _apply_gamma(img: Image.Image, gamma: float) -> Image.Image:
-    if gamma == 1.0:
-        return img
-    arr = (np.array(img).astype(np.float32) / 255.0) ** gamma
-    return Image.fromarray((arr * 255.0).clip(0, 255).astype(np.uint8))
-
-
-def _apply_color_jitter(img: Image.Image, magnitude: float) -> Image.Image:
-    if magnitude == 0:
-        return img
-    torch.manual_seed(SEED)  # deterministic draw per severity level
-    jitter = transforms.ColorJitter(
-        brightness=magnitude,
-        contrast=magnitude,
-        saturation=magnitude,
-        hue=min(magnitude * 0.5, 0.5),
-    )
-    return jitter(img)
-
-
-def _apply_blur(img: Image.Image, radius: float) -> Image.Image:
-    if radius == 0:
-        return img
-    return img.filter(ImageFilter.GaussianBlur(radius=radius))
-
-
-def _apply_noise(img: Image.Image, sigma: float) -> Image.Image:
-    if sigma == 0:
-        return img
-    rng = np.random.default_rng(SEED)
-    arr = np.array(img).astype(np.float32)
-    noisy = np.clip(arr + rng.normal(0.0, sigma, arr.shape), 0, 255).astype(np.uint8)
-    return Image.fromarray(noisy)
-
-
-def _apply_jpeg(img: Image.Image, quality: float) -> Image.Image:
-    if quality >= 100:
-        return img
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=int(quality))
-    buf.seek(0)
-    return Image.open(buf).convert("RGB")
-
-
 AUGMENTATIONS: dict[str, dict] = {
     "rotation": {
         "values": [0, 8, 16, 30, 50, 75],
         "unit": "deg",
-        "apply": _apply_rotation,
+        "apply": apply_rotation,
     },
     "illumination (gamma)": {
         "values": [1.0, 1.3, 1.7, 2.2, 2.8, 3.5],
         "unit": "gamma",
-        "apply": _pixel_only(_apply_gamma),
+        "apply": pixel_only(apply_gamma),
     },
     "color jitter": {
         "values": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5],
         "unit": "magnitude",
-        "apply": _pixel_only(_apply_color_jitter),
+        "apply": pixel_only(partial(apply_color_jitter, seed=SEED)),
     },
     "gaussian blur": {
         "values": [0, 1, 2, 4, 7, 11],
         "unit": "px radius",
-        "apply": _pixel_only(_apply_blur),
+        "apply": pixel_only(apply_blur),
     },
     "gaussian noise": {
         "values": [0, 8, 16, 28, 45, 70],
         "unit": "sigma (0-255)",
-        "apply": _pixel_only(_apply_noise),
+        "apply": pixel_only(partial(apply_noise, seed=SEED)),
     },
     "jpeg compression": {
         "values": [100, 80, 60, 35, 15, 3],
         "unit": "quality",
-        "apply": _pixel_only(_apply_jpeg),
+        "apply": pixel_only(apply_jpeg),
     },
 }
 
-# %% Build every augmented crop up front (base_crop / base_mask_px for severity=0)
+# %% Build every augmented crop up front (severity=0 == that instance's own base_crop)
 entries: list[dict] = []
-for family, spec in AUGMENTATIONS.items():
-    for val in spec["values"]:
-        img, mask_px = spec["apply"](base_crop, base_mask_px, val)
-        entries.append({"family": family, "value": val, "img": img, "mask_px": mask_px})
+for inst in tqdm(instances, desc="Building augmented crops"):
+    for family, spec in AUGMENTATIONS.items():
+        for val in spec["values"]:
+            img, mask_px = spec["apply"](inst["base_crop"], inst["base_mask_px"], val, inst["fill"])
+            entries.append(
+                {
+                    "image_stem": inst["image_stem"],
+                    "class": inst["class"],
+                    "instance_id": inst["instance_id"],
+                    "family": family,
+                    "value": val,
+                    "img": img,
+                    "mask_px": mask_px,
+                }
+            )
 
-log.info("Built %d augmented crops across %d families", len(entries), len(AUGMENTATIONS))
+log.info(
+    "Built %d augmented crops across %d instances x %d families",
+    len(entries),
+    len(instances),
+    len(AUGMENTATIONS),
+)
 
-# %% Encode every augmented crop in a single batched forward pass
+# %% Encode every augmented crop, chunked to encoder.max_batch_size with a progress bar
 encoder = DinoEncoder(
     version=DINO_VERSION,
     size=DINO_SIZE,
     img_size=IMG_SIZE,
     layers=[LAYER_IDX],
     weights_dir=DINO_WEIGHTS_DIR,
-    amp=True
+    amp=True,
 )
-out = encoder([e["img"] for e in entries], layers=[LAYER_IDX], debias=True)
-patches = out.patches[:, 0]  # (N, grid_h, grid_w, D)
+chunk_size = encoder.max_batch_size
+patch_chunks = []
+for i in tqdm(range(0, len(entries), chunk_size), desc="Encoding crops"):
+    chunk = entries[i : i + chunk_size]
+    out = encoder([e["img"] for e in chunk], layers=[LAYER_IDX], debias=True)
+    patch_chunks.append(out.patches[:, 0].cpu())  # (chunk, grid_h, grid_w, D)
+patches = torch.cat(patch_chunks, dim=0)  # (N, grid_h, grid_w, D)
 _, grid_h, grid_w, D = patches.shape
 
 # %% Per-crop masked-mean object embedding
-for entry, patch_tokens in zip(entries, patches):
+for entry, patch_tokens in tqdm(
+    zip(entries, patches), total=len(entries), desc="Pooling object embeddings"
+):
     patch_mask = pixel_mask_to_patch_mask(
         entry["mask_px"], grid_h, grid_w, IMG_SIZE, MASK_PATCH_THRESHOLD
     )
@@ -293,7 +267,11 @@ for entry, patch_tokens in zip(entries, patches):
     masked = tokens[patch_flat]
     if masked.shape[0] == 0:
         log.warning(
-            "family=%s value=%s: mask empty after patch-grid projection — using all crop patches",
+            "image=%s class=%s instance=%s family=%s value=%s: mask empty after patch-grid "
+            "projection — using all crop patches",
+            entry["image_stem"],
+            entry["class"],
+            entry["instance_id"],
             entry["family"],
             entry["value"],
         )
@@ -301,58 +279,92 @@ for entry, patch_tokens in zip(entries, patches):
     entry["embedding"] = compute_exemplar_features(masked, mode="mean")  # (1, D)
     entry["n_masked_patches"] = int(patch_flat.sum())
 
-# %% Similarity vs. each family's own severity=0 (unperturbed) embedding
-baseline_by_family = {
-    family: next(
-        e["embedding"] for e in entries if e["family"] == family and e["value"] == spec["values"][0]
-    )
-    for family, spec in AUGMENTATIONS.items()
-}
+# %% Similarity vs. each instance's own severity=0 (unperturbed) embedding, then
+# aggregated (mean + std) across all instances per family/severity
+baseline_by_instance_family: dict[tuple, torch.Tensor] = {}
+for family, spec in AUGMENTATIONS.items():
+    baseline_val = spec["values"][0]
+    for entry in entries:
+        if entry["family"] == family and entry["value"] == baseline_val:
+            key = (entry["image_stem"], entry["class"], entry["instance_id"], family)
+            baseline_by_instance_family[key] = entry["embedding"]
 
 for entry in entries:
-    baseline = baseline_by_family[entry["family"]]
+    key = (entry["image_stem"], entry["class"], entry["instance_id"], entry["family"])
+    baseline = baseline_by_instance_family[key]
     entry["similarity"] = float((entry["embedding"] @ baseline.T).item())
 
-drift_summary = {}
+drift_summary: dict[str, dict[str, np.ndarray]] = {}
 for family, spec in AUGMENTATIONS.items():
-    values = spec["values"]
-    sims = [
-        next(e["similarity"] for e in entries if e["family"] == family and e["value"] == v)
-        for v in values
-    ]
-    drift_summary[family] = sims
-    log.info("%-22s values=%s  sim=%s", family, values, np.round(sims, 3))
+    mean_sim = []
+    std_sim = []
+    for val in spec["values"]:
+        sims = np.array(
+            [e["similarity"] for e in entries if e["family"] == family and e["value"] == val]
+        )
+        mean_sim.append(float(sims.mean()))
+        std_sim.append(float(sims.std()))
+    drift_summary[family] = {"mean": np.array(mean_sim), "std": np.array(std_sim)}
+    log.info(
+        "%-22s values=%s  mean_sim=%s  std=%s",
+        family,
+        spec["values"],
+        np.round(mean_sim, 3),
+        np.round(std_sim, 3),
+    )
 
-# %% Visualization — augmented crop grid, one row per family
+# %% Visualization — augmented crop grid, one row per family (reference instance only;
+# a grid across all instances would be unreadable, so this is a qualitative sample —
+# the drift-curve plot below is the one aggregated across every instance)
+ref_entries = [
+    e
+    for e in entries
+    if e["image_stem"] == reference_instance["image_stem"]
+    and e["class"] == reference_instance["class"]
+    and e["instance_id"] == reference_instance["instance_id"]
+]
 n_families = len(AUGMENTATIONS)
 n_cols = max(len(spec["values"]) for spec in AUGMENTATIONS.values())
 fig, axes = plt.subplots(n_families, n_cols, figsize=(2.6 * n_cols, 2.9 * n_families))
 for row, (family, spec) in enumerate(AUGMENTATIONS.items()):
     for col, val in enumerate(spec["values"]):
         ax = axes[row, col]
-        entry = next(e for e in entries if e["family"] == family and e["value"] == val)
+        entry = next(e for e in ref_entries if e["family"] == family and e["value"] == val)
         ax.imshow(entry["img"])
         ax.set_title(f"{val} {spec['unit']}\nsim={entry['similarity']:.3f}", fontsize=8)
         ax.axis("off")
     for col in range(len(spec["values"]), n_cols):
         axes[row, col].axis("off")
     axes[row, 0].set_ylabel(family, fontsize=9)
-fig.suptitle(f"Augmentation sweeps — {IMAGE_STEM} / {TARGET_CLASS!r} (mid crop)")
+fig.suptitle(
+    f"Augmentation sweeps — {reference_instance['image_stem']} / "
+    f"{reference_instance['class']!r} instance {reference_instance['instance_id']} (mid crop)"
+)
 fig.tight_layout(rect=(0, 0, 1, 0.97))
 fig.savefig(OUTPUT_DIR / "augmented_crops.png", dpi=150, bbox_inches="tight")
 
-# %% Visualization — combined drift curves (x normalized to 0..1 severity fraction)
+# %% Visualization — combined drift curves, aggregated across all instances
+# (x normalized to 0..1 severity fraction; shaded band = ±1 std across instances)
 fig, ax = plt.subplots(figsize=(7.5, 5.5))
 colors = plt.get_cmap("tab10").colors
 for i, (family, spec) in enumerate(AUGMENTATIONS.items()):
     values = np.array(spec["values"], dtype=float)
     frac = (values - values[0]) / (values[-1] - values[0])
-    ax.plot(frac, drift_summary[family], marker="o", label=family, color=colors[i % len(colors)])
+    mean_sim = drift_summary[family]["mean"]
+    std_sim = drift_summary[family]["std"]
+    color = colors[i % len(colors)]
+    ax.plot(frac, mean_sim, marker="o", label=family, color=color)
+    ax.fill_between(frac, mean_sim - std_sim, mean_sim + std_sim, color=color, alpha=0.15)
 ax.set_xlabel("severity fraction (0 = no-op, 1 = strongest tested)")
-ax.set_ylabel("cosine similarity to severity=0")
-ax.set_ylim(min(0.0, min(min(v) for v in drift_summary.values()) - 0.05), 1.02)
+ax.set_ylabel(f"cosine similarity to severity=0 (mean ± std, n={len(instances)} instances)")
+lowest = min(
+    float((drift_summary[f]["mean"] - drift_summary[f]["std"]).min()) for f in AUGMENTATIONS
+)
+ax.set_ylim(min(0.0, lowest - 0.05), 1.02)
 ax.legend(fontsize=8)
-ax.set_title("Masked-object embedding drift per augmentation family")
+ax.set_title(
+    f"Masked-object embedding drift per augmentation family (n={len(instances)} instances)"
+)
 ax.grid(alpha=0.3)
 fig.tight_layout()
 fig.savefig(OUTPUT_DIR / "drift_curves.png", dpi=150, bbox_inches="tight")
@@ -378,12 +390,14 @@ log.info("Saved figures to %s", OUTPUT_DIR)
 # - **Layer-wise robustness** — repeat the sweep across several `LAYER_IDX` values;
 #   early blocks are closer to raw texture and likely far more blur/noise-sensitive
 #   than late, more semantic blocks.
-# - **Per-augmentation randomness spread** — color jitter and noise here use one fixed
-#   seed per severity; running several seeds per level and plotting a band (not just a
-#   line) would separate "this augmentation's typical effect" from "this one draw's
-#   effect."
+# - **Per-augmentation randomness spread** — the shaded band in `drift_curves.png` is
+#   spread *across instances* at one fixed seed; color jitter and noise still use one
+#   fixed seed per severity, so it says nothing about *this one draw's* variance.
+#   Running several seeds per level and plotting a second band would separate "this
+#   augmentation's typical effect" from "this one draw's effect."
 # - **Occlusion** — progressively mask out a growing fraction of the instance's own
 #   patches (independent of any pixel-level augmentation) — flagged in
 #   `scale_crop_similarity.py` too, and complements this file's perturbation set.
+
 
 # %%

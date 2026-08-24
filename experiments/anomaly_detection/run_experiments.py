@@ -1,10 +1,14 @@
 """Stage 1: fit + score every (category, method) pair and cache everything.
 
 Usage:
-    python run_experiments.py                                  # full run
+    python run_experiments.py                                  # full run (VAD auto-capped)
     python run_experiments.py --categories bottle --limit 10   # smoke test
+    python run_experiments.py --categories vad --limit 2000 --train-limit 2000  # full VAD
     python run_experiments.py --methods patchcore anomalydino_v3
     python run_experiments.py --force                          # overwrite existing cache
+
+VAD's train/good split (2000 images) is slow to fit, so `common.DEFAULT_LIMITS` caps it by
+default to 200 train / 200 normal + 200 anomalous test unless --limit/--train-limit override it.
 
 Writes, per (category, method), under outputs/anomaly_detection/cache/<category>/<method>/:
     scores.parquet      one row per test image (common.ScoreRecord)
@@ -34,6 +38,7 @@ import numpy as np
 import pandas as pd
 import torch
 from common import (
+    ALL_METHODS,
     CATEGORIES,
     METHODS,
     anomaly_maps_path,
@@ -48,22 +53,30 @@ from methods import ScoreResult, build_method
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--categories", nargs="+", default=CATEGORIES, choices=CATEGORIES)
-    parser.add_argument("--methods", nargs="+", default=METHODS, choices=METHODS)
+    parser.add_argument("--methods", nargs="+", default=ALL_METHODS, choices=ALL_METHODS)
     parser.add_argument(
         "--limit", type=int, default=None, help="Cap test set size for a fast smoke test"
+    )
+    parser.add_argument(
+        "--train-limit",
+        type=int,
+        default=None,
+        help="Cap train set size independently of --limit",
     )
     parser.add_argument("--force", action="store_true", help="Overwrite existing cache")
     return parser.parse_args()
 
 
-def _run_one(category: str, method_name: str, limit: int | None, force: bool) -> None:
+def _run_one(
+    category: str, method_name: str, limit: int | None, train_limit: int | None, force: bool
+) -> None:
     out_dir = cache_dir(category, method_name)
     if not force and scores_path(category, method_name).exists():
         log.info("[%s/%s] cache exists, skipping (use --force to overwrite)", category, method_name)
         return
 
     log.info("[%s/%s] resolving dataset paths", category, method_name)
-    train_paths, test_df = resolve_paths(category, limit=limit)
+    train_paths, test_df = resolve_paths(category, limit=limit, train_limit=train_limit)
 
     method = build_method(method_name, category)
     log.info("[%s/%s] fitting on %d normal images", category, method_name, len(train_paths))
@@ -112,6 +125,7 @@ def _run_one(category: str, method_name: str, limit: int | None, force: bool) ->
                 "n_train": len(train_paths),
                 "n_test": len(test_df),
                 "limit": limit,
+                "train_limit": train_limit,
             },
             indent=2,
         )
@@ -132,7 +146,7 @@ def main() -> None:
     for category in args.categories:
         for method_name in args.methods:
             try:
-                _run_one(category, method_name, args.limit, args.force)
+                _run_one(category, method_name, args.limit, args.train_limit, args.force)
             except Exception as exc:  # noqa: BLE001 - keep the batch going, report at the end
                 log.error("[%s/%s] FAILED: %s", category, method_name, exc)
                 traceback.print_exc()

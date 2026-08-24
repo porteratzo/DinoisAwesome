@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from .background_mask import compute_foreground_mask
 from .encoder import DinoEncoder
 from .gallery import Gallery
 
@@ -92,6 +93,11 @@ class AnomalyHead:
         smoothing:      If True, replace every patch feature (bank and query alike)
                         with its 3x3 box average (center included, edge-safe) over
                         the patch grid before scoring — see :func:`_box_smooth`.
+        masking:        If True, drop background patches (bank and query alike) via
+                        PCA-based foreground masking before scoring — see
+                        :func:`~dinoisawesome.background_mask.compute_foreground_mask`.
+                        Background query patches score 0 in the returned anomaly map,
+                        matching anomalib's own AnomalyDINO masking behaviour.
     """
 
     def __init__(
@@ -104,6 +110,7 @@ class AnomalyHead:
         split: str | None = None,
         has_labels: list[str] | None = None,
         smoothing: bool = False,
+        masking: bool = False,
     ) -> None:
         self.gallery = gallery
         self.encoder = encoder
@@ -113,6 +120,7 @@ class AnomalyHead:
         self._filter_has_labels = has_labels
         self._coreset_ratio = coreset_ratio
         self.smoothing = smoothing
+        self.masking = masking
 
         self._memory_bank: torch.Tensor = self._build_memory_bank()
 
@@ -137,6 +145,7 @@ class AnomalyHead:
         filter_split: str | None = "train",
         filter_has_labels: list[str] | None = None,
         smoothing: bool = False,
+        masking: bool = False,
     ) -> AnomalyHead:
         """Build a Gallery from *images* and return a ready-to-use AnomalyHead.
 
@@ -155,6 +164,7 @@ class AnomalyHead:
             filter_split:       Only load patches from this split into the bank.
             filter_has_labels:  Only load patches with all of these labels into the bank.
             smoothing:          See :class:`AnomalyHead`.
+            masking:            See :class:`AnomalyHead`.
         """
         gallery = Gallery.build(
             encoder=encoder,
@@ -175,6 +185,7 @@ class AnomalyHead:
             split=filter_split,
             has_labels=filter_has_labels,
             smoothing=smoothing,
+            masking=masking,
         )
 
     # ------------------------------------------------------------------
@@ -197,8 +208,10 @@ class AnomalyHead:
             raise ValueError(
                 "No gallery patches match the filter — check split/has_labels arguments."
             )
-        if self.smoothing:
-            embs = self._load_smoothed_embeddings(df)  # (N, D) float32
+        if self.smoothing or self.masking:
+            embs = self._load_processed_embeddings(
+                df
+            )  # (N', D) float32 — N' <= len(df) when masking
         else:
             embs = self.gallery.load_embeddings(df, self.block_idx)  # (N, D) float32
         bank = F.normalize(torch.from_numpy(embs), p=2, dim=1)
@@ -217,21 +230,28 @@ class AnomalyHead:
         logger.info("Memory bank ready: %d patches, D=%d", len(bank), bank.shape[1])
         return bank
 
-    def _load_smoothed_embeddings(self, df: pd.DataFrame) -> np.ndarray:
-        """Like :meth:`Gallery.load_embeddings`, but each patch is pulled from its
-        3x3 box-smoothed grid (see :func:`_box_smooth`) instead of the raw grid.
-        """
-        result = np.empty((len(df), self.gallery.config.embed_dim), dtype=np.float32)
-        pos_map = {idx: i for i, idx in enumerate(df.index)}
+    def _load_processed_embeddings(self, df: pd.DataFrame) -> np.ndarray:
+        """Load patch embeddings for the rows in *df*, applying smoothing and/or
+        background masking (whichever is enabled) per source image.
 
+        Unlike :meth:`Gallery.load_embeddings`, this is not guaranteed to return one
+        row per input row: masked-out background patches are dropped entirely, since
+        a memory bank has no notion of "position" to preserve.
+        """
+        chunks: list[np.ndarray] = []
         for img_id, group in df.groupby("image_id"):
             grid = self.gallery.load_image_grid(img_id, self.block_idx)  # (H, W, D)
-            smoothed = _box_smooth(torch.from_numpy(np.array(grid))).numpy()
-            out_pos = [pos_map[idx] for idx in group.index]
-            result[out_pos] = smoothed[
-                group["row"].values.astype(int), group["col"].values.astype(int)
-            ]
-        return result
+            if self.smoothing:
+                grid = _box_smooth(torch.from_numpy(np.array(grid))).numpy()
+            rows = group["row"].values.astype(int)
+            cols = group["col"].values.astype(int)
+            feats = grid[rows, cols]  # (n_i, D)
+            if self.masking:
+                h, w, d = grid.shape
+                fg_2d = compute_foreground_mask(grid.reshape(h * w, d), (h, w)).reshape(h, w)
+                feats = feats[fg_2d[rows, cols]]
+            chunks.append(feats)
+        return np.concatenate(chunks, axis=0)
 
     def reload(self) -> None:
         """Rebuild the in-RAM memory bank from the gallery on disk.
@@ -274,7 +294,14 @@ class AnomalyHead:
             patches = _box_smooth(patches)
         H, W, D = patches.shape
 
-        flat = F.normalize(patches.reshape(H * W, D), p=2, dim=1)
+        flat_all = F.normalize(patches.reshape(H * W, D), p=2, dim=1)
+        if self.masking:
+            fg_mask = compute_foreground_mask(patches.reshape(H * W, D).cpu().numpy(), (H, W))
+            mask_idx: np.ndarray | None = np.nonzero(fg_mask)[0]
+            flat = flat_all[mask_idx]
+        else:
+            mask_idx = None
+            flat = flat_all
         bank = self._memory_bank.to(flat.device)
 
         sim = flat @ bank.T  # (N, M)
@@ -282,7 +309,15 @@ class AnomalyHead:
 
         k = max(1, self.num_neighbours)
         topk, _ = torch.topk(dists, k=k, dim=1, largest=False)
-        patch_scores = topk.mean(dim=1) if k > 1 else topk.squeeze(1)
+        scored = topk.mean(dim=1) if k > 1 else topk.squeeze(1)
+
+        if mask_idx is not None:
+            # Background patches score 0 — excluded from the memory bank and from
+            # scoring, matching anomalib's own AnomalyDINO masking behaviour.
+            patch_scores = torch.zeros(H * W, dtype=scored.dtype, device=scored.device)
+            patch_scores[mask_idx] = scored
+        else:
+            patch_scores = scored
 
         num_top = max(1, int(patch_scores.shape[0] * 0.01))
         top_vals, _ = torch.topk(patch_scores, num_top, largest=True)

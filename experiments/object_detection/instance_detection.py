@@ -13,6 +13,7 @@
 # %% Logging — must be before torch import
 import logging
 import os
+import sys
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,7 +32,7 @@ import torch
 import torch.nn.functional as F
 from dotenv import load_dotenv
 from PIL import Image
-from sklearn.cluster import DBSCAN, HDBSCAN
+from sklearn.cluster import HDBSCAN
 from sklearn.decomposition import PCA
 
 from dinoisawesome import DinoEncoder
@@ -42,6 +43,12 @@ from dinoisawesome.instance_detection import (
     extract_patch_tokens,
     extract_peaks,
 )
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _shared.gt_utils import (
+    gt_instance_patch_sizes as _shared_gt_instance_patch_sizes,  # noqa: E402
+)
+from _shared.mask_geometry import mask_iou, pixel_mask_to_patch_mask  # noqa: E402
 
 # %% Parameters
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -89,23 +96,6 @@ def load_pixel_mask(path: str) -> np.ndarray:
     else:
         seg = np.load(path)["segmaps"]  # (H, W, N)
     return seg.any(axis=2)
-
-
-def pixel_mask_to_patch_mask(
-    pixel_mask: np.ndarray,
-    grid_h: int,
-    grid_w: int,
-    img_size: int,
-    threshold: float = 0.3,
-) -> np.ndarray:
-    """Resize pixel-space mask to patch-grid resolution, (grid_h, grid_w) bool."""
-    mask_pil = Image.fromarray(pixel_mask.astype(np.uint8) * 255)
-    mask_resized = np.array(mask_pil.resize((img_size, img_size), Image.NEAREST)) > 0
-    ph = img_size // grid_h
-    pw = img_size // grid_w
-    tiled = mask_resized.reshape(grid_h, ph, grid_w, pw)
-    patch_density = tiled.mean(axis=(1, 3))
-    return patch_density >= threshold
 
 
 # %% Visualisation helpers
@@ -812,12 +802,6 @@ def region_grow(
     return mask
 
 
-def mask_iou(a: np.ndarray, b: np.ndarray) -> float:
-    inter = int((a & b).sum())
-    union = int((a | b).sum())
-    return inter / (union + 1e-8)
-
-
 # 1. Relaxed candidate peaks
 RELAXED_MIN_PEAK = 0.1
 raw_peaks = extract_peaks(density_map, PEAK_KERNEL_SIZE, RELAXED_MIN_PEAK)
@@ -980,23 +964,8 @@ def gt_instance_patch_sizes(
     patch_threshold: float,
 ) -> np.ndarray:
     """GT instance sizes (in patches) for the query image, using its own annotation set."""
-    ann_stem = data_dir / "annotations" / Path(query_path).stem
-    try:
-        anns = load_annotations(ann_stem)
-    except FileNotFoundError:
-        log.warning("No GT annotations at %s — cannot derive cluster-size bounds.", ann_stem)
-        return np.array([])
-
-    instances = [a for a in anns if class_filter is None or a["class"] in class_filter]
-    if not instances:
-        log.warning("No GT instances matched classes %s at %s.", class_filter, ann_stem)
-        return np.array([])
-
-    sizes = np.array(
-        [
-            pixel_mask_to_patch_mask(a["mask"], grid_h, grid_w, img_size, patch_threshold).sum()
-            for a in instances
-        ]
+    sizes = _shared_gt_instance_patch_sizes(
+        Path(query_path).stem, class_filter, grid_h, grid_w, img_size, patch_threshold, data_dir
     )
     log.info("GT instance patch-sizes for %s: %s", Path(query_path).name, sizes.tolist())
     return sizes

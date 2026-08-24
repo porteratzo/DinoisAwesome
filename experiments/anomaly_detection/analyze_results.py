@@ -34,6 +34,7 @@ import numpy as np
 import pandas as pd
 import torch
 from common import (
+    ALL_METHODS,
     CATEGORIES,
     FIGURES_ROOT,
     METHODS,
@@ -139,9 +140,9 @@ _METHOD_COLORS = {
 }
 
 
-def plot_metric_bars(metrics_df: pd.DataFrame, metric: str) -> None:
+def plot_metric_bars(metrics_df: pd.DataFrame, metric: str, methods: list[str]) -> None:
     categories = sorted(metrics_df["category"].unique())
-    methods = [m for m in METHODS if m in metrics_df["method"].unique()]
+    methods = [m for m in methods if m in metrics_df["method"].unique()]
     x = np.arange(len(categories))
     width = 0.8 / max(len(methods), 1)
 
@@ -203,9 +204,11 @@ def plot_best_worst(
     plt.close(fig)
 
 
-def plot_side_by_side(category: str, cached: dict[str, tuple], n_samples: int = 4) -> None:
+def plot_side_by_side(
+    category: str, cached: dict[str, tuple], methods: list[str], n_samples: int = 4
+) -> None:
     """One row per sampled test image; columns = GT mask + every method's heatmap."""
-    methods = [m for m in METHODS if m in cached]
+    methods = [m for m in methods if m in cached]
     if not methods:
         return
     ref_df = cached[methods[0]][0]
@@ -262,12 +265,20 @@ def plot_side_by_side(category: str, cached: dict[str, tuple], n_samples: int = 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--categories", nargs="+", default=CATEGORIES, choices=CATEGORIES)
-    parser.add_argument("--methods", nargs="+", default=METHODS, choices=METHODS)
+    parser.add_argument("--methods", nargs="+", default=ALL_METHODS, choices=ALL_METHODS)
+    parser.add_argument(
+        "--drop-max",
+        action="store_true",
+        help="Exclude k-NN prototype methods using max aggregation "
+        "(dinov3_proto_..._max[_masked]); keeps their avg-aggregation counterparts.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
+    if args.drop_max:
+        args.methods = [m for m in args.methods if "_max" not in m]
     RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
     FIGURES_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -298,7 +309,7 @@ def main() -> None:
             plot_best_worst(category, method, df, maps_by_id)
 
         if cached:
-            plot_side_by_side(category, cached)
+            plot_side_by_side(category, cached, args.methods)
 
     metrics_df = pd.DataFrame(metric_rows)
     if metrics_df.empty:
@@ -309,7 +320,7 @@ def main() -> None:
     log.info("Wrote %s", RESULTS_ROOT / "metrics.csv")
 
     for metric in ("image_auroc", "pixel_auroc", "aupro", "image_f1max"):
-        plot_metric_bars(metrics_df, metric)
+        plot_metric_bars(metrics_df, metric, args.methods)
 
     summary_lines = ["# Anomaly detection method comparison\n"]
     for metric in (
@@ -321,7 +332,7 @@ def main() -> None:
         "mean_latency_ms",
     ):
         pivot = metrics_df.pivot(index="category", columns="method", values=metric)
-        pivot = pivot.reindex(columns=[m for m in METHODS if m in pivot.columns])
+        pivot = pivot.reindex(columns=[m for m in args.methods if m in pivot.columns])
         summary_lines.append(f"\n## {metric}\n")
         summary_lines.append(_df_to_markdown(pivot.round(4)))
     (RESULTS_ROOT / "summary.md").write_text("\n".join(summary_lines) + "\n")

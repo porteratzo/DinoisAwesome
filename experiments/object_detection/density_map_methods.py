@@ -31,11 +31,11 @@
 # %% Logging — must be before torch import
 import logging
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -44,13 +44,31 @@ import torch.nn.functional as F
 from dotenv import load_dotenv
 from matplotlib.patches import Rectangle
 from PIL import Image
-from scipy import ndimage
-from sklearn.cluster import DBSCAN, HDBSCAN
+from sklearn.cluster import HDBSCAN
 from sklearn.neural_network import MLPClassifier
 
 from dinoisawesome import DinoEncoder
 from dinoisawesome.annotation_utils import load_annotations
 from dinoisawesome.instance_detection import compute_exemplar_features, extract_patch_tokens
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _shared.clustering import dbscan_clusters_from_mask, match_and_score  # noqa: E402
+from _shared.crop_utils import pad_and_floor_crop_box  # noqa: E402
+from _shared.gt_utils import (
+    gt_instance_patch_sizes as _shared_gt_instance_patch_sizes,  # noqa: E402
+)
+from _shared.mask_geometry import (  # noqa: E402
+    blob_patch_bbox,
+    connected_component_blobs,
+    patch_bbox_to_native_px,
+    pixel_mask_to_patch_mask,
+)
+from _shared.thresholding import (  # noqa: E402
+    iou_threshold_curve,
+    iou_tuned_threshold,
+    otsu_threshold,
+    roi_binary_mask,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -166,23 +184,6 @@ def load_instance_pixel_mask(stem: str, class_filter: list[str] | None) -> np.nd
     return np.stack([a["mask"] for a in instances]).any(axis=0)
 
 
-def pixel_mask_to_patch_mask(
-    pixel_mask: np.ndarray,
-    grid_h: int,
-    grid_w: int,
-    img_size: int,
-    threshold: float = 0.3,
-) -> np.ndarray:
-    """Resize a pixel-space mask to patch-grid resolution, (grid_h, grid_w) bool."""
-    mask_pil = Image.fromarray(pixel_mask.astype(np.uint8) * 255)
-    mask_resized = np.array(mask_pil.resize((img_size, img_size), Image.NEAREST)) > 0
-    ph = img_size // grid_h
-    pw = img_size // grid_w
-    tiled = mask_resized.reshape(grid_h, ph, grid_w, pw)
-    patch_density = tiled.mean(axis=(1, 3))
-    return patch_density >= threshold
-
-
 def gt_instance_patch_sizes(
     stem: str,
     class_filter: list[str] | None,
@@ -192,26 +193,9 @@ def gt_instance_patch_sizes(
     patch_threshold: float,
 ) -> np.ndarray:
     """Per-instance GT sizes in patches, using that image's own annotation set."""
-    ann_stem = data_dir / "annotations" / stem
-    try:
-        anns = load_annotations(ann_stem)
-    except FileNotFoundError:
-        return np.array([])
-    instances = [a for a in anns if class_filter is None or a["class"] in class_filter]
-    if not instances:
-        return np.array([])
-    return np.array(
-        [
-            pixel_mask_to_patch_mask(a["mask"], grid_h, grid_w, img_size, patch_threshold).sum()
-            for a in instances
-        ]
+    return _shared_gt_instance_patch_sizes(
+        stem, class_filter, grid_h, grid_w, img_size, patch_threshold, data_dir
     )
-
-
-def mask_iou(a: np.ndarray, b: np.ndarray) -> float:
-    inter = int((a & b).sum())
-    union = int((a | b).sum())
-    return inter / (union + 1e-8)
 
 
 # %% Descriptor-method registry
@@ -404,28 +388,6 @@ def median_minus_margin_threshold(true_vals: np.ndarray, margin: float) -> float
     return float(np.median(true_vals) - margin)
 
 
-def iou_threshold_curve(
-    raw: np.ndarray, gt_mask: np.ndarray, steps: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Patch-mask IoU of `(raw > c)` vs. `gt_mask` for `steps` candidates spanning raw's range."""
-    candidates = np.linspace(raw.min(), raw.max(), steps)
-    ious = np.array([mask_iou(raw > c, gt_mask) for c in candidates])
-    return candidates, ious
-
-
-def iou_tuned_threshold(raw: np.ndarray, gt_mask: np.ndarray, steps: int) -> float:
-    """Threshold that maximises patch-mask IoU against *gt_mask*.
-
-    Sweeps `steps` candidates spanning the raw score range and keeps the one
-    with the highest IoU between the thresholded mask and GT — meant to be fit
-    on the exemplar's own score map + GT mask (self-supervised, no dependence
-    on the query's GT), then reused as-is to threshold queries.
-    """
-    candidates, ious = iou_threshold_curve(raw, gt_mask, steps)
-    best_idx = int(np.argmax(ious))
-    return float(candidates[best_idx])
-
-
 def minmax_margin_cluster_bounds(sizes: np.ndarray, margin: int | float) -> tuple[int, int]:
     """Cluster-size bounds from GT instance sizes ± margin.
 
@@ -482,103 +444,7 @@ def hdbscan_clusters(
     return clusters
 
 
-def dbscan_clusters_from_mask(patch_mask: np.ndarray, eps: float, min_samples: int) -> list[dict]:
-    ys, xs = np.where(patch_mask)
-    if len(xs) == 0:
-        return []
-    coords = np.stack([xs, ys], axis=1).astype(float)
-    labels = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(coords)
-    clusters = []
-    for lbl in sorted(set(labels)):
-        if lbl == -1:
-            continue
-        sel = labels == lbl
-        mask = np.zeros(patch_mask.shape, dtype=bool)
-        mask[ys[sel], xs[sel]] = True
-        clusters.append({"mask": mask})
-    return clusters
-
-
 # %% Two-stage ROI refinement — binarize, blob, crop, re-encode, splat back
-
-
-def otsu_threshold(raw: np.ndarray) -> float:
-    """Otsu's threshold on *raw*, computed via cv2 on a rescaled 8-bit copy."""
-    lo, hi = float(raw.min()), float(raw.max())
-    if hi - lo < 1e-8:
-        return lo
-    scaled = ((raw - lo) / (hi - lo) * 255).astype(np.uint8)
-    otsu_val, _ = cv2.threshold(scaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return lo + (float(otsu_val) / 255.0) * (hi - lo)
-
-
-def roi_binary_mask(raw: np.ndarray, method: str, single_threshold: float) -> np.ndarray:
-    """Unsupervised (no-GT) foreground/ROI mask used to decide where to zoom in."""
-    if method == "otsu":
-        thr = otsu_threshold(raw)
-    elif method == "single":
-        thr = single_threshold
-    else:
-        raise ValueError(f"Unknown ROI_BINARIZE_METHOD: {method!r}")
-    return raw > thr
-
-
-def connected_component_blobs(mask: np.ndarray) -> list[dict]:
-    """8-connected components of a boolean patch mask -> list of {'mask': ...}."""
-    structure = ndimage.generate_binary_structure(2, 2)
-    labeled, n = ndimage.label(mask, structure=structure)
-    return [{"mask": labeled == lbl} for lbl in range(1, n + 1)]
-
-
-def blob_patch_bbox(mask: np.ndarray) -> tuple[int, int, int, int]:
-    """Half-open patch-grid bbox (y0, y1, x0, x1) of a boolean blob mask."""
-    ys, xs = np.where(mask)
-    return int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
-
-
-def patch_bbox_to_native_px(
-    y0: int, y1: int, x0: int, x1: int, patch_size: int, scale_x: float, scale_y: float
-) -> tuple[float, float, float, float]:
-    """Patch-grid bbox -> native (original, full-resolution image) pixel bbox."""
-    px0 = x0 * patch_size * scale_x
-    px1 = x1 * patch_size * scale_x
-    py0 = y0 * patch_size * scale_y
-    py1 = y1 * patch_size * scale_y
-    return px0, py0, px1, py1
-
-
-def pad_and_floor_crop_box(
-    px0: float,
-    py0: float,
-    px1: float,
-    py1: float,
-    pad_fraction: float,
-    floor_side_px: float,
-    native_w: int,
-    native_h: int,
-) -> tuple[int, int, int, int]:
-    """Pad a native-pixel bbox by *pad_fraction* per side (of its own width/height),
-    then enforce a centred minimum side length of *floor_side_px* — this bounds how
-    much the encoder's resize-to-IMG_SIZE can upscale the crop — then clip to bounds.
-    """
-    w, h = px1 - px0, py1 - py0
-    pad_w, pad_h = w * pad_fraction, h * pad_fraction
-    px0, px1 = px0 - pad_w, px1 + pad_w
-    py0, py1 = py0 - pad_h, py1 + pad_h
-
-    w, h = px1 - px0, py1 - py0
-    if w < floor_side_px:
-        cx = (px0 + px1) / 2
-        px0, px1 = cx - floor_side_px / 2, cx + floor_side_px / 2
-    if h < floor_side_px:
-        cy = (py0 + py1) / 2
-        py0, py1 = cy - floor_side_px / 2, cy + floor_side_px / 2
-
-    px0_i = max(0, int(round(px0)))
-    py0_i = max(0, int(round(py0)))
-    px1_i = min(native_w, int(round(px1)))
-    py1_i = min(native_h, int(round(py1)))
-    return px0_i, py0_i, px1_i, py1_i
 
 
 def refine_raw_with_crops(
@@ -629,6 +495,7 @@ def refine_raw_with_crops(
             raw_py1,
             CROP_PADDING_FRACTION,
             floor_side_px,
+            floor_side_px,
             native_w,
             native_h,
         )
@@ -661,56 +528,6 @@ def refine_raw_with_crops(
 
     debug = {"raw_stage1": raw, "roi_mask": roi_mask, "blobs": blob_debug}
     return refined, debug
-
-
-def match_and_score(pred_clusters: list[dict], gt_clusters: list[dict], iou_thr: float) -> dict:
-    n_pred, n_gt = len(pred_clusters), len(gt_clusters)
-    if n_gt == 0:
-        return {
-            "precision": np.nan,
-            "recall": np.nan,
-            "f1": np.nan,
-            "mean_iou": np.nan,
-            "tp": 0,
-            "fp": n_pred,
-            "fn": 0,
-            "count_error": n_pred,
-            "n_pred": n_pred,
-            "n_gt": 0,
-        }
-    order = sorted(range(n_pred), key=lambda i: -pred_clusters[i]["score"])
-    matched_gt: set[int] = set()
-    tp = 0
-    ious: list[float] = []
-    for i in order:
-        best_j, best_iou = -1, 0.0
-        for j in range(n_gt):
-            if j in matched_gt:
-                continue
-            iou = mask_iou(pred_clusters[i]["mask"], gt_clusters[j]["mask"])
-            if iou > best_iou:
-                best_iou, best_j = iou, j
-        if best_j >= 0 and best_iou >= iou_thr:
-            matched_gt.add(best_j)
-            tp += 1
-            ious.append(best_iou)
-    fp = n_pred - tp
-    fn = n_gt - tp
-    precision = tp / n_pred if n_pred else 0.0
-    recall = tp / n_gt if n_gt else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
-    return {
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "mean_iou": float(np.mean(ious)) if ious else 0.0,
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
-        "count_error": abs(n_pred - n_gt),
-        "n_pred": n_pred,
-        "n_gt": n_gt,
-    }
 
 
 # %% Load encoder (shared across all pairs)

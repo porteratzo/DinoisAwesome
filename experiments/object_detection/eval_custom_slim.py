@@ -40,8 +40,10 @@ from PIL import Image
 _REPO_ROOT = Path(__file__).parent.parent.parent
 load_dotenv(_REPO_ROOT / ".env")
 sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+sys.path.insert(0, str(_REPO_ROOT / "experiments"))
 
 import torch
+from _shared.mask_geometry import mask_iou
 from eval_sam_dino import (
     ExemplarFeatures,
     _bbox_from_mask,
@@ -445,10 +447,6 @@ fig.tight_layout()
 plt.show()
 
 # %% Step 3 — DINO Scoring helpers
-
-
-def mask_iou(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.logical_and(a, b).sum()) / (float(np.logical_or(a, b).sum()) + 1e-8)
 
 
 @dataclass

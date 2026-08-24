@@ -17,6 +17,17 @@ uses this same "call the model directly" pattern for scoring.
 
 Methods 3-4 (`anomalydino_v3`, `anomalydino_v3_smooth9`) are `dinoisawesome`'s own
 `AnomalyHead` + `DinoEncoder(version="v3")` — see `dinoisawesome/anomaly_head.py`.
+
+Masked variants of methods 1-4 (`anomalydino_v2_masked`, `anomalydino_v3_masked`)
+turn on PCA-based background suppression (see `dinoisawesome/background_mask.py`,
+ported from anomalib's own `AnomalyDINOModel.compute_background_masks`).
+
+The `dinov3_proto_*` family (built by `PrototypeMethod`) is a fifth, different
+method: `dinoisawesome`'s `PrototypeAnomalyHead` — CLS-token retrieval of the
+nearest normal training image(s) followed by k-means prototype clustering,
+instead of one big cross-image patch memory bank. See
+`dinoisawesome/prototype_head.py` and `common.parse_prototype_name` for the
+naming scheme and parameter grid.
 """
 
 from __future__ import annotations
@@ -27,14 +38,14 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
-from common import gallery_dir
+from common import gallery_dir, parse_prototype_name, prototype_method_name
 from PIL import Image
 
-from dinoisawesome import AnomalyHead, DinoEncoder
+from dinoisawesome import AnomalyHead, DinoEncoder, Gallery, PrototypeAnomalyHead
 
 logger = logging.getLogger(__name__)
 
@@ -122,16 +133,15 @@ class PatchCoreMethod(_VendorAnomalibMethod):
 
 
 class AnomalyDINOv2Method(_VendorAnomalibMethod):
-    name = "anomalydino_v2"
-
-    def __init__(self, image_size: tuple[int, int] = (252, 252)) -> None:
+    def __init__(self, image_size: tuple[int, int] = (252, 252), masking: bool = False) -> None:
         from anomalib.models import AnomalyDINO
 
+        self.name = "anomalydino_v2_masked" if masking else "anomalydino_v2"
         self.model = AnomalyDINO(
             pre_processor=AnomalyDINO.configure_pre_processor(image_size=image_size),
             encoder_name="dinov2_vit_small_14",
             num_neighbours=1,
-            masking=False,
+            masking=masking,
         )
 
 
@@ -151,12 +161,21 @@ class _AnomalyDINOv3Method(AnomalyMethod):
         self,
         category: str,
         smoothing: bool,
+        masking: bool = False,
         img_size: int = 256,
         size: str = "small",
     ) -> None:
-        self.name = "anomalydino_v3_smooth9" if smoothing else "anomalydino_v3"
+        if smoothing and masking:
+            self.name = "anomalydino_v3_smooth9_masked"
+        elif smoothing:
+            self.name = "anomalydino_v3_smooth9"
+        elif masking:
+            self.name = "anomalydino_v3_masked"
+        else:
+            self.name = "anomalydino_v3"
         self._category = category
         self._smoothing = smoothing
+        self._masking = masking
         self._encoder = DinoEncoder(
             version="v3",
             size=size,
@@ -177,6 +196,7 @@ class _AnomalyDINOv3Method(AnomalyMethod):
             split="train",
             num_neighbours=1,
             smoothing=self._smoothing,
+            masking=self._masking,
         )
         return time.perf_counter() - t_start
 
@@ -191,13 +211,84 @@ class _AnomalyDINOv3Method(AnomalyMethod):
 
 
 class AnomalyDINOv3Method(_AnomalyDINOv3Method):
-    def __init__(self, category: str) -> None:
-        super().__init__(category=category, smoothing=False)
+    def __init__(self, category: str, masking: bool = False) -> None:
+        super().__init__(category=category, smoothing=False, masking=masking)
 
 
 class AnomalyDINOv3SmoothMethod(_AnomalyDINOv3Method):
     def __init__(self, category: str) -> None:
         super().__init__(category=category, smoothing=True)
+
+
+# ---------------------------------------------------------------------------
+# Method 5: dinoisawesome's PrototypeAnomalyHead — CLS retrieval + k-means
+# prototypes (DINOv3-backed), instead of one big cross-image patch memory bank.
+# ---------------------------------------------------------------------------
+
+
+class PrototypeMethod(AnomalyMethod):
+    """Driver for `dinoisawesome.PrototypeAnomalyHead` over a DINOv3 encoder.
+
+    Builds the same kind of Gallery as `_AnomalyDINOv3Method` (CLS tokens + patch
+    grids for every normal training image), but scores each query against a
+    small set of k-means prototypes drawn from the nearest retrieved normal
+    image(s) instead of the full cross-image patch bank.
+    """
+
+    def __init__(
+        self,
+        category: str,
+        n_prototypes: int,
+        retrieval_k: int,
+        aggregation: Literal["max", "avg"],
+        masking: bool,
+        img_size: int = 256,
+        size: str = "small",
+    ) -> None:
+        self.name = prototype_method_name(n_prototypes, retrieval_k, aggregation, masking)
+        self._category = category
+        self._n_prototypes = n_prototypes
+        self._retrieval_k = retrieval_k
+        self._aggregation = aggregation
+        self._masking = masking
+        self._encoder = DinoEncoder(
+            version="v3",
+            size=size,
+            img_size=img_size,
+            layers=1,
+            device=DEVICE,
+            weights_dir=DINO_WEIGHTS_DIR,
+        )
+        self._head: PrototypeAnomalyHead | None = None
+
+    def fit(self, train_paths: list[Path]) -> float:
+        t_start = time.perf_counter()
+        gallery = Gallery.build(
+            encoder=self._encoder,
+            images=train_paths,
+            image_ids=[p.stem for p in train_paths],
+            out_dir=gallery_dir(self._category, self.name),
+            split="train",
+        )
+        self._head = PrototypeAnomalyHead(
+            gallery=gallery,
+            encoder=self._encoder,
+            n_prototypes=self._n_prototypes,
+            retrieval_k=self._retrieval_k,
+            aggregation=self._aggregation,
+            masking=self._masking,
+            split="train",
+        )
+        return time.perf_counter() - t_start
+
+    def predict(self, image_path: Path) -> ScoreResult:
+        assert self._head is not None, "fit() must be called before predict()"
+        t_start = time.perf_counter()
+        result = self._head.predict(image_path)
+        latency_ms = (time.perf_counter() - t_start) * 1000
+        return ScoreResult(
+            score=result["score"], anomaly_map=result["anomaly_map"], latency_ms=latency_ms
+        )
 
 
 def build_method(name: str, category: str) -> AnomalyMethod:
@@ -206,8 +297,15 @@ def build_method(name: str, category: str) -> AnomalyMethod:
         return PatchCoreMethod()
     if name == "anomalydino_v2":
         return AnomalyDINOv2Method()
+    if name == "anomalydino_v2_masked":
+        return AnomalyDINOv2Method(masking=True)
     if name == "anomalydino_v3":
         return AnomalyDINOv3Method(category=category)
+    if name == "anomalydino_v3_masked":
+        return AnomalyDINOv3Method(category=category, masking=True)
     if name == "anomalydino_v3_smooth9":
         return AnomalyDINOv3SmoothMethod(category=category)
+    proto_kwargs = parse_prototype_name(name)
+    if proto_kwargs is not None:
+        return PrototypeMethod(category=category, **proto_kwargs)  # type: ignore[arg-type]
     raise ValueError(f"Unknown method: {name!r}")
