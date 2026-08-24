@@ -6,16 +6,22 @@ behaviour can be reused outside anomalib's DINOv2-only model — e.g. by
 dinoisawesome's DINOv3-backed :class:`~dinoisawesome.anomaly_head.AnomalyHead`
 and :class:`~dinoisawesome.prototype_head.PrototypeAnomalyHead`.
 
-Unlike anomalib's version (``cv2.dilate`` / ``cv2.morphologyEx``), morphological
-cleanup here uses ``scipy.ndimage`` with an equivalent 3x3 structuring element —
-scipy is already pulled in transitively by scikit-learn, so this avoids adding
-opencv as a new dependency.
+Morphological cleanup uses ``cv2.dilate`` / ``cv2.morphologyEx`` directly (matching
+anomalib's own implementation), now that opencv is a declared project dependency
+(see ``dinoisawesome.annotation_utils``, which also uses it — scipy's dense-footprint
+``binary_*`` ops are dramatically slower than cv2's for the same rectangular kernel).
+``borderType=cv2.BORDER_CONSTANT, borderValue=0`` is set explicitly to match scipy's
+``border_value=0`` default (cv2's own default border value is effectively "treat the
+border as foreground", which erodes edge-touching regions differently). With that set,
+cv2 and scipy agree exactly for odd `kernel_size`; even sizes can differ by ~1px at a
+mask's edge due to a center-pixel convention difference between the two libraries for
+structuring elements with no single center — negligible for this heuristic cleanup.
 """
 
 from __future__ import annotations
 
+import cv2
 import numpy as np
-from scipy.ndimage import binary_closing, binary_dilation
 from sklearn.decomposition import PCA
 
 
@@ -64,8 +70,12 @@ def compute_foreground_mask(
     if not mask_2d.any():
         return np.ones(h * w, dtype=bool)
 
-    structure = np.ones((kernel_size, kernel_size), dtype=bool)
-    mask_2d = binary_dilation(mask_2d, structure=structure)
-    mask_2d = binary_closing(mask_2d, structure=structure)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+    mask_u8 = mask_2d.astype(np.uint8) * 255
+    mask_u8 = cv2.dilate(mask_u8, kernel, borderType=cv2.BORDER_CONSTANT, borderValue=0)
+    mask_u8 = cv2.morphologyEx(
+        mask_u8, cv2.MORPH_CLOSE, kernel, borderType=cv2.BORDER_CONSTANT, borderValue=0
+    )
+    mask_2d = mask_u8 > 0
 
     return mask_2d.reshape(-1)

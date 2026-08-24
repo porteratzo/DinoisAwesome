@@ -68,7 +68,7 @@ from _shared.augmentations import (  # noqa: E402
     mean_color,
     pixel_only,
 )
-from _shared.mask_geometry import mask_bbox_px, pixel_mask_to_patch_mask  # noqa: E402
+from _shared.mask_geometry import pixel_mask_to_patch_mask, scale_crop_box  # noqa: E402
 
 # %% Parameters
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -90,7 +90,7 @@ REFERENCE_INSTANCE_ID = 1  # annotation "instance_id" (1-based, per class per im
 
 DINO_VERSION = "v3"
 DINO_SIZE = "large"
-IMG_SIZE = 1024  # must be divisible by patch_size (16 for v3)
+IMG_SIZE = 768  # must be divisible by patch_size (16 for v3)
 LAYER_IDX = 23  # penultimate/last block of ViT-L/16 (depth 24)
 DINO_WEIGHTS_DIR: str | None = os.environ.get("DINO_WEIGHTS_DIR")
 
@@ -112,32 +112,21 @@ log.info(
     LAYER_IDX,
 )
 
-# %% Mask / geometry helpers (same as scale_crop_similarity.py)
-
-
-def mid_bbox_crop(pixel_mask: np.ndarray, padding_frac: float) -> tuple[int, int, int, int]:
-    """PIL-style box (x0, y0, x1, y1): the mask's bbox padded by *padding_frac* of its
-    own extent on each side, clipped to the image."""
-    H, W = pixel_mask.shape
-    rmin, rmax, cmin, cmax = mask_bbox_px(pixel_mask)
-    pad_r = int((rmax - rmin) * padding_frac)
-    pad_c = int((cmax - cmin) * padding_frac)
-    return (
-        max(0, cmin - pad_c),
-        max(0, rmin - pad_r),
-        min(W, cmax + pad_c),
-        min(H, rmax + pad_r),
-    )
-
-
-# %% Load every abc3 image + every annotated instance, build each one's fixed mid crop
+# %% Load every abc3 image + every annotated instance, build each one's fixed mid crop.
+# "mid" here is scale_crop_box's actual mid geometry — the midpoint between the tight
+# bbox and the full image edges — the same helper augmented_prototype_oracle_iou.py uses
+# for its "mid" scale, so the two scripts' "mid crop" means the same thing. (An earlier
+# version of this file reimplemented its own mid_bbox_crop, which despite the name/docs
+# actually computed the *close*-scale formula — a padded-bbox crop, much smaller than a
+# real mid crop — silently understating drift for this "mid" setting; see scale_crop_box
+# in _shared/mask_geometry.py for the close/mid/global definitions.)
 instances: list[dict] = []
 for image_stem in tqdm(IMAGE_STEMS, desc="Loading images/annotations"):
     anns = load_annotations(data_dir / "annotations" / image_stem)
     ref_img = Image.open(data_dir / f"{image_stem}.jpg").convert("RGB")
     for ann in anns:
         mask = ann["mask"]  # (H, W) bool, full native resolution
-        mid_box = mid_bbox_crop(mask, MID_PADDING_FRACTION)
+        mid_box = scale_crop_box(mask, "mid", MID_PADDING_FRACTION)
         x0, y0, x1, y1 = mid_box
         base_crop = ref_img.crop(mid_box)
         base_mask_px = mask[y0:y1, x0:x1]
@@ -236,48 +225,47 @@ log.info(
     len(AUGMENTATIONS),
 )
 
-# %% Encode every augmented crop, chunked to encoder.max_batch_size with a progress bar
+# %% Encode + pool every augmented crop, chunked to encoder.max_batch_size. Pooling happens
+# inside the same loop that encodes each chunk so only one chunk's (grid_h, grid_w, D) patch
+# grid is ever resident at a time — holding all entries' full patch grids simultaneously (a
+# separate encode-everything-then-pool-everything pass) is what was exhausting RAM.
 encoder = DinoEncoder(
     version=DINO_VERSION,
     size=DINO_SIZE,
     img_size=IMG_SIZE,
     layers=[LAYER_IDX],
     weights_dir=DINO_WEIGHTS_DIR,
+    max_batch_size=16,
     amp=True,
 )
 chunk_size = encoder.max_batch_size
-patch_chunks = []
-for i in tqdm(range(0, len(entries), chunk_size), desc="Encoding crops"):
+for i in tqdm(range(0, len(entries), chunk_size), desc="Encoding + pooling crops"):
     chunk = entries[i : i + chunk_size]
     out = encoder([e["img"] for e in chunk], layers=[LAYER_IDX], debias=True)
-    patch_chunks.append(out.patches[:, 0].cpu())  # (chunk, grid_h, grid_w, D)
-patches = torch.cat(patch_chunks, dim=0)  # (N, grid_h, grid_w, D)
-_, grid_h, grid_w, D = patches.shape
+    chunk_patches = out.patches[:, 0].cpu()  # (chunk, grid_h, grid_w, D) — freed at loop end
+    D = chunk_patches.shape[-1]
 
-# %% Per-crop masked-mean object embedding
-for entry, patch_tokens in tqdm(
-    zip(entries, patches), total=len(entries), desc="Pooling object embeddings"
-):
-    patch_mask = pixel_mask_to_patch_mask(
-        entry["mask_px"], grid_h, grid_w, IMG_SIZE, MASK_PATCH_THRESHOLD
-    )
-    tokens = F.normalize(patch_tokens.reshape(grid_h * grid_w, D), p=2, dim=-1)
-    patch_flat = torch.from_numpy(patch_mask.reshape(-1)).to(tokens.device)
-
-    masked = tokens[patch_flat]
-    if masked.shape[0] == 0:
-        log.warning(
-            "image=%s class=%s instance=%s family=%s value=%s: mask empty after patch-grid "
-            "projection — using all crop patches",
-            entry["image_stem"],
-            entry["class"],
-            entry["instance_id"],
-            entry["family"],
-            entry["value"],
+    for entry, patch_tokens in zip(chunk, chunk_patches):
+        patch_mask = pixel_mask_to_patch_mask(
+            entry["mask_px"], encoder.grid_h, encoder.grid_w, IMG_SIZE, MASK_PATCH_THRESHOLD
         )
-        masked = tokens
-    entry["embedding"] = compute_exemplar_features(masked, mode="mean")  # (1, D)
-    entry["n_masked_patches"] = int(patch_flat.sum())
+        tokens = F.normalize(patch_tokens.reshape(encoder.grid_h * encoder.grid_w, D), p=2, dim=-1)
+        patch_flat = torch.from_numpy(patch_mask.reshape(-1)).to(tokens.device)
+
+        masked = tokens[patch_flat]
+        if masked.shape[0] == 0:
+            log.warning(
+                "image=%s class=%s instance=%s family=%s value=%s: mask empty after patch-grid "
+                "projection — using all crop patches",
+                entry["image_stem"],
+                entry["class"],
+                entry["instance_id"],
+                entry["family"],
+                entry["value"],
+            )
+            masked = tokens
+        entry["embedding"] = compute_exemplar_features(masked, mode="mean")  # (1, D)
+        entry["n_masked_patches"] = int(patch_flat.sum())
 
 # %% Similarity vs. each instance's own severity=0 (unperturbed) embedding, then
 # aggregated (mean + std) across all instances per family/severity

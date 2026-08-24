@@ -15,8 +15,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
-from scipy.ndimage import binary_opening, generate_binary_structure
 
 log = logging.getLogger(__name__)
 
@@ -69,7 +69,7 @@ def load_annotations(
             f"Mask count ({len(masks)}) does not match annotation count ({len(metadata)})"
         )
 
-    structure = np.ones((morph_kernel_size, morph_kernel_size), dtype=bool)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (morph_kernel_size, morph_kernel_size))
     log.debug(
         "Loading %d annotations from %s; opening kernel %dx%d",
         len(masks),
@@ -80,9 +80,15 @@ def load_annotations(
 
     result = []
     for i, (mask, meta) in enumerate(zip(masks, metadata)):
-        cleaned = binary_opening(mask, structure=structure)
+        mask_u8 = mask.astype(np.uint8) * 255
+        cleaned = (
+            cv2.morphologyEx(
+                mask_u8, cv2.MORPH_OPEN, kernel, borderType=cv2.BORDER_CONSTANT, borderValue=0
+            )
+            > 0
+        )
         entry = dict(meta)
-        entry["mask"] = cleaned.astype(bool)
+        entry["mask"] = cleaned
         log.debug(
             "  [%d] class=%r  pixels before=%d  after=%d",
             i,
