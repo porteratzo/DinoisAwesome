@@ -53,7 +53,7 @@ from dotenv import load_dotenv
 from matplotlib.patches import Rectangle
 from PIL import Image
 
-from dinoisawesome import DinoEncoder, compute_exemplar_features, load_annotations
+from dinoisawesome import DinoEncoder, EncoderWithCache, compute_exemplar_features, load_annotations
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from _shared.mask_geometry import mask_bbox_px, pixel_mask_to_patch_mask  # noqa: E402
@@ -76,6 +76,7 @@ DINO_SIZE = "large"
 IMG_SIZE = 1024  # must be divisible by patch_size (16 for v3)
 LAYER_IDX = 23  # penultimate/last block of ViT-L/16 (depth 24)
 DINO_WEIGHTS_DIR: str | None = os.environ.get("DINO_WEIGHTS_DIR")
+DINO_ENCODING_CACHE_DIR: str | None = os.environ.get("DINO_ENCODING_CACHE_DIR")
 
 MASK_PATCH_THRESHOLD = 0.3  # patch-grid cell counts as "object" once this fraction is masked
 
@@ -158,6 +159,7 @@ encoder = DinoEncoder(
     weights_dir=DINO_WEIGHTS_DIR,
     amp=True,
 )
+encoder = EncoderWithCache(encoder, cache_dir=DINO_ENCODING_CACHE_DIR)
 out = encoder(crops, layers=[LAYER_IDX], debias=True)
 patches = out.patches[:, 0]  # (N_SCALES, grid_h, grid_w, D)
 cls = out.cls[:, 0]  # (N_SCALES, D)

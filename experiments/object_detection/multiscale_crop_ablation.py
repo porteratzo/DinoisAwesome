@@ -50,8 +50,11 @@ from dotenv import load_dotenv
 from matplotlib.patches import Rectangle
 from PIL import Image
 from scipy import ndimage
+from scipy.spatial.distance import cdist
+from sklearn.cluster import DBSCAN as SKDBSCAN
+from sklearn.neighbors import NearestNeighbors
 
-from dinoisawesome import DinoEncoder
+from dinoisawesome import DinoEncoder, EncoderWithCache
 from dinoisawesome.abc3 import PART_TYPES, load_instance_pixel_mask, load_instance_pixel_masks
 from dinoisawesome.instance_detection import compute_exemplar_features, extract_patch_tokens
 
@@ -108,25 +111,26 @@ logging.basicConfig(
 )
 log = logging.getLogger("multiscale_crop_ablation")
 
-# %% Parameters
+# %% Setup — repo paths + env vars (must run before the os.environ.get() defaults below)
 _REPO_ROOT = Path(__file__).parent.parent.parent
 load_dotenv(_REPO_ROOT / ".env")
 
 data_dir = _REPO_ROOT / "data" / "abc3"
 
+# %% Parameters
 # PART_TYPES imported from dinoisawesome.abc3 (shared with augmented_prototype_oracle_iou.py's
 # batch mode)
 REF_NUMBER = 1
 QUERY_NUMBER = 2
-FOCUS_PART_TYPE = "RHa"  # part type used for the detailed per-method / crop figures
+FOCUS_PART_TYPE = "RHb"  # part type used for the detailed per-method / crop figures
 # Annotated classes per part type in data/abc3 — EXEMPLAR_CLASS must be present in whichever
 # part type(s) RUN_PART_TYPES selects, or run_pair skips them (no exemplar instances) and
 # results/metrics_rows end up empty:
 #   LHa, RHa — foam, donut foam, donut foam single           (no velcro, no white clips)
 #   LHb, RHb — foam, donut foam single, velcro, white clips
 # EXEMPLAR_CLASS: list[str] | None = ["white clips"]  # None = all classes
-# EXEMPLAR_CLASS: list[str] | None = ["donut foam single", "donut foam"]  # None = all classes
-EXEMPLAR_CLASS: list[str] | None = ["foam"]  # None = all classes
+EXEMPLAR_CLASS: list[str] | None = ["donut foam single", "donut foam"]  # None = all classes
+# EXEMPLAR_CLASS: list[str] | None = ["foam"]  # None = all classes
 # EXEMPLAR_CLASS: list[str] | None = ["velcro"]  # None = all classes
 
 # run_pair does several encoder forward passes per part type (ref multi-scale crops, the query,
@@ -140,9 +144,10 @@ RUN_PART_TYPES: list[str] = [FOCUS_PART_TYPE]
 
 DINO_VERSION = "v3"
 DINO_SIZE = "large"
-IMG_SIZE = 1024
+IMG_SIZE = 768
 LAYER_IDX = 23
 DINO_WEIGHTS_DIR: str | None = os.environ.get("DINO_WEIGHTS_DIR")
+DINO_ENCODING_CACHE_DIR: str | None = os.environ.get("DINO_ENCODING_CACHE_DIR")
 DEBIAS = True  # whether to apply positional debiasing when extracting patch tokens
 
 MASK_PATCH_THRESHOLD = 0.3
@@ -164,18 +169,19 @@ ABLATION_COMBOS: dict[str, list[str]] = {
     # "global+mid": ["global", "mid"],
     # "global+close": ["global", "close"],
     # "mid+close": ["mid", "close"], mid+close close seams not as good as mid, so lets drop it
-    # "global+mid+close": ["global", "mid", "close"],
+    "global+mid+close": ["global", "mid", "close"],
 }
 
-# fg-bg-mean, fg-bg-proto and fg-bg-knn are built separately from the single-scale combos above
-# (they need per-scale foreground/background prototypes or galleries, not just
-# scale_protos[m].prototype — see build_fgbg_states, build_fgbg_multiproto_states and
-# build_knn_fgbg_states) and are configurable the same way ABLATION_COMBOS is: each key names a
-# (fg source scales, bg source scales) pair. Single-fg-scale combos build a "fg-bg-mean(...)"
-# (both sides collapsed to one mean vector); multi-fg-scale combos build a "fg-bg-proto(...)"
-# instead (each fg scale's own mean prototype kept as a separate row, not averaged into one —
-# see build_fgbg_multiproto_states for why). "fg-bg-knn(...)" is built for every combo either
-# way, since it never collapses to a mean on either side.
+# fg-bg-proto and fg-bg-knn are built separately from the single-scale combos above (they need
+# per-scale foreground/background prototypes or galleries, not just scale_protos[m].prototype —
+# see build_fgbg_multiproto_states and build_knn_fgbg_states) and are configurable the same way
+# ABLATION_COMBOS is: each key names a (fg source scales, bg source scales) pair. Every combo
+# builds a "fg-bg-proto(...)" state: each fg scale's own mean prototype is kept as a separate
+# row (not averaged into one), so scoring takes the per-patch max cosine similarity across fg
+# rows minus the (still single, mean-collapsed) bg similarity — a single-fg-scale combo just
+# produces a one-row bank, which reduces to the same score a mean-collapsed fg would give.
+# "fg-bg-knn(...)" is built for every combo either way, since it never collapses to a mean on
+# either side.
 FGBG_SOURCE_COMBOS: dict[str, dict[str, list[str]]] = {
     "global/all": {"fg": ["global"], "bg": ["global", "mid", "close"]},
     "mid/all": {"fg": ["mid"], "bg": ["global", "mid", "close"]},
@@ -208,58 +214,6 @@ KMEANS_KS: tuple[int, ...] = (3, 8)
 # runs, so they're skipped by default. Flip to True to re-enable them for a comparison run —
 # nothing else needs to change, both builders stay registered below.
 INCLUDE_KMEANS_METHODS: bool = False
-
-
-def ablation_method_names(
-    combos: dict[str, list[str]], combine_modes: list[Literal["max", "mean"]]
-) -> list[str]:
-    """Expand each combo into the method name(s) build_ablation_states will produce for it.
-
-    Single-scale combos are unaffected by combine_modes — there's only one possible state, named
-    after the combo itself. Multi-scale combos get one name per mode in combine_modes, suffixed
-    "-<mode>" (e.g. "mid+close-max", "mid+close-mean"), matching the states build_ablation_states
-    actually builds. Shared by METHOD_DISPLAY_ORDER (computed before scale_protos exists, so it
-    can only use the static combo definitions) and build_ablation_states (computed per reference
-    image, from the scales actually present) so the two never drift apart.
-    """
-    names = []
-    for combo_name, members in combos.items():
-        if len(members) == 1:
-            names.append(combo_name)
-        else:
-            names.extend(f"{combo_name}-{mode}" for mode in combine_modes)
-    return names
-
-
-# "fg-bg-mean" and "fg-bg-knn" are built separately (need background prototypes/galleries, not
-# just the scale_protos[m].prototype the combos above key off — see build_fgbg_states and
-# build_knn_fgbg_states) but share display ordering with the combos. "two-stage(<scale>)" is
-# separate again — it's the diagonal of the cross-scale matrix (that scale finds its own ROI
-# blobs *and* re-scores them), added per scale in SCALES rather than as an ABLATION_COMBOS entry
-# since it isn't a single-pass prototype method — see two_stage_predicted_clusters.
-_KMEANS_SCALE_NAMES = [f"{scale}-kmeans{k}" for scale in SCALES for k in KMEANS_KS]
-
-METHOD_DISPLAY_ORDER: list[str] = (
-    ablation_method_names(ABLATION_COMBOS, MULTI_SCALE_COMBINE)
-    + (_KMEANS_SCALE_NAMES if INCLUDE_KMEANS_METHODS else [])
-    + [f"fg-bg-mean({n})" for n, c in FGBG_SOURCE_COMBOS.items() if len(c["fg"]) == 1]
-    + [f"fg-bg-proto({n})" for n, c in FGBG_SOURCE_COMBOS.items() if len(c["fg"]) > 1]
-    + [f"fg-bg-knn({name})" for name in FGBG_SOURCE_COMBOS]
-    + (
-        [f"fg-bg-kmeans{k}({name})" for name in FGBG_SOURCE_COMBOS for k in KMEANS_KS]
-        if INCLUDE_KMEANS_METHODS
-        else []
-    )
-    + [f"two-stage({s})" for s in SCALES]
-    + [f"two-stage(fg-bg-mean({n}))" for n, c in FGBG_SOURCE_COMBOS.items() if len(c["fg"]) == 1]
-    + [f"two-stage(fg-bg-proto({n}))" for n, c in FGBG_SOURCE_COMBOS.items() if len(c["fg"]) > 1]
-    + [f"two-stage(fg-bg-knn({name}))" for name in FGBG_SOURCE_COMBOS]
-    + (
-        [f"two-stage(fg-bg-kmeans{k}({name}))" for name in FGBG_SOURCE_COMBOS for k in KMEANS_KS]
-        if INCLUDE_KMEANS_METHODS
-        else []
-    )
-)
 
 # fg-bg-knn: k for the per-patch kNN gallery lookup (see build_knn_fgbg_states / knn_fgbg_score).
 # Same idea as num_neighbours in dinoisawesome.anomaly_head.AnomalyHead, but contrastive
@@ -300,7 +254,6 @@ CLUSTER_REJECT_MARGIN_FRACTION = 0.2
 # Tune by changing PRED_DBSCAN_EPS_PATCHES (try 1, 2, 5 — see patch_radius_to_eps's docstring for
 # what each radius means in Euclidean terms).
 PRED_DBSCAN_EPS_PATCHES = 2
-PRED_DBSCAN_EPS = patch_radius_to_eps(PRED_DBSCAN_EPS_PATCHES)
 PRED_DBSCAN_MIN_SAMPLES = 2
 
 # Cross-scale similarity: ROI blobs are found (unsupervised) in a single scale's own
@@ -320,7 +273,98 @@ ROI_CROP_MODE: Literal["per_blob", "single_bbox"] = "per_blob"
 BLOB_CROP_PADDING_FRACTION = 0.2  # padding around a blob bbox, fraction of its own width/height
 MAX_UPSCALE_FACTOR = 2.0  # crop native-pixel side floor = IMG_SIZE / MAX_UPSCALE_FACTOR
 
+# --- Two-stage IoU-degradation fixes (toggleable — flip either back if it regresses) ---
+#
+# PROJECTION_MODE: how a stage-2 crop-local cluster mask gets resampled onto the query's
+# own (q_h, q_w) grid, in project_crop_mask_to_query_grid. "nearest_union" (legacy) snaps
+# each foreground crop patch's center to the nearest query cell and ORs it in — a
+# point-sample, not the area-fraction rule GT masks are built with
+# (pixel_mask_to_patch_mask), so it can over/under-cover a query cell depending on the
+# crop/query grid's relative resolution and their (generally non-aligned) offset.
+# "area_weighted" instead accumulates each foreground crop patch's real native-pixel
+# overlap area into every query cell it intersects, then thresholds with that same GT
+# rule. Revert to "nearest_union" if this regresses.
+PROJECTION_MODE: Literal["nearest_union", "area_weighted"] = "area_weighted"
+
+# TUNE_THRESHOLD_PER_SCALE: the "close" method's patch threshold (thr) and cluster-reject
+# cutoff were always tuned against the reference's "mid" crop (ref_mid), even when scoring
+# with the "close" prototype — a domain mismatch. Single-stage applies that mismatched
+# threshold uniformly to the whole query image for every method, so it doesn't bias the
+# single-stage comparison; but two-stage's stage-2 rescoring (two-stage(close)) runs on a
+# native "close" crop — exactly the domain that threshold was never actually calibrated
+# against. When True, "close" is tuned against its own representative ref crop instead.
+# Scoped only to "close": "mid" is already tuned on itself (no change), and
+# "global"/multi-scale combos/fg-bg methods have no single well-defined "own scale" to
+# tune on, so they keep the ref_mid fallback. Revert to False if this regresses.
+TUNE_THRESHOLD_PER_SCALE: bool = True
+
 SEED = 0
+
+# %% Derived parameters + run setup
+# Everything here is computed *from* the plain knobs in "Parameters" above, rather than being a
+# knob itself — kept in its own cell so that section stays literal values only.
+
+
+def ablation_method_names(
+    combos: dict[str, list[str]], combine_modes: list[Literal["max", "mean"]]
+) -> list[str]:
+    """Expand each combo into the method name(s) build_ablation_states will produce for it.
+
+    Single-scale combos are unaffected by combine_modes — there's only one possible state, named
+    after the combo itself. Multi-scale combos get one name per mode in combine_modes, suffixed
+    "-<mode>" (e.g. "mid+close-max", "mid+close-mean"), matching the states build_ablation_states
+    actually builds. Shared by METHOD_DISPLAY_ORDER (computed before scale_protos exists, so it
+    can only use the static combo definitions) and build_ablation_states (computed per reference
+    image, from the scales actually present) so the two never drift apart.
+    """
+    names = []
+    for combo_name, members in combos.items():
+        if len(members) == 1:
+            names.append(combo_name)
+        else:
+            names.extend(f"{combo_name}-{mode}" for mode in combine_modes)
+    return names
+
+
+# "fg-bg-proto" and "fg-bg-knn" are built separately (need background prototypes/galleries, not
+# just the scale_protos[m].prototype the combos above key off — see build_fgbg_multiproto_states
+# and build_knn_fgbg_states) but share display ordering with the combos. "two-stage(<scale>)" is
+# separate again — it's the diagonal of the cross-scale matrix (that scale finds its own ROI
+# blobs *and* re-scores them), added per scale in SCALES rather than as an ABLATION_COMBOS entry
+# since it isn't a single-pass prototype method — see two_stage_predicted_clusters.
+_KMEANS_SCALE_NAMES = [f"{scale}-kmeans{k}" for scale in SCALES for k in KMEANS_KS]
+
+METHOD_DISPLAY_ORDER: list[str] = (
+    ablation_method_names(ABLATION_COMBOS, MULTI_SCALE_COMBINE)
+    + (_KMEANS_SCALE_NAMES if INCLUDE_KMEANS_METHODS else [])
+    + [f"fg-bg-proto({n})" for n in FGBG_SOURCE_COMBOS]
+    + [f"fg-bg-knn({name})" for name in FGBG_SOURCE_COMBOS]
+    + (
+        [f"fg-bg-kmeans{k}({name})" for name in FGBG_SOURCE_COMBOS for k in KMEANS_KS]
+        if INCLUDE_KMEANS_METHODS
+        else []
+    )
+    + [f"two-stage({s})" for s in SCALES]
+    + [f"two-stage(fg-bg-proto({n}))" for n in FGBG_SOURCE_COMBOS]
+    + [f"two-stage(fg-bg-knn({name}))" for name in FGBG_SOURCE_COMBOS]
+    + (
+        [f"two-stage(fg-bg-kmeans{k}({name}))" for name in FGBG_SOURCE_COMBOS for k in KMEANS_KS]
+        if INCLUDE_KMEANS_METHODS
+        else []
+    )
+)
+
+# patch_radius_to_eps (imported from _shared.clustering above): DBSCAN's eps is a Euclidean
+# radius, but "n pixels away, counting diagonals" is a Chebyshev (chessboard) distance — the
+# two only agree at the block's corner. A point n pixels out on the diagonal sits at Euclidean
+# distance n*sqrt(2), the largest gap DBSCAN must bridge to treat an n-pixel step as
+# "connected". n=1 -> eps spans the immediate 8-neighborhood (matches GT_DBSCAN_EPS's own
+# ~1.4142, rounded up to 1.5). Only exact for n<=2 — at n>=3 the corner distance n*sqrt(2)
+# exceeds n+1 (the nearest excluded axis-aligned point), so eps starts leaking in points
+# beyond the intended square block; treat larger n as "bridges gaps up to n pixels", not a
+# hard radius.
+PRED_DBSCAN_EPS = patch_radius_to_eps(PRED_DBSCAN_EPS_PATCHES)
+
 torch.manual_seed(SEED)
 
 log.info(
@@ -601,15 +645,15 @@ def build_all_scale_prototypes(
 @dataclass
 class MethodState:
     name: str
-    kind: Literal["single", "multi", "fgbg", "knn_fgbg", "kmeans_fgbg"]
-    # (K, C) L2-normalised prototype(s); "fgbg" is (2, C) = [fg, bg]; None for "knn_fgbg"/
-    # "kmeans_fgbg" (both use fg_bank/bg_bank instead — see build_knn_fgbg_states/
-    # build_kmeans_fgbg_states / knn_fgbg_score / kmeans_fgbg_score).
+    kind: Literal["single", "multi", "knn_fgbg", "kmeans_fgbg"]
+    # (K, C) L2-normalised prototype(s); None for "knn_fgbg"/"kmeans_fgbg" (both use
+    # fg_bank/bg_bank instead — see build_knn_fgbg_states/build_kmeans_fgbg_states /
+    # knn_fgbg_score / kmeans_fgbg_score).
     payload: torch.Tensor | None = None
     # "knn_fgbg": (Nfg, C) raw patch gallery. "kmeans_fgbg": (k, C) k-means centroids.
     fg_bank: torch.Tensor | None = None
     # "knn_fgbg": (Nbg, C) raw patch gallery. "kmeans_fgbg": (1, C) collapsed mean bg vector
-    # (same bg side as "fgbg"/fg-bg-mean) — only the fg side is k-means for this kind.
+    # (same bg side as fg-bg-proto) — only the fg side is k-means for this kind.
     bg_bank: torch.Tensor | None = None
 
 
@@ -649,74 +693,35 @@ def build_ablation_states(
     return states
 
 
-def build_fgbg_states(
-    scale_protos: dict[str, ScalePrototype], combos: dict[str, dict[str, list[str]]]
-) -> dict[str, MethodState]:
-    """Mean-collapsed contrastive fg-bg: score = cos(query, fg) - cos(query, bg).
-
-    One MethodState per *combos* entry with a single fg scale, named
-    "fg-bg-mean(<combo_name>)" — the "-mean" makes explicit that both sides are collapsed to a
-    single mean vector, unlike the "-max"/"-mean" combine modes on multi-scale single-side
-    combos (see MULTI_SCALE_COMBINE), and unlike fg-bg-knn which never collapses. fg is the
-    L2-renormalised (here, trivially, since there's only one scale) foreground (masked-mean)
-    prototype of the named "fg" scale, and bg is the L2-renormalised average of the named "bg"
-    scales' own background prototypes (the masked mean of the *non*-mask patches within that
-    scale's own crop(s)). A scale in "bg" that only appears there (e.g. "global") contributes
-    far-field background from the rest of the reference image — without it, bg only ever sees a
-    narrow local neighborhood and fails to discriminate once the query has background content
-    outside that neighborhood.
-
-    Combos with more than one fg scale are built by build_fgbg_multiproto_states instead (kept
-    as separate prototype rows, not averaged here) — see that function. A combo is skipped (not
-    included in the returned dict) if any of its fg/bg scales was dropped for this reference
-    image (e.g. "close" below MIN_CROP_SIZE) — build_ablation_states skips combos the same way.
-    """
-    states = {}
-    for combo_name, sources in combos.items():
-        fg_scales, bg_scales = sources["fg"], sources["bg"]
-        if len(fg_scales) != 1 or not all(s in scale_protos for s in [*fg_scales, *bg_scales]):
-            continue
-        fg = F.normalize(
-            torch.cat([scale_protos[s].prototype for s in fg_scales], dim=0).mean(
-                dim=0, keepdim=True
-            ),
-            p=2,
-            dim=-1,
-        )
-        bg = F.normalize(
-            torch.cat([scale_protos[s].bg_prototype for s in bg_scales], dim=0).mean(
-                dim=0, keepdim=True
-            ),
-            p=2,
-            dim=-1,
-        )
-        payload = torch.cat([fg, bg], dim=0)  # (2, C): row 0 = fg, row 1 = bg
-        name = f"fg-bg-mean({combo_name})"
-        states[name] = MethodState(name, "fgbg", payload)
-    return states
-
-
 def build_fgbg_multiproto_states(
     scale_protos: dict[str, ScalePrototype], combos: dict[str, dict[str, list[str]]]
 ) -> dict[str, MethodState]:
-    """Multi-datasource contrastive fg-bg: one prototype row per fg scale, kept separate
-    instead of averaged into one vector like build_fgbg_states.
+    """Contrastive fg-bg: one prototype row per fg scale, kept separate rather than averaged
+    into a single mean vector.
 
     Reuses the "kmeans_fgbg" MethodState shape/scoring (fg_bank of (K, C) rows scored via
     per-patch max cosine similarity, minus a single collapsed bg vector — see
     kmeans_fgbg_score) — the mechanism is identical to build_kmeans_fgbg_states' k-means
     centroids, just fed each fg scale's own mean prototype instead of learned centroids, so a
     query patch can match whichever scale's prototype fits best rather than an average of them.
+    fg is the L2-renormalised masked-mean prototype of each named "fg" scale, kept as its own
+    row; bg is the L2-renormalised average of the named "bg" scales' own background prototypes
+    (the masked mean of the *non*-mask patches within that scale's own crop(s)). A scale in
+    "bg" that only appears there (e.g. "global") contributes far-field background from the rest
+    of the reference image — without it, bg only ever sees a narrow local neighborhood and fails
+    to discriminate once the query has background content outside that neighborhood.
 
-    One MethodState per *combos* entry with more than one fg scale, named
-    "fg-bg-proto(<combo_name>)" — a single fg scale has nothing to keep separate, so it's just
-    build_fgbg_states' "fg-bg-mean(...)". Combos are skipped the same way build_fgbg_states
-    skips them (a dropped fg/bg scale for this reference image).
+    One MethodState per *combos* entry, named "fg-bg-proto(<combo_name>)". A single-fg-scale
+    combo just produces a one-row fg_bank — the per-patch max over one row reduces to the same
+    score a mean-collapsed fg side would give, so there's no separate "mean" method for that
+    case. A combo is skipped (not included in the returned dict) if any of its fg/bg scales was
+    dropped for this reference image (e.g. "close" below MIN_CROP_SIZE) — build_ablation_states
+    skips combos the same way.
     """
     states: dict[str, MethodState] = {}
     for combo_name, sources in combos.items():
         fg_scales, bg_scales = sources["fg"], sources["bg"]
-        if len(fg_scales) < 2 or not all(s in scale_protos for s in [*fg_scales, *bg_scales]):
+        if not all(s in scale_protos for s in [*fg_scales, *bg_scales]):
             continue
         fg_protos = torch.cat([scale_protos[s].prototype for s in fg_scales], dim=0)  # (K, C)
         bg = F.normalize(
@@ -789,21 +794,23 @@ def build_kmeans_states(
 def build_knn_fgbg_states(
     scale_protos: dict[str, ScalePrototype], combos: dict[str, dict[str, list[str]]]
 ) -> dict[str, MethodState]:
-    """kNN-gallery variant of build_fgbg_states: contrastive fg-bg without collapsing to a mean.
+    """kNN-gallery variant of build_fgbg_multiproto_states: contrastive fg-bg without collapsing
+    to a mean or a per-scale prototype row.
 
-    build_fgbg_states (the "fg-bg-mean" methods) reduces each scale's masked patches down to a
-    single masked-mean vector per side (fg, bg) before ever comparing to the query. This method
-    instead keeps every individual patch token as its own gallery entry: for each *combos* entry,
-    the named "fg" scales' foreground-masked patches are pooled into one fg gallery and the named
-    "bg" scales' background-masked patches into one bg gallery, across every cluster crop. Scoring
-    (see knn_fgbg_score) then does a per-query-patch kNN lookup against each gallery rather than one
-    cosine similarity to a mean — closer in spirit to dinoisawesome.anomaly_head.AnomalyHead's
-    memory-bank matching than to a prototype method, but contrastive (fg top-k minus bg top-k)
-    instead of a pure nearest-neighbour distance.
+    build_fgbg_multiproto_states (the "fg-bg-proto" methods) reduces each fg scale's masked
+    patches down to a single masked-mean vector (kept as its own row per scale) before ever
+    comparing to the query. This method instead keeps every individual patch token as its own
+    gallery entry: for each *combos* entry, the named "fg" scales' foreground-masked patches are
+    pooled into one fg gallery and the named "bg" scales' background-masked patches into one bg
+    gallery, across every cluster crop. Scoring (see knn_fgbg_score) then does a per-query-patch
+    kNN lookup against each gallery rather than one cosine similarity to a prototype — closer in
+    spirit to dinoisawesome.anomaly_head.AnomalyHead's memory-bank matching than to a prototype
+    method, but contrastive (fg top-k minus bg top-k) instead of a pure nearest-neighbour
+    distance.
 
     One MethodState per *combos* entry, named "fg-bg-knn(<combo_name>)". A combo is skipped if
     any of its fg/bg scales was dropped for this reference image, exactly like
-    build_fgbg_states.
+    build_fgbg_multiproto_states.
     """
     states = {}
     for combo_name, sources in combos.items():
@@ -833,19 +840,19 @@ def build_kmeans_fgbg_states(
 
     build_kmeans_states' "<scale>-kmeans<k>" methods score a query patch as the max cosine
     similarity to any of k foreground centroids, with nothing pulling background patches back
-    down — unlike every other multi-vector method here (fg-bg-mean, fg-bg-knn), which
+    down — unlike every other multi-vector method here (fg-bg-proto, fg-bg-knn), which
     contrasts against a background side. This builds that missing bg term: the fg side is
     still k learned centroids (see compute_exemplar_features's kmeans mode, pooled the same
     way build_knn_fgbg_states pools its fg gallery), scored with a per-query-patch max
     (kmeans_fgbg_score) — a query patch only needs to match ONE learned appearance mode, not
     average well across all of them, so this deliberately isn't knn_fgbg_score's mean-of-top-k.
-    The bg side stays a single collapsed mean, identical to fg-bg-mean's bg — the point is
+    The bg side stays a single collapsed mean, identical to fg-bg-proto's bg — the point is
     only to give kmeans' foreground gallery a contrast term, not to redesign the bg side too.
 
     One MethodState per (combo, k) in *combos* x *ks*, named "fg-bg-kmeans<k>(<combo_name>)".
     A combo is skipped for this reference image if any of its fg/bg scales was dropped,
-    exactly like build_fgbg_states/build_knn_fgbg_states. *k* is clamped to the pooled fg
-    patch count, same as build_kmeans_states.
+    exactly like build_fgbg_multiproto_states/build_knn_fgbg_states. *k* is clamped to the
+    pooled fg patch count, same as build_kmeans_states.
     """
     states: dict[str, MethodState] = {}
     for combo_name, sources in combos.items():
@@ -888,11 +895,11 @@ def score_method(state: MethodState, query_tokens: torch.Tensor) -> np.ndarray:
     """Similarity score per query patch.
 
     "single"/"multi": cosine similarity to the state's prototype(s), max'd over multiple.
-    "fgbg": fg cosine similarity minus bg cosine similarity (contrastive, mean-based).
-    "knn_fgbg": same contrastive idea, but each side is a patch gallery scored via kNN
-    (see knn_fgbg_score) instead of a single mean vector.
-    "kmeans_fgbg": fg side is k learned centroids scored via per-patch max, bg side is a
-    single collapsed mean (see kmeans_fgbg_score).
+    "knn_fgbg": contrastive fg-bg where each side is a patch gallery scored via kNN
+    (see knn_fgbg_score) instead of a mean vector or prototype row(s).
+    "kmeans_fgbg": fg side is k learned centroids (or, for fg-bg-proto, per-scale mean
+    prototypes) scored via per-patch max, bg side is a single collapsed mean (see
+    kmeans_fgbg_score).
     """
     if state.kind == "knn_fgbg":
         assert state.fg_bank is not None and state.bg_bank is not None
@@ -904,8 +911,6 @@ def score_method(state: MethodState, query_tokens: torch.Tensor) -> np.ndarray:
     sim = query_tokens @ state.payload.T  # (N, K)
     if state.kind == "single":
         return sim.squeeze(-1).cpu().float().numpy()
-    if state.kind == "fgbg":
-        return (sim[:, 0] - sim[:, 1]).cpu().float().numpy()
     return sim.max(dim=-1).values.cpu().float().numpy()
 
 
@@ -1143,7 +1148,7 @@ def cross_score_blobs(
         scale_states,
         q_pixel_mask,
         per_method,
-        score_fn_for=lambda state: (lambda tokens: score_method(state, tokens)),
+        score_fn_for=lambda state: lambda tokens: score_method(state, tokens),
         img_size=IMG_SIZE,
         mask_patch_threshold=MASK_PATCH_THRESHOLD,
     )
@@ -1192,6 +1197,8 @@ def two_stage_predicted_clusters(
         PRED_DBSCAN_EPS,
         PRED_DBSCAN_MIN_SAMPLES,
         MIN_POINTS_FLOOR,
+        mask_patch_threshold=MASK_PATCH_THRESHOLD,
+        projection_mode=PROJECTION_MODE,
     )
     return merged
 
@@ -1204,6 +1211,7 @@ encoder = DinoEncoder(
     weights_dir=DINO_WEIGHTS_DIR,
     amp=True,
 )
+encoder = EncoderWithCache(encoder, cache_dir=DINO_ENCODING_CACHE_DIR)
 PATCH_SIZE = encoder.patch_size
 log.info(
     "DINOv%s-%s | patch_size=%d | grid=%dx%d",
@@ -1255,7 +1263,6 @@ def run_pair(part_type: str, ref_number: int, query_number: int) -> dict | None:
         )
 
     ablation_states = build_ablation_states(scale_protos, ABLATION_COMBOS, MULTI_SCALE_COMBINE)
-    ablation_states.update(build_fgbg_states(scale_protos, FGBG_SOURCE_COMBOS))
     ablation_states.update(build_fgbg_multiproto_states(scale_protos, FGBG_SOURCE_COMBOS))
     ablation_states.update(build_knn_fgbg_states(scale_protos, FGBG_SOURCE_COMBOS))
     if INCLUDE_KMEANS_METHODS:
@@ -1305,12 +1312,29 @@ def run_pair(part_type: str, ref_number: int, query_number: int) -> dict | None:
     for name, state in ablation_states.items():
         raw = score_method(state, q_tokens).reshape(q_h, q_w)
 
-        ref_raw = score_method(state, ref_mid.tokens).reshape(ref_mid.grid_h, ref_mid.grid_w)
-        thr = iou_tuned_threshold(ref_raw, ref_mid_gt_mask, REF_THRESHOLD_STEPS)
+        # TUNE_THRESHOLD_PER_SCALE: tune "close" against its own representative ref crop
+        # rather than always ref_mid (see the flag's definition in Parameters). Every other
+        # method keeps the ref_mid fallback — "mid" already tunes on itself either way, and
+        # "global"/combos/fg-bg have no single well-defined own scale to switch to.
+        if TUNE_THRESHOLD_PER_SCALE and name == "close" and "close" in scale_protos:
+            ref_scale = scale_protos["close"]
+            rx0, ry0, rx1, ry1 = ref_scale.box
+            ref_gt_mask = pixel_mask_to_patch_mask(
+                ref_pixel_mask[ry0:ry1, rx0:rx1],
+                ref_scale.grid_h,
+                ref_scale.grid_w,
+                IMG_SIZE,
+                MASK_PATCH_THRESHOLD,
+            )
+        else:
+            ref_scale, ref_gt_mask = ref_mid, ref_mid_gt_mask
 
-        assert ref_mid.cluster_crops, "mid scale is never dropped, so this can't be empty"
+        ref_raw = score_method(state, ref_scale.tokens).reshape(ref_scale.grid_h, ref_scale.grid_w)
+        thr = iou_tuned_threshold(ref_raw, ref_gt_mask, REF_THRESHOLD_STEPS)
+
+        assert ref_scale.cluster_crops, "mid/close scale is never dropped when present"
         cluster_reject_thr, ref_tuning_clusters = tune_cluster_reject_threshold(
-            ref_mid.cluster_crops,
+            ref_scale.cluster_crops,
             state,
             mean_patch_prototype,
             thr,
@@ -1444,7 +1468,7 @@ for pt in RUN_PART_TYPES:
             {"part_type": pt, "method": f"two-stage({roi_source})", **two_stage_metrics}
         )
 
-    # fg-bg-mean/fg-bg-knn/fg-bg-kmeans two-stage variants: not scale-keyed like the SCALES loop
+    # fg-bg-proto/fg-bg-knn/fg-bg-kmeans two-stage variants: not scale-keyed like the SCALES loop
     # above. ROI blobs come from the combo's first "fg" scale (the scale that state's foreground
     # side is actually built from).
     for combo_name, combo in FGBG_SOURCE_COMBOS.items():
@@ -1453,14 +1477,13 @@ for pt in RUN_PART_TYPES:
             continue  # dropped scale (e.g. "close" below MIN_CROP_SIZE)
         blobs = result["blobs_by_scale"][roi_source_scale]
         fgbg_method_names = (
-            f"fg-bg-mean({combo_name})",
             f"fg-bg-proto({combo_name})",
             f"fg-bg-knn({combo_name})",
             *(f"fg-bg-kmeans{k}({combo_name})" for k in KMEANS_KS),
         )
         for method_name in fgbg_method_names:
             if method_name not in result["ablation_states"]:
-                continue  # combo skipped for this ref image (see build_fgbg_states)
+                continue  # combo skipped for this ref image (see build_fgbg_multiproto_states)
             state = result["ablation_states"][method_name]
             method_info = result["per_method"][method_name]
             pred_clusters = two_stage_predicted_clusters(
@@ -1601,6 +1624,59 @@ ax.set_title(
 )
 plt.show()
 
+# %% Plotting helpers — mask overlay + score histogram, shared by the visualisation cells below
+
+
+def overlay_patch_mask(
+    ax: plt.Axes, mask: np.ndarray, size: tuple[int, int], color: list[float]
+) -> None:
+    """Upsample a boolean patch/pixel *mask* to *size* (PIL-style (w, h)) and tint it on *ax*."""
+    mask_up = np.array(Image.fromarray(mask.astype(np.uint8) * 255).resize(size, Image.NEAREST))
+    overlay = np.zeros((*mask_up.shape, 4), dtype=np.float32)
+    overlay[mask_up > 0] = color
+    ax.imshow(overlay)
+
+
+def plot_score_histogram(
+    ax_false: plt.Axes,
+    raw: np.ndarray,
+    gt_mask: np.ndarray,
+    threshold: float,
+    title: str,
+    *,
+    title_fontsize: int = 9,
+    tick_labelsize: float | None = None,
+    show_ylabels: bool = True,
+    show_legend: bool = True,
+    legend_fontsize: int = 8,
+) -> None:
+    """GT-true/GT-false score histogram for one raw score map, on a shared x-axis.
+
+    GT-false patches vastly outnumber GT-true ones (background vs. object), so GT-true gets its
+    own right-hand y-axis via ``twinx()`` — on a shared axis its bars would be invisible.
+    """
+    true_vals, false_vals = raw[gt_mask], raw[~gt_mask]
+    bins = np.linspace(raw.min(), raw.max(), 40)
+    ax_true = ax_false.twinx()
+    h_false = ax_false.hist(false_vals, bins=bins, alpha=0.6, color="tab:gray", label="GT-false")
+    h_true = ax_true.hist(true_vals, bins=bins, alpha=0.6, color="tab:red", label="GT-true")
+    ax_false.set_yscale("log")
+    tick_kwargs = {"labelsize": tick_labelsize} if tick_labelsize is not None else {}
+    ax_false.tick_params(axis="y", labelcolor="tab:gray", **tick_kwargs)
+    ax_true.tick_params(axis="y", labelcolor="tab:red", **tick_kwargs)
+    if show_ylabels:
+        ax_false.set_ylabel("GT-false count (log)", color="tab:gray", fontsize=8)
+        ax_true.set_ylabel("GT-true count", color="tab:red", fontsize=8)
+    thr_line = ax_false.axvline(threshold, color="black", linestyle="--", linewidth=1.5)
+    ax_false.set_title(title, fontsize=title_fontsize)
+    if show_legend:
+        ax_false.legend(
+            [h_false[2][0], h_true[2][0], thr_line],
+            ["GT-false", "GT-true", "threshold"],
+            fontsize=legend_fontsize,
+        )
+
+
 # %% [markdown]
 # ## Exemplar multi-scale crop overview (`FOCUS_PART_TYPE`)
 # The reference image with its GT mask and every scale's crop box overlaid, then a grid of every
@@ -1628,17 +1704,7 @@ def _crop_cells(proto: ScalePrototype) -> list[ClusterCrop | ScalePrototype]:
 fig, ax = plt.subplots(figsize=(7, 7), constrained_layout=True)
 disp_ref = np.array(focus["ref_img"])
 ax.imshow(disp_ref)
-ref_mask_disp = (
-    np.array(
-        Image.fromarray(focus["ref_pixel_mask"].astype(np.uint8) * 255).resize(
-            focus["ref_img"].size, Image.NEAREST
-        )
-    )
-    > 0
-)
-ov = np.zeros((*ref_mask_disp.shape, 4), dtype=np.float32)
-ov[ref_mask_disp] = [0.2, 0.9, 0.2, 0.4]
-ax.imshow(ov)
+overlay_patch_mask(ax, focus["ref_pixel_mask"], focus["ref_img"].size, [0.2, 0.9, 0.2, 0.4])
 for scale in present_scales:
     cells = _crop_cells(focus_scale_protos[scale])
     for i, cell in enumerate(cells):
@@ -1681,17 +1747,9 @@ for row, scale in enumerate(present_scales):
         cell = cells[col]
         crop_arr = np.array(cell.crop_img)
         ax.imshow(crop_arr)
-        mask_up = (
-            np.array(
-                Image.fromarray(cell.patch_mask.astype(np.uint8) * 255).resize(
-                    (crop_arr.shape[1], crop_arr.shape[0]), Image.NEAREST
-                )
-            )
-            > 0
-        )
-        ov2 = np.zeros((*mask_up.shape, 4), dtype=np.float32)
-        ov2[mask_up] = [0.9, 0.2, 0.2, 0.4]  # this cluster's own mask (fg -> prototype)
-        ax.imshow(ov2)
+        crop_size = (crop_arr.shape[1], crop_arr.shape[0])
+        # this cluster's own mask (fg -> prototype)
+        overlay_patch_mask(ax, cell.patch_mask, crop_size, [0.9, 0.2, 0.2, 0.4])
 
         x0, y0, x1, y1 = cell.box
         # Other instances' fg that happen to fall inside *this* cluster's own crop box.
@@ -1705,17 +1763,8 @@ for row, scale in enumerate(present_scales):
             secondary_patch_mask = cell.exclude_patch_mask & ~cell.patch_mask
             n_secondary = int(secondary_patch_mask.sum())
             if n_secondary:
-                sec_up = (
-                    np.array(
-                        Image.fromarray(secondary_patch_mask.astype(np.uint8) * 255).resize(
-                            (crop_arr.shape[1], crop_arr.shape[0]), Image.NEAREST
-                        )
-                    )
-                    > 0
-                )
-                ov3 = np.zeros((*sec_up.shape, 4), dtype=np.float32)
-                ov3[sec_up] = [1.0, 0.85, 0.0, 0.45]  # other instances' fg, excluded from bg
-                ax.imshow(ov3)
+                # other instances' fg, excluded from bg
+                overlay_patch_mask(ax, secondary_patch_mask, crop_size, [1.0, 0.85, 0.0, 0.45])
 
         title = f"scale={scale}"
         if isinstance(cell, ClusterCrop):
@@ -1805,28 +1854,14 @@ for row, name in enumerate(methods_present):
     )
     axes[row, 3].axis("off")
 
-    true_vals = raw_np[focus["gt_patch_mask"]]
-    false_vals = raw_np[~focus["gt_patch_mask"]]
-    bins = np.linspace(raw_np.min(), raw_np.max(), 40)
-
-    # GT-false patches vastly outnumber GT-true ones (background vs. object), so GT-true
-    # gets its own right-hand y-axis/scale — on a shared axis its bars would be invisible.
-    ax_false = axes[row, 4]
-    ax_true = ax_false.twinx()
-    h_false = ax_false.hist(false_vals, bins=bins, alpha=0.6, color="tab:gray", label="GT-false")
-    h_true = ax_true.hist(true_vals, bins=bins, alpha=0.6, color="tab:red", label="GT-true")
-    ax_false.set_yscale("log")
-    ax_false.set_ylabel("GT-false count (log)", color="tab:gray", fontsize=8)
-    ax_true.set_ylabel("GT-true count", color="tab:red", fontsize=8)
-    ax_false.tick_params(axis="y", labelcolor="tab:gray")
-    ax_true.tick_params(axis="y", labelcolor="tab:red")
-    thr_line = ax_false.axvline(
-        m["threshold"], color="black", linestyle="--", linewidth=1.5, label="threshold"
+    plot_score_histogram(
+        axes[row, 4],
+        raw_np,
+        focus["gt_patch_mask"],
+        m["threshold"],
+        f"[{name}] score histogram (thr={m['threshold']:.3f})",
+        title_fontsize=10,
     )
-    ax_false.set_title(f"[{name}] score histogram (thr={m['threshold']:.3f})", fontsize=10)
-    handles = [h_false[2][0], h_true[2][0], thr_line]
-    labels = ["GT-false", "GT-true", "threshold"]
-    ax_false.legend(handles, labels, fontsize=8)
 
     # Mean-patch reject is disregarded in this view only — shows every raw DBSCAN cluster
     # (m["clusters"]), not m["kept_clusters"]; the real pipeline (run_pair, cluster_reject_thr,
@@ -1864,7 +1899,7 @@ plt.show()
 # crop is exclude_patch_mask (union of every instance's mask within that crop) — the same "don't
 # hide neighbouring instances" mask ClusterCrop already carries.
 # prototype_to_use = "fg-bg-knn(mid/all)"
-prototype_to_use = "fg-bg-mean(mid/all)"
+prototype_to_use = "fg-bg-proto(global+mid+close/all)"
 mid_state = focus["ablation_states"][prototype_to_use]
 
 mid_clusters = focus_scale_protos["mid"].cluster_crops
@@ -1912,15 +1947,7 @@ if n_rows == 1:
 
 for row, (cc, raw_i, gt_i) in enumerate(zip(mid_clusters, per_crop_raw, per_crop_gt)):
     axes[row, 0].imshow(np.array(cc.crop_img))
-    mask_up_i = (
-        np.array(
-            Image.fromarray(gt_i.astype(np.uint8) * 255).resize(cc.crop_img.size, Image.NEAREST)
-        )
-        > 0
-    )
-    ov_i = np.zeros((*mask_up_i.shape, 4), dtype=np.float32)
-    ov_i[mask_up_i] = [0.2, 0.9, 0.2, 0.4]
-    axes[row, 0].imshow(ov_i)
+    overlay_patch_mask(axes[row, 0], gt_i, cc.crop_img.size, [0.2, 0.9, 0.2, 0.4])
     axes[row, 0].set_title(
         f"cluster {cc.cluster_idx} mid crop + GT ({int(gt_i.sum())}/{gt_i.size} patches)",
         fontsize=9,
@@ -1942,23 +1969,14 @@ for row, (cc, raw_i, gt_i) in enumerate(zip(mid_clusters, per_crop_raw, per_crop
     )
     axes[row, 2].axis("off")
 
-    true_vals_i, false_vals_i = raw_i[gt_i], raw_i[~gt_i]
-    bins_i = np.linspace(raw_i.min(), raw_i.max(), 40)
-    ax_false_i = axes[row, 3]
-    ax_true_i = ax_false_i.twinx()
-    h_false_i = ax_false_i.hist(
-        false_vals_i, bins=bins_i, alpha=0.6, color="tab:gray", label="GT-false"
-    )
-    h_true_i = ax_true_i.hist(true_vals_i, bins=bins_i, alpha=0.6, color="tab:red", label="GT-true")
-    ax_false_i.set_yscale("log")
-    ax_false_i.tick_params(axis="y", labelcolor="tab:gray")
-    ax_true_i.tick_params(axis="y", labelcolor="tab:red")
-    thr_line_i = ax_false_i.axvline(pooled_thr, color="black", linestyle="--", linewidth=1.5)
-    ax_false_i.set_title(f"cluster {cc.cluster_idx} score histogram", fontsize=9)
-    ax_false_i.legend(
-        [h_false_i[2][0], h_true_i[2][0], thr_line_i],
-        ["GT-false", "GT-true", "threshold"],
-        fontsize=7,
+    plot_score_histogram(
+        axes[row, 3],
+        raw_i,
+        gt_i,
+        pooled_thr,
+        f"cluster {cc.cluster_idx} score histogram",
+        show_ylabels=False,
+        legend_fontsize=7,
     )
 
 plt.suptitle(
@@ -1970,26 +1988,13 @@ plt.show()
 # %% Visualisation — pooled accumulation histogram + IoU-vs-threshold curve, all mid crops
 fig, axes = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
 
-pooled_true, pooled_false = pooled_raw[pooled_gt], pooled_raw[~pooled_gt]
-pooled_bins = np.linspace(pooled_raw.min(), pooled_raw.max(), 40)
-ax_false = axes[0]
-ax_true = ax_false.twinx()
-h_false = ax_false.hist(
-    pooled_false, bins=pooled_bins, alpha=0.6, color="tab:gray", label="GT-false"
-)
-h_true = ax_true.hist(pooled_true, bins=pooled_bins, alpha=0.6, color="tab:red", label="GT-true")
-ax_false.set_yscale("log")
-ax_false.set_ylabel("GT-false count (log)", color="tab:gray", fontsize=8)
-ax_true.set_ylabel("GT-true count", color="tab:red", fontsize=8)
-ax_false.tick_params(axis="y", labelcolor="tab:gray")
-ax_true.tick_params(axis="y", labelcolor="tab:red")
-thr_line = ax_false.axvline(pooled_thr, color="black", linestyle="--", linewidth=1.5)
-ax_false.set_title(
+plot_score_histogram(
+    axes[0],
+    pooled_raw,
+    pooled_gt,
+    pooled_thr,
     f"pooled score histogram, all {len(mid_clusters)} mid crops (thr={pooled_thr:.3f})",
-    fontsize=10,
-)
-ax_false.legend(
-    [h_false[2][0], h_true[2][0], thr_line], ["GT-false", "GT-true", "threshold"], fontsize=8
+    title_fontsize=10,
 )
 
 axes[1].plot(pooled_candidates, pooled_ious, color="steelblue", label="IoU(threshold)")
@@ -2084,17 +2089,7 @@ for row, (crop_idx, crop_clusters) in enumerate(tuning_by_crop.items()):
     crop_gt_mask = crop_clusters[0]["crop_gt_mask"]
     ax = axes[row]
     ax.imshow(np.array(crop_img))
-    mask_up = (
-        np.array(
-            Image.fromarray(crop_gt_mask.astype(np.uint8) * 255).resize(
-                crop_img.size, Image.NEAREST
-            )
-        )
-        > 0
-    )
-    ov = np.zeros((*mask_up.shape, 4), dtype=np.float32)
-    ov[mask_up] = [0.2, 0.9, 0.2, 0.4]
-    ax.imshow(ov)
+    overlay_patch_mask(ax, crop_gt_mask, crop_img.size, [0.2, 0.9, 0.2, 0.4])
     for cl in crop_clusters:
         ys_c, xs_c = np.where(cl["mask"])
         grid_h, grid_w = cl["mask"].shape
@@ -2321,26 +2316,17 @@ def plot_crop_breakdown(
         )
         axes[row, 4].axis("off")
 
-        true_vals = crop_raw[crop_gt_mask]
-        false_vals = crop_raw[~crop_gt_mask]
-        bins = np.linspace(crop_raw.min(), crop_raw.max(), 40)
-        ax_false = axes[row, 5]
-        ax_true = ax_false.twinx()
-        h_false = ax_false.hist(
-            false_vals, bins=bins, alpha=0.6, color="tab:gray", label="GT-false"
+        plot_score_histogram(
+            axes[row, 5],
+            crop_raw,
+            crop_gt_mask,
+            threshold,
+            f"score histogram (thr={threshold:.3f})",
+            tick_labelsize=7,
+            show_ylabels=False,
+            show_legend=(row == 0),
+            legend_fontsize=7,
         )
-        h_true = ax_true.hist(true_vals, bins=bins, alpha=0.6, color="tab:red", label="GT-true")
-        ax_false.set_yscale("log")
-        ax_false.tick_params(axis="y", labelcolor="tab:gray", labelsize=7)
-        ax_true.tick_params(axis="y", labelcolor="tab:red", labelsize=7)
-        thr_line = ax_false.axvline(threshold, color="black", linestyle="--", linewidth=1.5)
-        ax_false.set_title(f"score histogram (thr={threshold:.3f})", fontsize=9)
-        if row == 0:
-            ax_false.legend(
-                [h_false[2][0], h_true[2][0], thr_line],
-                ["GT-false", "GT-true", "threshold"],
-                fontsize=7,
-            )
 
         mp_scores = np.array([cl["mean_patch_score"] for cl in crop_pred_clusters])
         mp_rejected = np.array([cl["rejected"] for cl in crop_pred_clusters])
@@ -2439,7 +2425,17 @@ for blob in mid_blobs:
         if cl["rejected"]:
             continue
         projected = project_crop_mask_to_query_grid(
-            cl["mask"], blob["px_bbox"], c_h, c_w, q_h, q_w, PATCH_SIZE, scale_x, scale_y
+            cl["mask"],
+            blob["px_bbox"],
+            c_h,
+            c_w,
+            q_h,
+            q_w,
+            PATCH_SIZE,
+            scale_x,
+            scale_y,
+            mode=PROJECTION_MODE,
+            area_threshold=MASK_PATCH_THRESHOLD,
         )
         if not projected.any():
             continue
@@ -2521,5 +2517,358 @@ ax.set_title(
 ax.axis("off")
 plt.show()
 
+# %% [markdown]
+# ## One-stage DBSCAN clustering deep-dive (`FOCUS_PART_TYPE`)
+# Mirrors the two-stage deep-dive above, but for the *one-stage* pipeline: `prototype_to_use`
+# scores the full query once (no ROI/crop step), thresholds, then DBSCAN clusters straight on
+# the full-image patch grid — exactly what `per_method[prototype_to_use]` already computed in
+# `run_pair`. The two-stage sections above hand DBSCAN a small, native-resolution, re-encoded
+# crop per instance; here DBSCAN has to separate instances directly on the coarse full-image
+# score map, which is the harder case and the one worth diagnosing.
+#
+# The "Detailed per-method breakdown" grid above already shows this method's raw map / binary /
+# clusters / histogram in one row. This section goes deeper on the clustering step specifically:
+#
+# 1. **k-distance plot** — the standard way to sanity-check DBSCAN's `eps`: sort every
+#    foreground point's distance to its `min_samples`-th nearest neighbor and look for the
+#    "knee". Compares that knee against the actually-configured `PRED_DBSCAN_EPS`.
+# 2. **predicted vs. GT cluster assignment**, side by side, with an explicit merge/split
+#    diagnosis (a predicted cluster spanning >1 GT instance = merge; a GT instance covered by
+#    >1 predicted cluster = split) plus raw DBSCAN noise points (foreground patches DBSCAN
+#    couldn't assign to any cluster at all).
+# 3. **gap distances** — nearest-patch distance between every pair of GT instances (is `eps`
+#    already bigger than the real gap between two separate parts, so merging is baked in
+#    regardless of score quality?) and the largest internal gap *within* each GT instance's own
+#    predicted foreground (is the score map dropping patches in the middle of one object, large
+#    enough to fragment it even though it's a single part?).
+# 4. **eps / min_samples sweep** — recompute DBSCAN at a grid of parameter values (holding the
+#    threshold fixed) and plot P/R/F1/mIoU/cluster-count vs. each parameter, to see whether the
+#    configured operating point sits in a stable region or right on a merge/split cliff.
+
+# %% One-stage deep-dive — setup: reuse prototype_to_use's already-computed full-query pass
+one_stage_state = focus["ablation_states"][prototype_to_use]
+one_stage_method = focus["per_method"][prototype_to_use]
+one_stage_raw = one_stage_method["raw"]
+one_stage_thr = one_stage_method["threshold"]
+one_stage_binary = one_stage_method["binary"]
+# Size-filtered, reject-annotated DBSCAN clusters (mean_patch_score/rejected) — same clusters
+# match_and_score used for this method's P/R/F1 in the summary table above.
+one_stage_clusters = one_stage_method["clusters"]
+one_stage_gt_clusters = focus["gt_clusters"]
+
+ys_fg, xs_fg = np.where(one_stage_binary)
+fg_coords = np.stack([xs_fg, ys_fg], axis=1).astype(float)
+
+log.info(
+    "[%s] one-stage deep-dive: method=%s thr=%.3f foreground_patches=%d/%d pred_clusters=%d "
+    "(kept=%d) gt_clusters=%d eps=%.3f min_samples=%d min_cs=%d",
+    FOCUS_PART_TYPE,
+    prototype_to_use,
+    one_stage_thr,
+    len(xs_fg),
+    one_stage_binary.size,
+    len(one_stage_clusters),
+    sum(not c["rejected"] for c in one_stage_clusters),
+    len(one_stage_gt_clusters),
+    PRED_DBSCAN_EPS,
+    PRED_DBSCAN_MIN_SAMPLES,
+    focus["min_cs"],
+)
+
+# %% Visualisation — k-distance plot (eps sanity check)
+_kdist_k = PRED_DBSCAN_MIN_SAMPLES
+fig, ax = plt.subplots(figsize=(7, 5), constrained_layout=True)
+if len(fg_coords) > _kdist_k:
+    _nn = NearestNeighbors(n_neighbors=_kdist_k).fit(fg_coords)
+    _dists, _ = _nn.kneighbors(fg_coords)
+    kth_dist_sorted = np.sort(_dists[:, -1])
+    ax.plot(kth_dist_sorted, color="steelblue")
+    ax.axhline(
+        PRED_DBSCAN_EPS,
+        color="red",
+        linestyle="--",
+        label=f"PRED_DBSCAN_EPS={PRED_DBSCAN_EPS:.3f}",
+    )
+    ax.set_xlabel("foreground points, sorted by k-NN distance")
+    ax.set_ylabel(f"distance to {_kdist_k}-th nearest neighbor")
+    ax.legend(fontsize=8)
+else:
+    ax.text(0.5, 0.5, "too few foreground points", ha="center", va="center")
+ax.set_title(
+    f"k-distance plot (k={_kdist_k}) — {prototype_to_use} | part_type={FOCUS_PART_TYPE}\n"
+    "look for the 'knee' — eps well past it means far-apart points get bridged anyway",
+    fontsize=10,
+)
+plt.show()
+
+# %% One-stage deep-dive — merge/split diagnosis against GT instances
+pred_overlap = [
+    [int((cl["mask"] & gt["mask"]).sum()) for gt in one_stage_gt_clusters]
+    for cl in one_stage_clusters
+]
+gt_frag_counts = [0] * len(one_stage_gt_clusters)
+merged_preds: list[tuple[dict, list[int]]] = []
+for cl, overlaps in zip(one_stage_clusters, pred_overlap):
+    hit_gts = [j for j, n in enumerate(overlaps) if n > 0]
+    for j in hit_gts:
+        gt_frag_counts[j] += 1
+    if len(hit_gts) > 1:
+        merged_preds.append((cl, hit_gts))
+    log.info(
+        "  pred cluster size=%d score=%.3f mean_patch=%.3f rejected=%s -> overlaps GT %s%s",
+        int(cl["mask"].sum()),
+        cl["score"],
+        cl["mean_patch_score"],
+        cl["rejected"],
+        hit_gts if hit_gts else "none",
+        "  <-- MERGE (spans >1 GT instance)" if len(hit_gts) > 1 else "",
+    )
+
+split_gts = [j for j, n in enumerate(gt_frag_counts) if n > 1]
+missed_gts = [j for j, n in enumerate(gt_frag_counts) if n == 0]
+log.info(
+    "[%s] merge/split summary: %d/%d pred clusters merge >=2 GT instances | "
+    "%d/%d GT instances split across >=2 pred clusters %s | "
+    "%d/%d GT instances have zero overlapping pred cluster %s",
+    FOCUS_PART_TYPE,
+    len(merged_preds),
+    len(one_stage_clusters),
+    len(split_gts),
+    len(one_stage_gt_clusters),
+    split_gts,
+    len(missed_gts),
+    len(one_stage_gt_clusters),
+    missed_gts,
+)
+
+# %% Visualisation — predicted vs. GT cluster assignment, plus raw DBSCAN noise points
+sk_labels = (
+    SKDBSCAN(eps=PRED_DBSCAN_EPS, min_samples=PRED_DBSCAN_MIN_SAMPLES).fit_predict(fg_coords)
+    if len(fg_coords)
+    else np.array([])
+)
+n_noise = int((sk_labels == -1).sum()) if len(sk_labels) else 0
+n_raw_clusters = len(set(sk_labels.tolist()) - {-1}) if len(sk_labels) else 0
+
+fig, axes = plt.subplots(1, 3, figsize=(19, 6), constrained_layout=True)
+
+axes[0].imshow(disp_q)
+for i, cl in enumerate(one_stage_clusters):
+    ys_c, xs_c = np.where(cl["mask"])
+    px_x, px_y = patch_centers_to_px(xs_c, ys_c)
+    n_hit = sum(1 for n in pred_overlap[i] if n > 0)
+    marker = "x" if cl["rejected"] else "o"
+    edge = "red" if n_hit > 1 else "none"
+    axes[0].scatter(
+        px_x,
+        px_y,
+        s=16,
+        color=CMAP(i % 10),
+        marker=marker,
+        edgecolors=edge,
+        linewidths=1.2 if edge != "none" else 0,
+    )
+axes[0].set_title(
+    f"predicted DBSCAN clusters ({len(one_stage_clusters)})\n"
+    "x=mean-patch-rejected, red ring=spans >1 GT instance",
+    fontsize=9,
+)
+axes[0].axis("off")
+
+axes[1].imshow(disp_q)
+for j, gt in enumerate(one_stage_gt_clusters):
+    ys_c, xs_c = np.where(gt["mask"])
+    px_x, px_y = patch_centers_to_px(xs_c, ys_c)
+    edge = "red" if gt_frag_counts[j] > 1 else ("orange" if gt_frag_counts[j] == 0 else "none")
+    axes[1].scatter(
+        px_x,
+        px_y,
+        s=16,
+        color=CMAP(j % 10),
+        edgecolors=edge,
+        linewidths=1.2 if edge != "none" else 0,
+    )
+axes[1].set_title(
+    f"GT-DBSCAN instances ({len(one_stage_gt_clusters)})\n"
+    "red ring=split across >1 pred cluster, orange ring=zero pred overlap",
+    fontsize=9,
+)
+axes[1].axis("off")
+
+axes[2].imshow(disp_q)
+_noise_sel = sk_labels == -1
+if _noise_sel.any():
+    px_x, px_y = patch_centers_to_px(xs_fg[_noise_sel], ys_fg[_noise_sel])
+    axes[2].scatter(px_x, px_y, s=20, color="black", marker="x", label="DBSCAN noise")
+_core_sel = ~_noise_sel
+if _core_sel.any():
+    px_x, px_y = patch_centers_to_px(xs_fg[_core_sel], ys_fg[_core_sel])
+    axes[2].scatter(px_x, px_y, s=10, color="steelblue", alpha=0.5, label="clustered")
+axes[2].legend(fontsize=8)
+axes[2].set_title(
+    f"raw DBSCAN labels, before size filter ({n_raw_clusters} clusters)\n"
+    f"{n_noise}/{len(xs_fg)} foreground patches are noise (too isolated to join any cluster)",
+    fontsize=9,
+)
+axes[2].axis("off")
+
+plt.suptitle(
+    f"One-stage clustering diagnosis — {prototype_to_use} | part_type={FOCUS_PART_TYPE}",
+    fontsize=12,
+)
+plt.show()
+
+# %% Visualisation — nearest-patch gap between every pair of GT instances
+# If two real instances sit closer together (in patch-grid distance) than eps, DBSCAN merges
+# them into one cluster no matter how clean the score map is — this isolates that failure mode
+# from scoring/thresholding noise by measuring the GT masks directly, not the prediction.
+if len(one_stage_gt_clusters) >= 2:
+    gt_coords_list = []
+    for gt in one_stage_gt_clusters:
+        ys_g, xs_g = np.where(gt["mask"])
+        gt_coords_list.append(np.stack([xs_g, ys_g], axis=1).astype(float))
+
+    cross_gaps = []
+    for i in range(len(gt_coords_list)):
+        for j in range(i + 1, len(gt_coords_list)):
+            cross_gaps.append(float(cdist(gt_coords_list[i], gt_coords_list[j]).min()))
+
+    n_at_risk = sum(g <= PRED_DBSCAN_EPS for g in cross_gaps)
+    fig, ax = plt.subplots(figsize=(7, 4.5), constrained_layout=True)
+    ax.hist(cross_gaps, bins=min(15, max(3, len(cross_gaps))), color="tab:purple", alpha=0.7)
+    ax.axvline(
+        PRED_DBSCAN_EPS,
+        color="red",
+        linestyle="--",
+        label=f"PRED_DBSCAN_EPS={PRED_DBSCAN_EPS:.3f}",
+    )
+    ax.set_xlabel("min patch-grid distance between the two GT instances")
+    ax.legend(fontsize=8)
+    ax.set_title(
+        f"nearest-patch gap between every GT instance pair ({len(cross_gaps)} pairs)\n"
+        f"{n_at_risk}/{len(cross_gaps)} pairs closer than eps -> merge risk on a perfect mask too",
+        fontsize=9,
+    )
+    plt.show()
+    log.info(
+        "[%s] GT instance-pair gaps: %s (eps=%.3f, %d/%d pairs at/under eps)",
+        FOCUS_PART_TYPE,
+        [round(g, 2) for g in cross_gaps],
+        PRED_DBSCAN_EPS,
+        n_at_risk,
+        len(cross_gaps),
+    )
+else:
+    log.info(
+        "[%s] fewer than 2 GT instances — skipping inter-instance gap analysis", FOCUS_PART_TYPE
+    )
+
+# %% One-stage deep-dive — within-instance foreground gaps (why one true instance might fragment)
+# For each GT instance, look at *predicted* foreground patches (post-threshold) that fall inside
+# its own GT mask, and find the largest internal nearest-neighbor gap among them. If that gap
+# exceeds eps, DBSCAN necessarily splits that instance into >=2 clusters even though it is a
+# single object, because the score map missed patches somewhere in the middle of it.
+for j, gt in enumerate(one_stage_gt_clusters):
+    inside = one_stage_binary & gt["mask"]
+    ys_in, xs_in = np.where(inside)
+    if len(xs_in) < 2:
+        log.info(
+            "  GT instance %d: only %d foreground patch(es) inside its own mask — too sparse "
+            "to assess (likely a recall miss, not a clustering split)",
+            j,
+            len(xs_in),
+        )
+        continue
+    coords_in = np.stack([xs_in, ys_in], axis=1).astype(float)
+    _nn_in = NearestNeighbors(n_neighbors=2).fit(coords_in)
+    _dists_in, _ = _nn_in.kneighbors(coords_in)
+    max_gap = float(_dists_in[:, 1].max())
+    log.info(
+        "  GT instance %d: %d/%d patches thresholded as foreground, max internal NN gap=%.3f "
+        "(%s eps=%.3f)",
+        j,
+        len(xs_in),
+        int(gt["mask"].sum()),
+        max_gap,
+        "EXCEEDS" if max_gap > PRED_DBSCAN_EPS else "within",
+        PRED_DBSCAN_EPS,
+    )
+
+# %% One-stage deep-dive — eps / min_samples sweep against P/R/F1/mIoU
+# Holds the threshold fixed (only the DBSCAN geometry parameters vary) and skips the mean-patch
+# reject step — isolates what eps/min_samples alone do to clustering quality, independent of the
+# separate reject-threshold tuning.
+EPS_SWEEP_PATCHES = [1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+MIN_SAMPLES_SWEEP = [1, 2, 3, 4, 6]
+
+
+def _sweep_metrics(eps: float, min_samples: int) -> dict:
+    if len(xs_fg) < max(MIN_POINTS_FLOOR, focus["min_cs"]):
+        clusters: list[dict] = []
+    else:
+        clusters = dbscan_clusters(
+            xs_fg, ys_fg, q_h, q_w, one_stage_raw, focus["min_cs"], eps=eps, min_samples=min_samples
+        )
+    m = match_and_score(clusters, one_stage_gt_clusters, IOU_MATCH_THRESHOLD)
+    return {"eps": eps, "min_samples": min_samples, "n_clusters": len(clusters), **m}
+
+
+eps_sweep_df = pd.DataFrame(
+    [_sweep_metrics(patch_radius_to_eps(r), PRED_DBSCAN_MIN_SAMPLES) for r in EPS_SWEEP_PATCHES]
+)
+log.info(
+    "[%s] eps sweep (min_samples=%d fixed):\n%s",
+    FOCUS_PART_TYPE,
+    PRED_DBSCAN_MIN_SAMPLES,
+    eps_sweep_df.to_string(index=False),
+)
+
+ms_sweep_df = pd.DataFrame([_sweep_metrics(PRED_DBSCAN_EPS, ms) for ms in MIN_SAMPLES_SWEEP])
+log.info(
+    "[%s] min_samples sweep (eps=%.3f fixed):\n%s",
+    FOCUS_PART_TYPE,
+    PRED_DBSCAN_EPS,
+    ms_sweep_df.to_string(index=False),
+)
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
+
+for ax, sweep_df, x_col, current_val, title in (
+    (
+        axes[0],
+        eps_sweep_df,
+        "eps",
+        PRED_DBSCAN_EPS,
+        f"eps sweep (min_samples={PRED_DBSCAN_MIN_SAMPLES} fixed)",
+    ),
+    (
+        axes[1],
+        ms_sweep_df,
+        "min_samples",
+        PRED_DBSCAN_MIN_SAMPLES,
+        f"min_samples sweep (eps={PRED_DBSCAN_EPS:.3f} fixed)",
+    ),
+):
+    for col, style in (("precision", "o-"), ("recall", "o-"), ("f1", "o-"), ("mean_iou", "o-")):
+        ax.plot(sweep_df[x_col], sweep_df[col], style, label=col)
+    ax_n = ax.twinx()
+    ax_n.plot(sweep_df[x_col], sweep_df["n_clusters"], "s:", color="gray", label="n_clusters")
+    ax_n.axhline(
+        len(one_stage_gt_clusters), color="black", linestyle="--", linewidth=1, label="n_GT"
+    )
+    ax.axvline(current_val, color="red", linestyle="--", linewidth=1)
+    ax.set_xlabel(x_col)
+    ax.set_ylim(0, 1.05)
+    ax.set_title(title, fontsize=10)
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax_n.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc="center right")
+
+plt.suptitle(
+    f"DBSCAN parameter sensitivity — {prototype_to_use} | part_type={FOCUS_PART_TYPE}\n"
+    "red dashed line = currently configured value",
+    fontsize=12,
+)
+plt.show()
 
 # %%

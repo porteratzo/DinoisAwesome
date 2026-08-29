@@ -27,11 +27,18 @@ Usage:
     python run_experiments.py --part-types RHa --limit-pairs 1   # smoke test
     python run_experiments.py --methods global mid close mid-kmeans3
     python run_experiments.py --include-kmeans                   # also run the k-means families
+    python run_experiments.py --include-classifiers               # also run svm/linear-probe
     python run_experiments.py --force                            # ignore existing cache
+    python run_experiments.py --resolution 768                   # override CropConfig.img_size
+    python run_experiments.py --model base                       # override CropConfig.dino_size
+    python run_experiments.py --bg-enrich-crops 5                 # Phase 1 bg enrichment
+    python run_experiments.py --fg-clean step1                    # Phase 2 fg/bg cleaning
+    python run_experiments.py --offset 0.05                        # shift similarity thresholds
 
-k-means methods (``<scale>-kmeans<k>``, ``fg-bg-kmeans<k>(...)``) consistently underperform
-the mean/proto/knn families (see ``methods.py``), so they're skipped by default; pass
-``--include-kmeans`` to run them too, or name one explicitly via ``--methods``.
+k-means methods (``<scale>-kmeans<k>``, ``fg-bg-kmeans<k>(...)``) and the classifier methods
+(``linear-probe(...)``, ``svm(...)``) consistently underperform the mean/proto/knn families
+(see ``methods.py``), so they're skipped by default; pass ``--include-kmeans``/
+``--include-classifiers`` to run them too, or name one explicitly via ``--methods``.
 """
 
 # Logging — must be before torch import
@@ -45,6 +52,7 @@ logging.basicConfig(
 log = logging.getLogger("run_experiments")
 
 import argparse
+import dataclasses
 import os
 import pickle
 import time
@@ -52,6 +60,7 @@ import traceback
 
 import numpy as np
 import torch
+from cleaning import apply_fg_cleaning
 from common import (
     DATA_DIR,
     DEFAULT_CROP_CONFIG,
@@ -72,8 +81,8 @@ from engine import (
     build_all_scale_prototypes,
     cross_score_blobs,
     dbscan_clusters,
-    dbscan_clusters_from_mask,
     find_roi_blobs,
+    gt_instance_patch_masks,
     gt_instance_patch_sizes,
     iou_tuned_threshold,
     match_and_score,
@@ -105,16 +114,69 @@ def _parse_args() -> argparse.Namespace:
         "--methods",
         nargs="+",
         default=None,
-        # include_kmeans=True here just so the (default-off) k-means names remain valid
-        # --methods choices; whether they're actually built by default is controlled by
-        # --include-kmeans / build_method_states, not by this list.
+        # include_kmeans=True/include_classifiers=True here just so the (default-off)
+        # k-means/linear-probe/svm names remain valid --methods choices; whether they're
+        # actually built by default is controlled by --include-kmeans/--include-classifiers
+        # / build_method_states, not by this list.
         choices=all_method_names(
-            list(DEFAULT_CROP_CONFIG.scales), DEFAULT_SCORING_CONFIG.kmeans_ks, include_kmeans=True
+            list(DEFAULT_CROP_CONFIG.scales),
+            DEFAULT_SCORING_CONFIG.kmeans_ks,
+            include_kmeans=True,
+            include_classifiers=True,
         ),
-        help="Restrict to these methods (default: every registered method except k-means)",
+        help=(
+            "Restrict to these methods (default: every registered method except "
+            "k-means/svm/linear-probe)"
+        ),
     )
     parser.add_argument(
         "--limit-pairs", type=int, default=None, help="Cap number of pairs (smoke test)"
+    )
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=None,
+        help=f"Override CropConfig.img_size (default: {DEFAULT_CROP_CONFIG.img_size})",
+    )
+    parser.add_argument(
+        "--model",
+        choices=["small", "base", "large", "giant"],
+        default=None,
+        help=(
+            f"Override CropConfig.dino_size (default: {DEFAULT_CROP_CONFIG.dino_size!r}). A "
+            "different backbone size gets its own crop-cache namespace (new encoder passes)."
+        ),
+    )
+    parser.add_argument(
+        "--bg-enrich-crops",
+        type=int,
+        default=None,
+        help=(
+            "Extra rejection-sampled bg crops per scale (mid, close), Phase 1 background-"
+            f"gallery enrichment (default: {DEFAULT_CROP_CONFIG.bg_enrich_crops_per_scale}, "
+            "i.e. off). A non-zero value gets its own crop-cache namespace (new encoder "
+            "passes) — see bg_enrichment.py."
+        ),
+    )
+    parser.add_argument(
+        "--fg-clean",
+        choices=["raw", "step1", "step2_cls", "step2_center"],
+        default=None,
+        help=(
+            "Fg/bg gallery cleaning stage, Phase 2 noise cleaning (default: "
+            f"{DEFAULT_SCORING_CONFIG.fg_clean_stage!r}, i.e. off) — see cleaning.py. Cheap "
+            "to flip: reuses the existing crop cache, no new encoder pass."
+        ),
+    )
+    parser.add_argument(
+        "--offset",
+        type=float,
+        default=0.0,
+        help=(
+            "Added to the tuned per-method pixel-selection threshold (raw > thr) before "
+            "it's applied, e.g. to sweep stricter/looser thresholding without re-tuning. "
+            "Does not affect the separately-tuned cluster-reject cutoff (default: 0.0)"
+        ),
     )
     parser.add_argument(
         "--force", action="store_true", help="Ignore existing cache, recompute everything"
@@ -123,6 +185,13 @@ def _parse_args() -> argparse.Namespace:
         "--include-kmeans",
         action="store_true",
         help="Also build the k-means method families (skipped by default — see methods.py)",
+    )
+    parser.add_argument(
+        "--include-classifiers",
+        action="store_true",
+        help=(
+            "Also build the linear-probe/svm method families (skipped by default — see methods.py)"
+        ),
     )
     return parser.parse_args()
 
@@ -134,7 +203,7 @@ def _parse_args() -> argparse.Namespace:
 
 def _load_pair_images_and_masks(
     pair: PairKey,
-) -> tuple[Image.Image, Image.Image, list, np.ndarray, np.ndarray | None]:
+) -> tuple[Image.Image, Image.Image, list, np.ndarray, np.ndarray | None, list[np.ndarray]]:
     exemplar_class = instance_classes_for(pair.instance_type)
     ref_stem = f"{pair.part_type}_{pair.ref_number}"
     query_stem = f"{pair.part_type}_{pair.query_number}"
@@ -146,7 +215,21 @@ def _load_pair_images_and_masks(
     ref_img = Image.open(DATA_DIR / f"{ref_stem}.jpg").convert("RGB")
     query_img = Image.open(DATA_DIR / f"{query_stem}.jpg").convert("RGB")
     q_pixel_mask = load_instance_pixel_mask(DATA_DIR / "annotations" / query_stem, exemplar_class)
-    return ref_img, query_img, ref_instance_masks, ref_pixel_mask, q_pixel_mask
+    # Kept alongside q_pixel_mask (their union) rather than derived from it later — per-instance
+    # boundaries are needed for the two-stage blob diagnostics' TP/FP panel (see
+    # two_stage_predicted_clusters's q_instance_pixel_masks) so touching-but-distinct query
+    # instances never get silently re-merged by a DBSCAN-on-union reconstruction.
+    q_instance_pixel_masks = load_instance_pixel_masks(
+        DATA_DIR / "annotations" / query_stem, exemplar_class
+    )
+    return (
+        ref_img,
+        query_img,
+        ref_instance_masks,
+        ref_pixel_mask,
+        q_pixel_mask,
+        q_instance_pixel_masks,
+    )
 
 
 def _get_or_build_crop_cache(
@@ -209,11 +292,15 @@ def _compute_pair_meta(
     min_cs = min_cluster_size_bound(
         gt_sizes, scoring_cfg.cluster_size_margin, scoring_cfg.min_points_floor
     )
-    gt_clusters = dbscan_clusters_from_mask(
-        gt_patch_mask, scoring_cfg.gt_dbscan_eps, scoring_cfg.gt_dbscan_min_samples
-    )
+    # Built from each annotated instance's own mask, never from DBSCAN-reclustering the
+    # unioned gt_patch_mask — two distinct instances that are touching/adjacent in patch
+    # space would otherwise get silently re-merged into a single GT cluster, making a
+    # correctly-split prediction score as one TP + one spurious FP (see gt_utils.py).
+    gt_clusters = [
+        {"mask": m} for m in gt_instance_patch_masks(query_stem, exemplar_class, q_h, q_w, crop_cfg)
+    ]
     log.info(
-        "[%s] GT instances=%d sizes=%s -> min_cluster_size=%d -> GT-DBSCAN clusters=%d",
+        "[%s] GT instances=%d sizes=%s -> min_cluster_size=%d -> GT clusters=%d",
         pair.slug,
         len(gt_sizes),
         gt_sizes.tolist(),
@@ -247,26 +334,51 @@ def _compute_pair_meta(
 
 
 def _run_method(
+    name: str,
     state,
     q_tokens: torch.Tensor,
     q_h: int,
     q_w: int,
     ref_mid: ScalePrototype,
     ref_mid_gt_mask: np.ndarray,
+    scale_protos: dict[str, ScalePrototype],
+    ref_pixel_mask: np.ndarray,
     mean_patch_prototype: torch.Tensor,
     min_cs: int,
     gt_clusters: list[dict],
+    crop_cfg: CropConfig,
     scoring_cfg: ScoringConfig,
 ) -> dict:
     raw = score_method(state, q_tokens, knn_k=scoring_cfg.knn_fgbg_num_neighbours).reshape(q_h, q_w)
-    ref_raw = score_method(
-        state, ref_mid.tokens, knn_k=scoring_cfg.knn_fgbg_num_neighbours
-    ).reshape(ref_mid.grid_h, ref_mid.grid_w)
-    thr = iou_tuned_threshold(ref_raw, ref_mid_gt_mask, scoring_cfg.ref_threshold_steps)
 
-    assert ref_mid.cluster_crops, "mid scale is never dropped by default crop configs"
+    # tune_threshold_per_scale: tune "close" against its own representative ref crop rather
+    # than always ref_mid (see ScoringConfig's field docstring). Every other method keeps
+    # the ref_mid fallback — "mid" already tunes on itself either way, and
+    # "global"/combos/fg-bg have no single well-defined own scale to switch to.
+    if scoring_cfg.tune_threshold_per_scale and name == "close" and "close" in scale_protos:
+        ref_scale = scale_protos["close"]
+        rx0, ry0, rx1, ry1 = ref_scale.box
+        ref_gt_mask = pixel_mask_to_patch_mask(
+            ref_pixel_mask[ry0:ry1, rx0:rx1],
+            ref_scale.grid_h,
+            ref_scale.grid_w,
+            crop_cfg.img_size,
+            crop_cfg.mask_patch_threshold,
+        )
+    else:
+        ref_scale, ref_gt_mask = ref_mid, ref_mid_gt_mask
+
+    ref_raw = score_method(
+        state, ref_scale.tokens, knn_k=scoring_cfg.knn_fgbg_num_neighbours
+    ).reshape(ref_scale.grid_h, ref_scale.grid_w)
+    thr = (
+        iou_tuned_threshold(ref_raw, ref_gt_mask, scoring_cfg.ref_threshold_steps)
+        + scoring_cfg.threshold_offset
+    )
+
+    assert ref_scale.cluster_crops, "mid/close scale is never dropped when present"
     cluster_reject_thr, ref_tuning_clusters = tune_cluster_reject_threshold(
-        ref_mid.cluster_crops,
+        ref_scale.cluster_crops,
         state,
         mean_patch_prototype,
         thr,
@@ -297,7 +409,7 @@ def _run_method(
 def _write_method_cache(
     pair: PairKey, crop_cfg: CropConfig, scoring_cfg: ScoringConfig, method_name: str, payload: dict
 ) -> None:
-    # The on-disk filename sanitises "/" (e.g. "fg-bg-mean(mid/all)") for path-safety,
+    # The on-disk filename sanitises "/" (e.g. "fg-bg-proto(mid/all)") for path-safety,
     # which is lossy to invert — callers that need the true method name (e.g.
     # visualize_results.py's summary aggregation) must read it back from here, never
     # reconstruct it from the filename stem.
@@ -326,13 +438,16 @@ def _get_or_build_blobs(
     scoring_cfg: ScoringConfig,
     patch_size: int,
     force: bool,
+    target_size_frac: tuple[float, float] | None = None,
 ) -> tuple[list[dict], np.ndarray]:
     cache_path = blob_cache_path(pair, crop_cfg, scoring_cfg, roi_source)
     if cache_path.exists() and not force:
         payload = torch.load(cache_path, weights_only=False)
         return payload["blobs"], payload["roi_mask"]
 
-    blobs, roi_mask = find_roi_blobs(raw, query_img, encoder, crop_cfg, scoring_cfg, patch_size)
+    blobs, roi_mask = find_roi_blobs(
+        raw, query_img, encoder, crop_cfg, scoring_cfg, patch_size, target_size_frac
+    )
     torch.save({"blobs": blobs, "roi_mask": roi_mask}, cache_path)
 
     light_blobs = [{k: v for k, v in b.items() if k != "crop_tokens"} for b in blobs]
@@ -355,8 +470,9 @@ def run_pair(
     method_names: list[str] | None,
     force: bool,
     include_kmeans: bool = False,
+    include_classifiers: bool = False,
 ) -> None:
-    ref_img, query_img, ref_instance_masks, ref_pixel_mask, q_pixel_mask = (
+    ref_img, query_img, ref_instance_masks, ref_pixel_mask, q_pixel_mask, q_instance_pixel_masks = (
         _load_pair_images_and_masks(pair)
     )
     if not ref_instance_masks:
@@ -370,6 +486,13 @@ def run_pair(
     mean_patch_prototype = crop_cache["mean_patch_prototype"]
     q_tokens, q_h, q_w = crop_cache["q_tokens"], crop_cache["q_h"], crop_cache["q_w"]
 
+    # Phase 2 fg/bg gallery cleaning (see cleaning.py) — a no-op identity when
+    # scoring_cfg.fg_clean_stage == "raw" (the default), so this costs nothing for a plain
+    # run. Everything downstream (pair_meta, method states, ref-crop tuning, two-stage) reads
+    # the cleaned scale_protos uniformly; patch_mask/exclude_patch_mask (the true GT extent)
+    # are untouched by cleaning, so pair_meta's cluster_boxes are unaffected either way.
+    scale_protos = apply_fg_cleaning(scale_protos, crop_cfg, scoring_cfg)
+
     pair_meta = _compute_pair_meta(
         pair, crop_cfg, scoring_cfg, scale_protos, q_h, q_w, ref_pixel_mask, q_pixel_mask
     )
@@ -378,7 +501,12 @@ def run_pair(
     )
 
     states = build_method_states(
-        scale_protos, scoring_cfg, list(scale_protos.keys()), method_names, include_kmeans
+        scale_protos,
+        scoring_cfg,
+        list(scale_protos.keys()),
+        method_names,
+        include_kmeans,
+        include_classifiers,
     )
     if not states:
         log.warning("[%s] no methods buildable for this pair's available scales", pair.slug)
@@ -401,15 +529,19 @@ def run_pair(
                 per_method[name] = pickle.load(f)
             continue
         result = _run_method(
+            name,
             state,
             q_tokens,
             q_h,
             q_w,
             ref_mid,
             ref_mid_gt_mask,
+            scale_protos,
+            ref_pixel_mask,
             mean_patch_prototype,
             pair_meta["min_cs"],
             pair_meta["gt_clusters"],
+            crop_cfg,
             scoring_cfg,
         )
         m = result["metrics"]
@@ -436,6 +568,12 @@ def run_pair(
 
     blobs_by_source: dict[str, list[dict]] = {}
     for name in self_anchored:
+        # scale_protos[name].target_size_frac is None for every scale except "mid" (see
+        # build_all_scale_prototypes), and None for non-scale self-anchored methods (e.g.
+        # "mid-kmeans3", not a key in scale_protos) — so this naturally only pulls "mid" blob
+        # crops toward their training-time field of view; everything else keeps the old fixed
+        # floor.
+        target_size_frac = scale_protos[name].target_size_frac if name in scale_protos else None
         blobs, _roi_mask = _get_or_build_blobs(
             pair,
             name,
@@ -446,6 +584,7 @@ def run_pair(
             scoring_cfg,
             patch_size,
             force,
+            target_size_frac,
         )
         blobs_by_source[name] = blobs
         log.info("[%s] roi_source=%s -> %d blob(s)", pair.slug, name, len(blobs))
@@ -485,6 +624,7 @@ def run_pair(
             scale_y,
             scoring_cfg,
             q_pixel_mask=q_pixel_mask,
+            q_instance_pixel_masks=q_instance_pixel_masks,
             crop_cfg=crop_cfg,
             collect_diagnostics=True,
         )
@@ -519,7 +659,21 @@ def run_pair(
 def main() -> None:
     args = _parse_args()
     crop_cfg = DEFAULT_CROP_CONFIG
+    if args.resolution is not None:
+        crop_cfg = dataclasses.replace(crop_cfg, img_size=args.resolution)
+    if args.model is not None:
+        # layer_idx=None re-triggers CropConfig.__post_init__'s "last block of this
+        # size" derivation — omitting it would carry forward crop_cfg's already-resolved
+        # layer_idx (tuned for the old dino_size), which is invalid/wrong-depth for a
+        # different block count (see common.py's last_block_idx).
+        crop_cfg = dataclasses.replace(crop_cfg, dino_size=args.model, layer_idx=None)
+    if args.bg_enrich_crops is not None:
+        crop_cfg = dataclasses.replace(crop_cfg, bg_enrich_crops_per_scale=args.bg_enrich_crops)
     scoring_cfg = DEFAULT_SCORING_CONFIG
+    if args.fg_clean is not None:
+        scoring_cfg = dataclasses.replace(scoring_cfg, fg_clean_stage=args.fg_clean)
+    if args.offset:
+        scoring_cfg = dataclasses.replace(scoring_cfg, threshold_offset=args.offset)
 
     encoder = DinoEncoder(
         version=crop_cfg.dino_version,
@@ -565,6 +719,7 @@ def main() -> None:
                 args.methods,
                 args.force,
                 args.include_kmeans,
+                args.include_classifiers,
             )
         except Exception as exc:  # noqa: BLE001 - keep the batch going, report at the end
             log.error("[%s] FAILED: %s", pair.slug, exc)

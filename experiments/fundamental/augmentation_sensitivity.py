@@ -55,7 +55,7 @@ from dotenv import load_dotenv
 from PIL import Image
 from tqdm import tqdm
 
-from dinoisawesome import DinoEncoder, compute_exemplar_features, load_annotations
+from dinoisawesome import DinoEncoder, EncoderWithCache, compute_exemplar_features, load_annotations
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from _shared.augmentations import (  # noqa: E402
@@ -93,6 +93,7 @@ DINO_SIZE = "large"
 IMG_SIZE = 768  # must be divisible by patch_size (16 for v3)
 LAYER_IDX = 23  # penultimate/last block of ViT-L/16 (depth 24)
 DINO_WEIGHTS_DIR: str | None = os.environ.get("DINO_WEIGHTS_DIR")
+DINO_ENCODING_CACHE_DIR: str | None = os.environ.get("DINO_ENCODING_CACHE_DIR")
 
 MASK_PATCH_THRESHOLD = 0.3  # patch-grid cell counts as "object" once this fraction is masked
 MID_PADDING_FRACTION = 1.0  # mid-crop padding around the mask bbox, fraction of its extent
@@ -238,6 +239,7 @@ encoder = DinoEncoder(
     max_batch_size=16,
     amp=True,
 )
+encoder = EncoderWithCache(encoder, cache_dir=DINO_ENCODING_CACHE_DIR)
 chunk_size = encoder.max_batch_size
 for i in tqdm(range(0, len(entries), chunk_size), desc="Encoding + pooling crops"):
     chunk = entries[i : i + chunk_size]

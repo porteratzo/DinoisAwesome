@@ -7,22 +7,30 @@ split: stage 1 does the AI work, stage 2 is plotting).
 ``--mode`` controls how much gets rendered on top of the summary, which always runs:
 
     summary   Aggregate every cached pair into a metrics table + a handful of
-              comparison figures (bar chart, method x part-type IoU heatmap,
-              method x instance-type IoU heatmap, cross-scale similarity
-              heatmap, and one bar-chart breakdown per instance_type / "class"
-              under figures/by_instance_type/) — for "how do the methods
+              comparison figures (bar chart; method x part-type and method x
+              instance-type heatmaps for IoU, precision, and recall; cross-scale
+              similarity heatmap; and one bar-chart breakdown per instance_type /
+              "class" under figures/by_instance_type/) — for "how do the methods
               compare overall", not "what happened on this one image". Runs
               regardless of ``--mode``.
     detailed  Everything from summary, plus rich per-case figures for every
               (part_type, instance_type) pair by default (narrow with
               --part-type/--instance-type): exemplar crop overview, per-method
               score/cluster/GT breakdown, cluster-reject threshold tuning,
-              two-stage ROI blob overlay.
+              two-stage ROI blob overlay. Written flat under
+              figures/<instance_type>/, one file per (kind, part-instance case)
+              — and, for the per-method two-stage breakdown, per (method, case)
+              with the method name first in the filename so files for the same
+              method across parts sort together.
 
 Usage:
     python visualize_results.py --mode summary
     python visualize_results.py --mode detailed --part-type RHa --instance-type foam
-    python visualize_results.py --mode detailed --methods mid mid-kmeans3
+    python visualize_results.py --methods mid mid-kmeans3   # applies to summary too
+    python visualize_results.py --include-kmeans --include-classifiers
+    python visualize_results.py --resolution 768   # match a non-default run_experiments.py run
+    python visualize_results.py --model base       # match a non-default run_experiments.py run
+    python visualize_results.py --offset 0.05      # match a non-default run_experiments.py run
 """
 
 # Logging first, matches the rest of this experiment's scripts (see run_experiments.py)
@@ -36,6 +44,7 @@ logging.basicConfig(
 log = logging.getLogger("visualize_results")
 
 import argparse  # noqa: E402
+import dataclasses  # noqa: E402
 import pickle  # noqa: E402
 import sys  # noqa: E402
 from pathlib import Path  # noqa: E402
@@ -50,9 +59,11 @@ from common import (  # noqa: E402
     DEFAULT_SCORING_CONFIG,
     FIGURES_ROOT,
     RESULTS_ROOT,
+    CropConfig,
     PairKey,
+    ScoringConfig,
 )
-from methods import all_method_names  # noqa: E402
+from methods import DEFAULT_SKIP_FGBG_COMBOS, all_method_names  # noqa: E402
 from PIL import Image  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -71,7 +82,88 @@ def _parse_args() -> argparse.Namespace:
         "--instance-type", default=None, help="Detailed mode: focal instance-type group"
     )
     parser.add_argument(
-        "--methods", nargs="+", default=None, help="Detailed mode: restrict rendered methods"
+        "--methods",
+        nargs="+",
+        default=None,
+        # include_kmeans=True/include_classifiers=True here just so the (default-off)
+        # k-means/linear-probe/svm names remain valid --methods choices, mirroring
+        # run_experiments.py's own --methods; whether they're actually charted/rendered
+        # by default is controlled by --include-kmeans/--include-classifiers.
+        choices=all_method_names(
+            list(CROP_CFG.scales),
+            SCORING_CFG.kmeans_ks,
+            include_kmeans=True,
+            include_classifiers=True,
+        ),
+        help=(
+            "Restrict to these methods (summary charts and, if --mode detailed, "
+            "rendered figures too; default: every registered method except "
+            "k-means/svm/linear-probe)"
+        ),
+    )
+    parser.add_argument(
+        "--include-kmeans",
+        action="store_true",
+        help="Also chart/render the k-means method families (skipped by default — see methods.py)",
+    )
+    parser.add_argument(
+        "--include-classifiers",
+        action="store_true",
+        help=(
+            "Also chart/render the linear-probe/svm method families "
+            "(skipped by default — see methods.py)"
+        ),
+    )
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=None,
+        help=(
+            "Override CropConfig.img_size to match a run_experiments.py run made with "
+            f"--resolution (default: {DEFAULT_CROP_CONFIG.img_size})"
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        choices=["small", "base", "large", "giant"],
+        default=None,
+        help=(
+            "Override CropConfig.dino_size to match a run_experiments.py run made with "
+            f"--model (default: {DEFAULT_CROP_CONFIG.dino_size!r})"
+        ),
+    )
+    parser.add_argument(
+        "--bg-enrich-crops",
+        type=int,
+        default=None,
+        help=(
+            "Match a run_experiments.py run made with --bg-enrich-crops (default: "
+            f"{DEFAULT_CROP_CONFIG.bg_enrich_crops_per_scale}, i.e. off). When set to a "
+            "non-default value, also renders vanilla-vs-flagged comparison figures against "
+            "the plain (--bg-enrich-crops 0) cache — see comparison_bg_enrich.png."
+        ),
+    )
+    parser.add_argument(
+        "--fg-clean",
+        choices=["raw", "step1", "step2_cls", "step2_center"],
+        default=None,
+        help=(
+            "Match a run_experiments.py run made with --fg-clean (default: "
+            f"{DEFAULT_SCORING_CONFIG.fg_clean_stage!r}, i.e. off). When set to a non-default "
+            "value, also renders vanilla-vs-flagged comparison figures against the plain "
+            "(--fg-clean raw) cache — see comparison_fg_clean.png."
+        ),
+    )
+    parser.add_argument(
+        "--offset",
+        type=float,
+        default=0.0,
+        help=(
+            "Match a run_experiments.py run made with --offset (default: "
+            f"{DEFAULT_SCORING_CONFIG.threshold_offset}, i.e. off). When non-zero, also "
+            "renders vanilla-vs-flagged comparison figures against the plain (--offset 0) "
+            "cache — see comparison_offset.png."
+        ),
     )
     return parser.parse_args()
 
@@ -81,12 +173,21 @@ def _parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-def _pairs_root() -> Path:
-    return CACHE_ROOT / "methods" / f"{CROP_CFG.hash()}__{SCORING_CFG.hash()}"
+def _pairs_root(
+    crop_cfg: CropConfig | None = None, scoring_cfg: ScoringConfig | None = None
+) -> Path:
+    crop_cfg = crop_cfg if crop_cfg is not None else CROP_CFG
+    scoring_cfg = scoring_cfg if scoring_cfg is not None else SCORING_CFG
+    return CACHE_ROOT / "methods" / f"{crop_cfg.hash()}__{scoring_cfg.hash()}"
 
 
-def discover_cached_pairs() -> list[tuple[PairKey, Path]]:
-    root = _pairs_root()
+def discover_cached_pairs(
+    crop_cfg: CropConfig | None = None, scoring_cfg: ScoringConfig | None = None
+) -> list[tuple[PairKey, Path]]:
+    """Every cached pair under ``(crop_cfg, scoring_cfg)``'s cache namespace — the current
+    (possibly flagged) run by default, or an explicit namespace (e.g. the vanilla baseline
+    for a --bg-enrich-crops/--fg-clean comparison, see build_comparison_df)."""
+    root = _pairs_root(crop_cfg, scoring_cfg)
     if not root.exists():
         return []
     out = []
@@ -131,8 +232,8 @@ def method_names_in(pair_dir: Path) -> list[str]:
     """True method names for every cached result in *pair_dir*.
 
     Reads the ``method`` field each payload was written with rather than the on-disk
-    filename stem — the filename sanitises "/" (e.g. "fg-bg-mean(mid/all)" ->
-    "fg-bg-mean(mid-all)"), which is lossy to invert.
+    filename stem — the filename sanitises "/" (e.g. "fg-bg-proto(mid/all)" ->
+    "fg-bg-proto(mid-all)"), which is lossy to invert.
     """
     names = []
     for p in pair_dir.glob("*.pkl"):
@@ -142,10 +243,46 @@ def method_names_in(pair_dir: Path) -> list[str]:
     return names
 
 
-BASE_METHOD_ORDER = all_method_names(
-    list(CROP_CFG.scales), SCORING_CFG.kmeans_ks, include_kmeans=False
-)
-DISPLAY_ORDER = BASE_METHOD_ORDER + [f"two-stage({m})" for m in BASE_METHOD_ORDER]
+def _is_default_skipped(name: str) -> bool:
+    """Mirrors ``methods.build_method_states``'s default-skip filter (see
+    ``DEFAULT_SKIP_FGBG_COMBOS``), so stale cached results for opt-in-only combos —
+    left behind by an old run predating that skip, or a run that named them explicitly
+    via ``--methods`` — don't leak into figures just because they're still on disk.
+    """
+    return any(f"({combo})" in name for combo in DEFAULT_SKIP_FGBG_COMBOS)
+
+
+def _base_method_order(
+    method_names: list[str] | None, include_kmeans: bool, include_classifiers: bool
+) -> list[str]:
+    """Base (stage-1) method order for one CLI invocation — *method_names* if given
+    (explicit opt-in, matching ``build_method_states``), else every registered method
+    except the default-off families (k-means/svm/linear-probe unless
+    *include_kmeans*/*include_classifiers*, plus ``DEFAULT_SKIP_FGBG_COMBOS``).
+    """
+    if method_names is not None:
+        return method_names
+    return [
+        m
+        for m in all_method_names(
+            list(CROP_CFG.scales), SCORING_CFG.kmeans_ks, include_kmeans, include_classifiers
+        )
+        if not _is_default_skipped(m)
+    ]
+
+
+def _display_order(
+    method_names: list[str] | None, include_kmeans: bool, include_classifiers: bool
+) -> list[str]:
+    """``_base_method_order`` plus each base method's ``two-stage(...)`` variant."""
+    base = _base_method_order(method_names, include_kmeans, include_classifiers)
+    return base + [f"two-stage({m})" for m in base]
+
+
+# Plain (no CLI args) defaults — still used as the module-wide fallback wherever a
+# caller doesn't have per-invocation args handy (e.g. plot helpers below).
+BASE_METHOD_ORDER = _base_method_order(None, False, False)
+DISPLAY_ORDER = _display_order(None, False, False)
 
 
 # ---------------------------------------------------------------------------
@@ -248,9 +385,11 @@ def _plot_score_histogram(
 # ---------------------------------------------------------------------------
 
 
-def build_metrics_df() -> pd.DataFrame:
+def build_metrics_df(
+    crop_cfg: CropConfig | None = None, scoring_cfg: ScoringConfig | None = None
+) -> pd.DataFrame:
     rows = []
-    for pair, pair_dir in discover_cached_pairs():
+    for pair, pair_dir in discover_cached_pairs(crop_cfg, scoring_cfg):
         for name in method_names_in(pair_dir):
             result = load_method_result(pair_dir, name)
             if result is None:
@@ -304,9 +443,7 @@ def plot_summary_bars(
     # Each panel is sorted independently by the metric it displays, best-first, rather than
     # sharing DISPLAY_ORDER — makes the strongest methods for that particular metric readable
     # at a glance instead of scattered across the bar chart.
-    pr_order = (
-        summary_df[["precision", "recall"]].mean(axis=1).sort_values(ascending=False).index
-    )
+    pr_order = summary_df[["precision", "recall"]].mean(axis=1).sort_values(ascending=False).index
     iou_order = summary_df["mean_iou"].sort_values(ascending=False).index
 
     fig, axes = plt.subplots(1, 2, figsize=(max(10, 0.5 * len(order)), 5), constrained_layout=True)
@@ -343,14 +480,16 @@ def plot_summary_bars_by_instance_type(
         )
 
 
-def plot_iou_heatmap(
+def plot_metric_heatmap(
     metrics_df: pd.DataFrame,
     order: list[str],
     out_path: Path,
+    metric_col: str = "mean_iou",
+    metric_label: str = "mean matched IoU",
     group_col: str = "part_type",
 ) -> None:
     pivot = (
-        metrics_df.groupby(["method", group_col])["mean_iou"]
+        metrics_df.groupby(["method", group_col])[metric_col]
         .mean()
         .unstack(group_col)
         .reindex(index=order)
@@ -376,21 +515,31 @@ def plot_iou_heatmap(
                     fontsize=7,
                     color="white" if val < 0.6 else "black",
                 )
-    fig.colorbar(im, ax=ax, label="mean matched IoU")
-    ax.set_title(f"Mean matched IoU per method x {group_col}")
+    fig.colorbar(im, ax=ax, label=metric_label)
+    ax.set_title(f"{metric_label} per method x {group_col}")
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     log.info("wrote %s", out_path)
 
 
-def plot_cross_scale_heatmap(cross_df: pd.DataFrame, out_path: Path) -> None:
+# (metric_col, metric_label, output-filename stem) for every method x {part_type,
+# instance_type} heatmap `run_summary` renders — one IoU heatmap plus the same grid for
+# precision and recall.
+METRIC_HEATMAPS = [
+    ("mean_iou", "mean matched IoU", "iou_heatmap"),
+    ("precision", "mean precision", "precision_heatmap"),
+    ("recall", "mean recall", "recall_heatmap"),
+]
+
+
+def plot_cross_scale_heatmap(cross_df: pd.DataFrame, out_path: Path, base_order: list[str]) -> None:
     if cross_df.empty:
         return
     gt = cross_df[cross_df["gt_present"]]
     if gt.empty:
         return
     matrix = gt.groupby(["roi_source", "score_scale"])["iou"].mean().unstack("score_scale")
-    order = [m for m in BASE_METHOD_ORDER if m in matrix.index or m in matrix.columns]
+    order = [m for m in base_order if m in matrix.index or m in matrix.columns]
     matrix = matrix.reindex(index=order, columns=order)
     fig, ax = plt.subplots(
         figsize=(0.6 * len(order) + 3, 0.6 * len(order) + 3), constrained_layout=True
@@ -416,7 +565,11 @@ def plot_cross_scale_heatmap(cross_df: pd.DataFrame, out_path: Path) -> None:
     log.info("wrote %s", out_path)
 
 
-def run_summary() -> None:
+def run_summary(
+    method_names: list[str] | None = None,
+    include_kmeans: bool = False,
+    include_classifiers: bool = False,
+) -> None:
     RESULTS_ROOT.mkdir(parents=True, exist_ok=True)
     FIGURES_ROOT.mkdir(parents=True, exist_ok=True)
 
@@ -437,26 +590,34 @@ def run_summary() -> None:
             n_pairs,
         )
 
-    order = [m for m in DISPLAY_ORDER if m in metrics_df["method"].unique()]
+    base_order = _base_method_order(method_names, include_kmeans, include_classifiers)
+    order = [
+        m
+        for m in _display_order(method_names, include_kmeans, include_classifiers)
+        if m in metrics_df["method"].unique()
+    ]
     plot_summary_bars(
         metrics_df,
         order,
         FIGURES_ROOT / "summary_bar.png",
         title_suffix=" (mean across every cached pair)",
     )
-    plot_iou_heatmap(metrics_df, order, FIGURES_ROOT / "iou_heatmap_by_part_type.png")
-    plot_iou_heatmap(
-        metrics_df,
-        order,
-        FIGURES_ROOT / "iou_heatmap_by_instance_type.png",
-        group_col="instance_type",
-    )
+    for metric_col, metric_label, filename_stem in METRIC_HEATMAPS:
+        for group_col in ("part_type", "instance_type"):
+            plot_metric_heatmap(
+                metrics_df,
+                order,
+                FIGURES_ROOT / f"{filename_stem}_by_{group_col}.png",
+                metric_col=metric_col,
+                metric_label=metric_label,
+                group_col=group_col,
+            )
     plot_summary_bars_by_instance_type(metrics_df, order, FIGURES_ROOT / "by_instance_type")
 
     cross_df = build_cross_scale_df()
     if not cross_df.empty:
         cross_df.to_csv(RESULTS_ROOT / "cross_scale_records.csv", index=False)
-        plot_cross_scale_heatmap(cross_df, FIGURES_ROOT / "cross_scale_heatmap.png")
+        plot_cross_scale_heatmap(cross_df, FIGURES_ROOT / "cross_scale_heatmap.png", base_order)
 
     n_classes = metrics_df["instance_type"].nunique()
     log.info(
@@ -464,6 +625,125 @@ def run_summary() -> None:
         n_pairs,
         len(order),
         n_classes,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Vanilla-vs-flagged comparison (Phase 1 bg-enrich / Phase 2 fg-clean)
+#
+# Both flags live in their own crop/scoring-hash cache namespace (see common.py's two-tier
+# cache docstring), so "does this flag help" means loading the vanilla (flag off) namespace
+# alongside the current (flagged) one and comparing per-method metrics side by side. Only
+# triggered from main() when the respective CLI flag differs from its default — a plain run
+# costs nothing extra and renders no comparison figures.
+# ---------------------------------------------------------------------------
+
+
+def build_comparison_df(
+    vanilla_crop_cfg: CropConfig,
+    vanilla_scoring_cfg: ScoringConfig,
+    flagged_crop_cfg: CropConfig,
+    flagged_scoring_cfg: ScoringConfig,
+    flagged_label: str,
+) -> pd.DataFrame | None:
+    """Long-form (method, variant, metrics...) dataframe pairing the vanilla cache namespace
+    against the current flagged one. Returns None (logged) if the vanilla namespace has no
+    cached results — the flag comparison needs a plain ``run_experiments.py`` run first.
+    """
+    vanilla_root = _pairs_root(vanilla_crop_cfg, vanilla_scoring_cfg)
+    vanilla_df = build_metrics_df(vanilla_crop_cfg, vanilla_scoring_cfg)
+    if vanilla_df.empty:
+        log.warning(
+            "No cached vanilla-baseline results under %s — run run_experiments.py with "
+            "defaults (no --bg-enrich-crops/--fg-clean) first to enable the vanilla-vs-"
+            "flagged comparison. Skipping.",
+            vanilla_root,
+        )
+        return None
+    flagged_df = build_metrics_df(flagged_crop_cfg, flagged_scoring_cfg)
+    return pd.concat(
+        [vanilla_df.assign(variant="vanilla"), flagged_df.assign(variant=flagged_label)],
+        ignore_index=True,
+    )
+
+
+def plot_variant_comparison_bars(
+    comparison_df: pd.DataFrame, order: list[str], flagged_label: str, out_path: Path, title: str
+) -> None:
+    """Grouped (method x variant) bar chart — vanilla vs *flagged_label* — for F1 and mean
+    IoU, the two-panel analogue of ``plot_summary_bars`` with variant as the hue instead of
+    a single series."""
+    variants = ["vanilla", flagged_label]
+    summary = comparison_df.groupby(["method", "variant"])[["f1", "mean_iou"]].mean()
+
+    fig, axes = plt.subplots(1, 2, figsize=(max(10, 0.6 * len(order)), 5), constrained_layout=True)
+    for ax, metric, color in [(axes[0], "f1", None), (axes[1], "mean_iou", "teal")]:
+        pivot = summary[metric].unstack("variant").reindex(index=order, columns=variants)
+        pivot.plot.bar(ax=ax, color=(["#b0b0b0", color] if color else None))
+        ax.set_ylim(0, 1.0 if metric == "mean_iou" else 1.05)
+        ax.set_title(f"{'Mean matched IoU' if metric == 'mean_iou' else 'F1'}{title}")
+        ax.set_xticklabels(order, rotation=90, ha="center")
+        ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    log.info("wrote %s", out_path)
+
+
+def write_comparison_csv(
+    comparison_df: pd.DataFrame, order: list[str], flagged_label: str, out_path: Path
+) -> None:
+    """Per-method vanilla/flagged metrics side by side, plus flagged-minus-vanilla deltas —
+    the numeric backing for ``plot_variant_comparison_bars``' bar chart."""
+    variants = ["vanilla", flagged_label]
+    wide = (
+        comparison_df.groupby(["method", "variant"])[["precision", "recall", "f1", "mean_iou"]]
+        .mean()
+        .unstack("variant")
+        .reindex(
+            index=order,
+            columns=pd.MultiIndex.from_product(
+                [["precision", "recall", "f1", "mean_iou"], variants]
+            ),
+        )
+    )
+    for metric in ("precision", "recall", "f1", "mean_iou"):
+        wide[(metric, f"delta_{flagged_label}_minus_vanilla")] = (
+            wide[(metric, flagged_label)] - wide[(metric, "vanilla")]
+        )
+    wide.to_csv(out_path)
+    log.info("wrote %s", out_path)
+
+
+def run_variant_comparison(
+    flag_name: str,
+    flagged_label: str,
+    vanilla_crop_cfg: CropConfig,
+    vanilla_scoring_cfg: ScoringConfig,
+    order: list[str],
+) -> None:
+    """Vanilla-vs-flagged comparison figure + CSV for one Phase 1/2 flag — called from
+    main() only when that flag differs from its default (see this section's docstring)."""
+    comparison_df = build_comparison_df(
+        vanilla_crop_cfg, vanilla_scoring_cfg, CROP_CFG, SCORING_CFG, flagged_label
+    )
+    if comparison_df is None:
+        return
+    comparison_order = [m for m in order if m in comparison_df["method"].unique()]
+    plot_variant_comparison_bars(
+        comparison_df,
+        comparison_order,
+        flagged_label,
+        FIGURES_ROOT / f"comparison_{flag_name}.png",
+        title=f" — vanilla vs {flagged_label} (mean across every cached pair)",
+    )
+    write_comparison_csv(
+        comparison_df, comparison_order, flagged_label, RESULTS_ROOT / f"comparison_{flag_name}.csv"
+    )
+    log.info(
+        "Comparison done for %s: %d method(s), vanilla vs %s.",
+        flag_name,
+        len(comparison_order),
+        flagged_label,
     )
 
 
@@ -515,9 +795,10 @@ def render_exemplar_overview(
         ax.axis("off")
     fig.suptitle(f"{pair.part_type} / {pair.instance_type} — exemplar crops per scale")
     fig.tight_layout()
-    fig.savefig(out_dir / "exemplar_overview.png", dpi=150, bbox_inches="tight")
+    out_path = out_dir / f"exemplar_overview__{pair.case_slug}.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    log.info("wrote %s", out_dir / "exemplar_overview.png")
+    log.info("wrote %s", out_path)
 
 
 def render_method_breakdown(
@@ -591,9 +872,10 @@ def render_method_breakdown(
         ax.axis("off")
 
     fig.suptitle(f"{pair.part_type} / {pair.instance_type} — per-method breakdown")
-    fig.savefig(out_dir / "method_breakdown.png", dpi=150, bbox_inches="tight")
+    out_path = out_dir / f"method_breakdown__{pair.case_slug}.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    log.info("wrote %s", out_dir / "method_breakdown.png")
+    log.info("wrote %s", out_path)
 
 
 def render_cluster_reject_tuning(
@@ -631,9 +913,10 @@ def render_cluster_reject_tuning(
         axes[j // ncols][j % ncols].axis("off")
     fig.suptitle(f"{pair.part_type} / {pair.instance_type} — cluster-reject threshold tuning")
     fig.tight_layout()
-    fig.savefig(out_dir / "cluster_reject_tuning.png", dpi=150, bbox_inches="tight")
+    out_path = out_dir / f"cluster_reject_tuning__{pair.case_slug}.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    log.info("wrote %s", out_dir / "cluster_reject_tuning.png")
+    log.info("wrote %s", out_path)
 
 
 def render_two_stage_overview(
@@ -672,9 +955,10 @@ def render_two_stage_overview(
         axes[j // ncols][j % ncols].axis("off")
     fig.suptitle(f"{pair.part_type} / {pair.instance_type} — two-stage ROI blobs")
     fig.tight_layout()
-    fig.savefig(out_dir / "two_stage_overview.png", dpi=150, bbox_inches="tight")
+    out_path = out_dir / f"two_stage_overview__{pair.case_slug}.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    log.info("wrote %s", out_dir / "two_stage_overview.png")
+    log.info("wrote %s", out_path)
 
 
 def render_two_stage_breakdown(
@@ -686,6 +970,10 @@ def render_two_stage_breakdown(
     ``blob_diagnostics`` ``run_experiments.py`` now caches per two-stage result (see
     ``engine.two_stage_predicted_clusters``). Methods whose two-stage cache predates that
     (no ``blob_diagnostics``) are skipped — rerun ``run_experiments.py --force`` to backfill.
+    TP/FP/FN matching uses each blob's ``gt_instance_masks`` (one mask per real annotated
+    query instance) when cached; older caches without it fall back to reconstructing GT
+    clusters via DBSCAN on the unioned mask, with a warning — rerun with ``--force`` to
+    get the more accurate per-instance panel.
     """
     for name in method_names:
         two_stage_name = f"two-stage({name})"
@@ -732,9 +1020,22 @@ def render_two_stage_breakdown(
             clusters = diag["clusters"]
             kept_clusters = [c for c in clusters if not c["rejected"]]
             rejected_clusters = [c for c in clusters if c["rejected"]]
-            gt_clusters = dbscan_clusters_from_mask(
-                gt_mask, SCORING_CFG.gt_dbscan_eps, SCORING_CFG.gt_dbscan_min_samples
-            )
+            if "gt_instance_masks" in diag:
+                # One cluster per real annotated query instance overlapping this blob —
+                # never reconstructed by DBSCAN-clustering the unioned gt_mask, which
+                # would silently re-merge touching-but-distinct instances into one and
+                # make a correctly-split prediction score as a spurious FP.
+                gt_clusters = [{"mask": m} for m in diag["gt_instance_masks"]]
+            else:
+                log.warning(
+                    "[%s] blob diagnostics predate gt_instance_masks — falling back to "
+                    "DBSCAN-on-union GT reconstruction for this panel (may over-merge "
+                    "touching instances); rerun run_experiments.py --force to backfill",
+                    pair.slug,
+                )
+                gt_clusters = dbscan_clusters_from_mask(
+                    gt_mask, SCORING_CFG.gt_dbscan_eps, SCORING_CFG.gt_dbscan_min_samples
+                )
             ax = axes[row, 3]
             ax.imshow(crop_arr)
             tp, fp, fn, rejected = _draw_scored_clusters(
@@ -755,23 +1056,28 @@ def render_two_stage_breakdown(
             f"F1={m['f1']:.2f} mIoU={m['mean_iou']:.2f}"
         )
         safe_name = name.replace("/", "-")
-        out_path = out_dir / f"two_stage_breakdown__{safe_name}.png"
+        out_path = out_dir / f"two_stage_breakdown__{safe_name}__{pair.case_slug}.png"
         fig.savefig(out_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         log.info("wrote %s", out_path)
 
 
 def run_detailed(
-    part_type: str | None, instance_type: str | None, methods: list[str] | None
+    part_type: str | None,
+    instance_type: str | None,
+    methods: list[str] | None,
+    include_kmeans: bool = False,
+    include_classifiers: bool = False,
 ) -> None:
     pairs = _resolve_focal_pairs(part_type, instance_type)
     log.info("[detailed] rendering %d pair(s)", len(pairs))
+    default_base_order = _base_method_order(methods, include_kmeans, include_classifiers)
     for pair, pair_dir in pairs:
         log.info("[detailed] focal pair: %s", pair.slug)
         meta = load_pair_meta(pair_dir)
         ref_img, query_img = _load_images(pair)
 
-        out_dir = FIGURES_ROOT / pair.slug
+        out_dir = FIGURES_ROOT / pair.safe_instance_type
         out_dir.mkdir(parents=True, exist_ok=True)
 
         render_exemplar_overview(pair, meta, ref_img, out_dir)
@@ -781,7 +1087,7 @@ def run_detailed(
         selected = (
             methods
             if methods is not None
-            else [m for m in BASE_METHOD_ORDER if m in base_available]
+            else [m for m in default_base_order if m in base_available]
         )
         render_method_breakdown(pair, meta, pair_dir, query_img, selected, out_dir)
         render_cluster_reject_tuning(pair, pair_dir, selected, out_dir)
@@ -792,10 +1098,78 @@ def run_detailed(
 
 
 def main() -> None:
+    global CROP_CFG, SCORING_CFG
     args = _parse_args()
-    run_summary()
+    if args.resolution is not None:
+        CROP_CFG = dataclasses.replace(CROP_CFG, img_size=args.resolution)
+    if args.model is not None:
+        # layer_idx=None re-triggers CropConfig.__post_init__'s "last block of this
+        # size" derivation — see run_experiments.py's matching comment.
+        CROP_CFG = dataclasses.replace(CROP_CFG, dino_size=args.model, layer_idx=None)
+    if args.bg_enrich_crops is not None:
+        CROP_CFG = dataclasses.replace(CROP_CFG, bg_enrich_crops_per_scale=args.bg_enrich_crops)
+    if args.fg_clean is not None:
+        SCORING_CFG = dataclasses.replace(SCORING_CFG, fg_clean_stage=args.fg_clean)
+    if args.offset:
+        SCORING_CFG = dataclasses.replace(SCORING_CFG, threshold_offset=args.offset)
+
+    run_summary(args.methods, args.include_kmeans, args.include_classifiers)
     if args.mode == "detailed":
-        run_detailed(args.part_type, args.instance_type, args.methods)
+        run_detailed(
+            args.part_type,
+            args.instance_type,
+            args.methods,
+            args.include_kmeans,
+            args.include_classifiers,
+        )
+
+    # Every comparison's "vanilla" side resets only the augmentation flags (bg_enrich,
+    # fg_clean, threshold_offset) to their defaults, while keeping every other CROP_CFG/
+    # SCORING_CFG field — resolution, model, etc. — exactly as passed on this invocation.
+    # Using DEFAULT_CROP_CONFIG/DEFAULT_SCORING_CONFIG outright would ignore --resolution/
+    # --model and look up a baseline cache for the wrong model size entirely. Shared across
+    # all three comparisons so running multiple flags together (e.g. --bg-enrich-crops +
+    # --fg-clean) compares each against the same plain baseline instead of needing a
+    # separate cached run per leave-one-out combination. Requires one baseline
+    # `run_experiments.py` run (same --resolution/--model, no augmentation flags) to
+    # populate that baseline cache.
+    vanilla_crop_cfg = dataclasses.replace(
+        CROP_CFG,
+        bg_enrich_crops_per_scale=DEFAULT_CROP_CONFIG.bg_enrich_crops_per_scale,
+        bg_enrich_max_overlap_fraction=DEFAULT_CROP_CONFIG.bg_enrich_max_overlap_fraction,
+        bg_enrich_seed=DEFAULT_CROP_CONFIG.bg_enrich_seed,
+    )
+    vanilla_scoring_cfg = dataclasses.replace(
+        SCORING_CFG,
+        fg_clean_stage=DEFAULT_SCORING_CONFIG.fg_clean_stage,
+        threshold_offset=DEFAULT_SCORING_CONFIG.threshold_offset,
+    )
+
+    display_order = _display_order(args.methods, args.include_kmeans, args.include_classifiers)
+    if CROP_CFG.bg_enrich_crops_per_scale != DEFAULT_CROP_CONFIG.bg_enrich_crops_per_scale:
+        run_variant_comparison(
+            "bg_enrich",
+            f"bg_enrich={CROP_CFG.bg_enrich_crops_per_scale}",
+            vanilla_crop_cfg,
+            vanilla_scoring_cfg,
+            display_order,
+        )
+    if SCORING_CFG.fg_clean_stage != DEFAULT_SCORING_CONFIG.fg_clean_stage:
+        run_variant_comparison(
+            "fg_clean",
+            f"fg_clean={SCORING_CFG.fg_clean_stage}",
+            vanilla_crop_cfg,
+            vanilla_scoring_cfg,
+            display_order,
+        )
+    if SCORING_CFG.threshold_offset != DEFAULT_SCORING_CONFIG.threshold_offset:
+        run_variant_comparison(
+            "offset",
+            f"offset={SCORING_CFG.threshold_offset}",
+            vanilla_crop_cfg,
+            vanilla_scoring_cfg,
+            display_order,
+        )
 
 
 if __name__ == "__main__":

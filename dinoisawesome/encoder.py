@@ -188,6 +188,7 @@ class DinoEncoder(nn.Module):
         model_name = _MODEL_NAMES[(version, size)]
         if weights_dir is not None:
             weights_path = _find_weights_file(Path(weights_dir), model_name)
+            self.weights_signature = f"{weights_path}:{weights_path.stat().st_mtime_ns}"
             _log.info("Loading %s architecture from hub (no pretrained weights)", model_name)
             backbone = torch.hub.load(_HUB_REPOS[version], model_name, pretrained=False)
             _log.info("Loading weights from %s", weights_path)
@@ -202,6 +203,7 @@ class DinoEncoder(nn.Module):
             backbone.load_state_dict(state)
         else:
             backbone = torch.hub.load(_HUB_REPOS[version], model_name)
+            self.weights_signature = f"hub:{model_name}"
         backbone.eval()
         if self.model_dtype is not None:
             backbone = backbone.to(dtype=self.model_dtype)
@@ -329,7 +331,12 @@ class DinoEncoder(nn.Module):
 
         E = patches.T  # (D, N)
         E = E - E.mean(dim=1, keepdim=True)
-        U, _, _ = torch.linalg.svd(E, full_matrices=False)  # U: (D, min(D, N))
+        # SVD always in float32: torch.linalg.svd has no CPU kernel for bfloat16 at all
+        # (crashes outright when amp forces model_dtype to bfloat16 on a CPU-resolved
+        # device), and bfloat16 SVD is numerically weak even where it does run — this
+        # basis is reused for the encoder's lifetime, so it's worth computing precisely
+        # once. _debias_features casts the result back to each caller's own device/dtype.
+        U, _, _ = torch.linalg.svd(E.float(), full_matrices=False)  # U: (D, min(D, N))
         return U[:, : self.svd_components].contiguous()
 
     def _debias_features(self, patches: torch.Tensor) -> torch.Tensor:
@@ -361,14 +368,25 @@ class DinoEncoder(nn.Module):
         x_deb = x @ self._p_perp.T  # (N, H*W, D)
         return F.normalize(x_deb, p=2, dim=-1).reshape(shape)
 
-    def _split_into_chunks(self, images: torch.Tensor | Image.Image | np.ndarray | list) -> list:
-        """Split *images* into chunks of at most `self.max_batch_size` items each.
+    def _split_into_chunks(
+        self,
+        images: torch.Tensor | Image.Image | np.ndarray | list,
+        chunk_size: int | None = None,
+    ) -> list:
+        """Split *images* into chunks of at most `chunk_size` items each.
 
         Mirrors `_to_tensor_batch`'s shape handling so slicing always happens along the
         batch axis: a single unbatched tensor/PIL/numpy image becomes one chunk of size
         1 (never sliced along its channel/height axis), while a ``(B, ...)`` tensor,
         ``(B, H, W, 3)`` ndarray, or list/tuple is sliced along its leading dimension.
+
+        Args:
+            chunk_size: Items per chunk. Defaults to `self.max_batch_size`; pass
+                        `chunk_size=1` to get one chunk per individual item (e.g. for
+                        per-item cache-key hashing).
         """
+        if chunk_size is None:
+            chunk_size = self.max_batch_size
         items: torch.Tensor | np.ndarray | list | tuple
         if isinstance(images, torch.Tensor):
             items = images.unsqueeze(0) if images.ndim == 3 else images
@@ -378,9 +396,7 @@ class DinoEncoder(nn.Module):
             items = images
         else:
             items = [images]  # single PIL Image or (H, W, 3) ndarray
-        return [
-            items[i : i + self.max_batch_size] for i in range(0, len(items), self.max_batch_size)
-        ]
+        return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
 
     @torch.inference_mode()
     def forward(

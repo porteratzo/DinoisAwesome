@@ -4,6 +4,7 @@ from .annotation_utils import load_annotations
 from .anomaly_head import AnomalyHead
 from .background_mask import compute_foreground_mask
 from .encoder import DinoEncoder, ExtractorOutput
+from .encoder_cache import EncoderFingerprint, EncoderWithCache, inspect_cache
 from .foreground_head import ForegroundHead
 from .gallery import Gallery, GalleryConfig
 from .instance_detection import (
@@ -28,6 +29,9 @@ __all__ = [
     "load_annotations",
     "DinoEncoder",
     "ExtractorOutput",
+    "EncoderFingerprint",
+    "EncoderWithCache",
+    "inspect_cache",
     "Gallery",
     "GalleryConfig",
     "AnomalyHead",

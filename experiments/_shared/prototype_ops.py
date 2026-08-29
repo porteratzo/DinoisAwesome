@@ -25,6 +25,28 @@ def extract_patch_tokens_batch(
     ]
 
 
+def extract_patch_tokens_batch_with_cls(
+    encoder: DinoEncoder, images: list[Image.Image], layer_idx: int, debias: bool = False
+) -> list[tuple[torch.Tensor, torch.Tensor, int, int]]:
+    """``extract_patch_tokens_batch``'s sibling, additionally returning each image's own
+    L2-normalised [CLS] token (that helper discards it). CLS is *not* L2-normalised by
+    ``DinoEncoder`` itself (unlike patch tokens), so it's normalised here.
+    """
+    out = encoder(images, layers=[layer_idx], debias=debias)
+    patches = out.patches[:, 0]  # (B, H, W, D)
+    cls = F.normalize(out.cls[:, 0], p=2, dim=-1)  # (B, D)
+    _, grid_h, grid_w, D = patches.shape
+    return [
+        (
+            F.normalize(patches[b].reshape(grid_h * grid_w, D), p=2, dim=-1),
+            cls[b],
+            grid_h,
+            grid_w,
+        )
+        for b in range(patches.shape[0])
+    ]
+
+
 def knn_fgbg_score(
     query_tokens: torch.Tensor, fg_bank: torch.Tensor, bg_bank: torch.Tensor, k: int
 ) -> np.ndarray:

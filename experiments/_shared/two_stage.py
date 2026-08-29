@@ -11,7 +11,7 @@ k-means fg-bg variant) that isn't just a config-plumbing difference.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -142,6 +142,40 @@ def blob_crop_gt_mask(
     return pixel_mask_to_patch_mask(crop_pixel_mask, c_h, c_w, img_size, mask_patch_threshold)
 
 
+def blob_crop_gt_instance_masks(
+    blob: dict,
+    q_instance_pixel_masks: list[np.ndarray] | None,
+    img_size: int,
+    mask_patch_threshold: float,
+) -> list[np.ndarray]:
+    """Per-instance patch-grid GT masks for one ROI blob crop, aligned to its own
+    re-encoded grid — one entry per real annotated query instance that overlaps this
+    blob's pixel bbox.
+
+    Unlike ``blob_crop_gt_mask`` (which unions every instance into one mask for
+    display), this keeps each instance separate so a caller doing per-instance
+    TP/FP/FN cluster matching never has to reconstruct instances by DBSCAN-clustering
+    a unioned mask — two distinct instances that are touching/adjacent within this
+    blob would otherwise get silently re-merged into one (see
+    ``_shared.gt_utils.gt_instance_patch_masks`` for the same fix at the pair level).
+    """
+    if not q_instance_pixel_masks:
+        return []
+    px0, py0, px1, py1 = blob["px_bbox"]
+    c_h, c_w = blob["c_h"], blob["c_w"]
+    masks = []
+    for inst_pixel_mask in q_instance_pixel_masks:
+        crop_pixel_mask = inst_pixel_mask[py0:py1, px0:px1]
+        if not crop_pixel_mask.any():
+            continue
+        patch_mask = pixel_mask_to_patch_mask(
+            crop_pixel_mask, c_h, c_w, img_size, mask_patch_threshold
+        )
+        if patch_mask.any():
+            masks.append(patch_mask)
+    return masks
+
+
 def crop_patch_centers_to_native_px(
     xs: np.ndarray, ys: np.ndarray, px_bbox: tuple[int, int, int, int], c_h: int, c_w: int
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -150,6 +184,58 @@ def crop_patch_centers_to_native_px(
     cell_w = (px1 - px0) / c_w
     cell_h = (py1 - py0) / c_h
     return px0 + (xs + 0.5) * cell_w, py0 + (ys + 0.5) * cell_h
+
+
+def _project_area_weighted(
+    cluster_mask: np.ndarray,
+    px_bbox: tuple[int, int, int, int],
+    c_h: int,
+    c_w: int,
+    q_h: int,
+    q_w: int,
+    patch_size: int,
+    scale_x: float,
+    scale_y: float,
+    area_threshold: float,
+) -> np.ndarray:
+    """Area-weighted variant of ``project_crop_mask_to_query_grid``'s "nearest_union" mode:
+    accumulates each foreground crop patch's real native-pixel rectangle overlap area into
+    every query patch it actually intersects, then thresholds each query cell by the same
+    area-fraction rule ``pixel_mask_to_patch_mask`` uses to build GT masks — instead of
+    nearest_union's point-sample-then-OR, which isn't that rule and can silently over- or
+    under-cover a query cell depending on the crop/query grid's relative resolution and
+    the (generally non-aligned) offset between the crop's box and the query grid.
+    """
+    px0, py0, px1, py1 = px_bbox
+    cell_w = (px1 - px0) / c_w
+    cell_h = (py1 - py0) / c_h
+    dx = patch_size * scale_x  # native px per query patch, x
+    dy = patch_size * scale_y  # native px per query patch, y
+
+    ys, xs = np.where(cluster_mask)
+    area_acc = np.zeros((q_h, q_w), dtype=np.float64)
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        fx0, fx1 = px0 + x * cell_w, px0 + (x + 1) * cell_w
+        fy0, fy1 = py0 + y * cell_h, py0 + (y + 1) * cell_h
+
+        col_lo = max(0, int(fx0 // dx))
+        col_hi = min(q_w - 1, int(fx1 // dx))
+        row_lo = max(0, int(fy0 // dy))
+        row_hi = min(q_h - 1, int(fy1 // dy))
+        for row in range(row_lo, row_hi + 1):
+            overlap_h = min(fy1, (row + 1) * dy) - max(fy0, row * dy)
+            if overlap_h <= 0:
+                continue
+            for col in range(col_lo, col_hi + 1):
+                overlap_w = min(fx1, (col + 1) * dx) - max(fx0, col * dx)
+                if overlap_w <= 0:
+                    continue
+                area_acc[row, col] += overlap_w * overlap_h
+
+    cell_area = dx * dy
+    if cell_area <= 0:
+        return np.zeros((q_h, q_w), dtype=bool)
+    return (area_acc / cell_area) >= area_threshold
 
 
 def project_crop_mask_to_query_grid(
@@ -162,12 +248,28 @@ def project_crop_mask_to_query_grid(
     patch_size: int,
     scale_x: float,
     scale_y: float,
+    mode: Literal["nearest_union", "area_weighted"] = "nearest_union",
+    area_threshold: float = 0.3,
 ) -> np.ndarray:
     """Project one crop-local cluster mask onto the full query's own (q_h, q_w) patch grid.
 
-    Each foreground crop patch is placed at its own center's native-pixel position (see
-    ``crop_patch_centers_to_native_px``) and snapped to the nearest full-query patch.
+    ``mode="nearest_union"`` (default, legacy behaviour): each foreground crop patch is
+    placed at its own center's native-pixel position (see
+    ``crop_patch_centers_to_native_px``) and snapped to the nearest full-query patch —
+    a point-sample union, not an area rule, so it can over- or under-cover a query cell
+    relative to how GT masks are built.
+
+    ``mode="area_weighted"``: see ``_project_area_weighted`` — uses the same area-fraction
+    rule GT masks are built with (``pixel_mask_to_patch_mask``'s ``>= area_threshold``),
+    so a two-stage prediction and its GT counterpart are computed by the same rule.
     """
+    if mode == "area_weighted":
+        return _project_area_weighted(
+            cluster_mask, px_bbox, c_h, c_w, q_h, q_w, patch_size, scale_x, scale_y, area_threshold
+        )
+    if mode != "nearest_union":
+        raise ValueError(f"Unknown projection mode: {mode!r}")
+
     ys, xs = np.where(cluster_mask)
     mask = np.zeros((q_h, q_w), dtype=bool)
     if len(xs) == 0:
@@ -239,8 +341,10 @@ def two_stage_predicted_clusters(
     pred_dbscan_min_samples: int,
     min_points_floor: int,
     q_pixel_mask: np.ndarray | None = None,
+    q_instance_pixel_masks: list[np.ndarray] | None = None,
     img_size: int | None = None,
     mask_patch_threshold: float | None = None,
+    projection_mode: Literal["nearest_union", "area_weighted"] = "nearest_union",
     collect_diagnostics: bool = False,
 ) -> tuple[list[dict], list[dict]]:
     """Predicted clusters for the two-stage pipeline's P/R/F1: one method state used for both
@@ -249,16 +353,24 @@ def two_stage_predicted_clusters(
 
     Each crop's own re-scored patches are thresholded, DBSCAN-clustered, and mean-patch-rejected
     against *cluster_reject_thr* exactly like ``annotate_cluster_rejection`` does for
-    single-step. Surviving clusters are projected onto the shared (q_h, q_w) query grid and
-    merged across every blob, keeping the biggest of any that collide.
+    single-step. Surviving clusters are projected onto the shared (q_h, q_w) query grid (see
+    ``project_crop_mask_to_query_grid``'s *mode* — pass *projection_mode* to opt into
+    "area_weighted" instead of the legacy "nearest_union" point-sample; *mask_patch_threshold*
+    doubles as that mode's area-fraction cutoff, defaulting to 0.3 when not given even if
+    *collect_diagnostics* is off) and merged across every blob, keeping the biggest of any that
+    collide.
 
     Returns ``(merged_predicted_clusters, blob_diagnostics)``. ``merged_predicted_clusters``
     (used for P/R/F1 via ``match_and_score``) is computed independent of *collect_diagnostics*.
     When *collect_diagnostics* is True (requires *q_pixel_mask*/*img_size*/*mask_patch_threshold*),
     ``blob_diagnostics`` gets one entry per blob — its own raw score map, threshold, every
-    DBSCAN cluster found in it (including rejected ones), and its own GT patch mask. Otherwise
+    DBSCAN cluster found in it (including rejected ones), its own (unioned) GT patch mask for
+    display, and — when *q_instance_pixel_masks* is also given — that same GT split into one
+    patch mask per real annotated query instance (``gt_instance_masks``), for callers doing
+    per-instance TP/FP/FN matching (see ``blob_crop_gt_instance_masks``). Otherwise
     ``blob_diagnostics`` is ``[]``.
     """
+    area_threshold = 0.3 if mask_patch_threshold is None else mask_patch_threshold
     candidates: list[dict] = []
     diagnostics: list[dict] = []
     for blob in blobs:
@@ -278,7 +390,17 @@ def two_stage_predicted_clusters(
                 if cl["rejected"]:
                     continue
                 projected = project_crop_mask_to_query_grid(
-                    cl["mask"], blob["px_bbox"], c_h, c_w, q_h, q_w, patch_size, scale_x, scale_y
+                    cl["mask"],
+                    blob["px_bbox"],
+                    c_h,
+                    c_w,
+                    q_h,
+                    q_w,
+                    patch_size,
+                    scale_x,
+                    scale_y,
+                    mode=projection_mode,
+                    area_threshold=area_threshold,
                 )
                 if not projected.any():
                     continue
@@ -303,6 +425,9 @@ def two_stage_predicted_clusters(
                     ],
                     "gt_mask": blob_crop_gt_mask(
                         blob, q_pixel_mask, img_size, mask_patch_threshold
+                    ),
+                    "gt_instance_masks": blob_crop_gt_instance_masks(
+                        blob, q_instance_pixel_masks, img_size, mask_patch_threshold
                     ),
                     "px_bbox": blob["px_bbox"],
                     "c_h": c_h,
