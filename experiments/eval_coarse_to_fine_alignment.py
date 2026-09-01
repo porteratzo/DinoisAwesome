@@ -30,6 +30,7 @@ from typing import NamedTuple
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 from dotenv import load_dotenv
@@ -92,8 +93,8 @@ class KeypointMatcherHead:
 
     def match(
         self,
-        ref_token: torch.Tensor,      # (D,)  L2-normalised
-        target_features: torch.Tensor, # (H_g, W_g, D)  L2-normalised
+        ref_token: torch.Tensor,  # (D,)  L2-normalised
+        target_features: torch.Tensor,  # (H_g, W_g, D)  L2-normalised
     ) -> tuple[torch.Tensor, float]:
         H_g, W_g, D = target_features.shape
         flat = F.normalize(target_features.reshape(H_g * W_g, D), p=2, dim=1)
@@ -109,8 +110,8 @@ def _extract_features(img_rgb: np.ndarray, encoder: DinoEncoder) -> torch.Tensor
 
 
 def _sample_feature_map(
-    feat: torch.Tensor,      # (H_g, W_g, D)
-    px_coords: np.ndarray,   # (N, 2) float32  [x, y] image pixels
+    feat: torch.Tensor,  # (H_g, W_g, D)
+    px_coords: np.ndarray,  # (N, 2) float32  [x, y] image pixels
     patch_size: int,
 ) -> torch.Tensor:
     """Bilinearly sample ``feat`` at image-pixel coords → (N, D) L2-normalised."""
@@ -132,27 +133,33 @@ def _sample_feature_map(
 
 
 def _build_affine_matrix(
-    angle_deg: float, scale: float, shear_deg: float,
-    tx: float, ty: float, cx: float, cy: float,
+    angle_deg: float,
+    scale: float,
+    shear_deg: float,
+    tx: float,
+    ty: float,
+    cx: float,
+    cy: float,
 ) -> np.ndarray:
     """3×3 forward affine homography (source px → destination px)."""
     theta = np.deg2rad(angle_deg)
     shear = np.deg2rad(shear_deg)
-    T_c     = np.array([[1, 0, -cx], [0, 1, -cy], [0, 0, 1]], dtype=np.float64)
-    T_c_inv = np.array([[1, 0,  cx], [0, 1,  cy], [0, 0, 1]], dtype=np.float64)
-    R  = np.array([[np.cos(theta), -np.sin(theta), 0],
-                   [np.sin(theta),  np.cos(theta), 0],
-                   [0, 0, 1]], dtype=np.float64)
-    S  = np.diag([scale, scale, 1.0])
+    T_c = np.array([[1, 0, -cx], [0, 1, -cy], [0, 0, 1]], dtype=np.float64)
+    T_c_inv = np.array([[1, 0, cx], [0, 1, cy], [0, 0, 1]], dtype=np.float64)
+    R = np.array(
+        [[np.cos(theta), -np.sin(theta), 0], [np.sin(theta), np.cos(theta), 0], [0, 0, 1]],
+        dtype=np.float64,
+    )
+    S = np.diag([scale, scale, 1.0])
     Sh = np.array([[1, np.tan(shear), 0], [0, 1, 0], [0, 0, 1]], dtype=np.float64)
-    T  = np.array([[1, 0, tx], [0, 1, ty], [0, 0, 1]], dtype=np.float64)
+    T = np.array([[1, 0, tx], [0, 1, ty], [0, 0, 1]], dtype=np.float64)
     return (T @ T_c_inv @ Sh @ S @ R @ T_c).astype(np.float32)
 
 
 def _apply_photometric(img: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     """Random brightness / contrast / blur augmentation."""
     alpha = float(rng.uniform(0.7, 1.3))
-    beta  = float(rng.uniform(-30.0, 30.0))
+    beta = float(rng.uniform(-30.0, 30.0))
     out = np.clip(img.astype(np.float32) * alpha + beta, 0, 255).astype(np.uint8)
     if rng.random() > 0.5:
         ksize = int(rng.choice([3, 5]))
@@ -163,9 +170,9 @@ def _apply_photometric(img: np.ndarray, rng: np.random.Generator) -> np.ndarray:
 def _alpha_overlay(base: np.ndarray, warp: np.ndarray, alpha: float = 0.45) -> np.ndarray:
     mask = (warp.sum(axis=2) > 0)[..., None].astype(np.float32)
     return np.clip(
-        base.astype(np.float32) * (1.0 - alpha * mask)
-        + warp.astype(np.float32) * alpha * mask,
-        0, 255,
+        base.astype(np.float32) * (1.0 - alpha * mask) + warp.astype(np.float32) * alpha * mask,
+        0,
+        255,
     ).astype(np.uint8)
 
 
@@ -180,19 +187,19 @@ def _mse(a: np.ndarray, b: np.ndarray) -> float:
 
 
 class _ViewInfo(NamedTuple):
-    M_fwd: np.ndarray       # (3, 3) forward affine  (I_A px → view px)
+    M_fwd: np.ndarray  # (3, 3) forward affine  (I_A px → view px)
     features: torch.Tensor  # (H_g, W_g, D)
-    img_rgb: np.ndarray     # (H, W, 3) uint8 augmented view
+    img_rgb: np.ndarray  # (H, W, 3) uint8 augmented view
 
 
 @dataclass
 class AlignmentResult:
-    H_coarse: np.ndarray       # (3, 3) coarse homography  (I_B → I_A frame)
-    image_b_coarse: np.ndarray # warped I_B (BGR)
-    src_pts: np.ndarray        # (M, 2) master keypoint pixel coords in I_A
-    dst_pts: np.ndarray        # (M, 2) matched pixel coords in I_B
-    inlier_mask: np.ndarray    # (M,) bool RANSAC inlier mask
-    match_sims: np.ndarray     # (M,) cosine similarities
+    H_coarse: np.ndarray  # (3, 3) coarse homography  (I_B → I_A frame)
+    image_b_coarse: np.ndarray  # warped I_B (BGR)
+    src_pts: np.ndarray  # (M, 2) master keypoint pixel coords in I_A
+    dst_pts: np.ndarray  # (M, 2) matched pixel coords in I_B
+    inlier_mask: np.ndarray  # (M,) bool RANSAC inlier mask
+    match_sims: np.ndarray  # (M,) cosine similarities
 
 
 def _generate_views(
@@ -210,7 +217,8 @@ def _generate_views(
             shear_deg=float(rng.uniform(-8, 8)),
             tx=float(rng.uniform(-0.1 * W_img, 0.1 * W_img)),
             ty=float(rng.uniform(-0.1 * H_img, 0.1 * H_img)),
-            cx=cx, cy=cy,
+            cx=cx,
+            cy=cy,
         )
         view_bgr = cv2.warpPerspective(image_a, M_fwd, (W_img, H_img))
         view_rgb = _apply_photometric(cv2.cvtColor(view_bgr, cv2.COLOR_BGR2RGB), rng)
@@ -250,41 +258,52 @@ def discover_master_keypoints(
     cycle_hits = np.zeros(N, dtype=np.int32)
     for view in views:
         warped_hom = view.M_fwd.astype(np.float64) @ px_hom.astype(np.float64)
-        warped_px  = (warped_hom[:2] / warped_hom[2:3]).T.astype(np.float32)
+        warped_px = (warped_hom[:2] / warped_hom[2:3]).T.astype(np.float32)
         valid = (
-            (warped_px[:, 0] >= 0) & (warped_px[:, 0] < W_img) &
-            (warped_px[:, 1] >= 0) & (warped_px[:, 1] < H_img)
+            (warped_px[:, 0] >= 0)
+            & (warped_px[:, 0] < W_img)
+            & (warped_px[:, 1] >= 0)
+            & (warped_px[:, 1] < H_img)
         )
         feat_at_warped = _sample_feature_map(view.features, warped_px, encoder.patch_size)
         nn_in_a = (feat_at_warped @ flat_a.T).argmax(dim=1).cpu().numpy()
-        nn_px = np.stack([
-            (nn_in_a % W_g + 0.5) * encoder.patch_size,
-            (nn_in_a // W_g + 0.5) * encoder.patch_size,
-        ], axis=1).astype(np.float32)
+        nn_px = np.stack(
+            [
+                (nn_in_a % W_g + 0.5) * encoder.patch_size,
+                (nn_in_a // W_g + 0.5) * encoder.patch_size,
+            ],
+            axis=1,
+        ).astype(np.float32)
         dist = np.linalg.norm(patch_px - nn_px, axis=1)
         cycle_hits += (valid & (dist < CYCLE_DIST_PX)).astype(np.int32)
 
     mnn_score_all = cycle_hits.astype(np.float32) / len(views)
     centroid = flat_a.mean(dim=0)
-    self_sim  = (flat_a @ centroid).cpu().numpy()
+    self_sim = (flat_a @ centroid).cpu().numpy()
 
     keep = (mnn_score_all > MNN_THRESHOLD) & (self_sim < SELF_SIM_THRESHOLD)
     kept_idx = np.where(keep)[0]
     log.info(
         "Phase 1 | Kept %d / %d patches  (mnn>%.2f, self_sim<%.2f)",
-        len(kept_idx), N, MNN_THRESHOLD, SELF_SIM_THRESHOLD,
+        len(kept_idx),
+        N,
+        MNN_THRESHOLD,
+        SELF_SIM_THRESHOLD,
     )
     if len(kept_idx) == 0:
         log.warning("No keypoints survived — falling back to top %d by mnn_score", max(20, N // 10))
-        kept_idx = np.argsort(mnn_score_all)[-max(20, N // 10):]
+        kept_idx = np.argsort(mnn_score_all)[-max(20, N // 10) :]
 
     return patch_px[kept_idx].astype(np.float32), mnn_score_all[kept_idx]
 
 
 def _mnn_filter(
-    src_px: np.ndarray, dst_px: np.ndarray,
-    flat_a: torch.Tensor, flat_b: torch.Tensor,
-    W_g: int, patch_size: int,
+    src_px: np.ndarray,
+    dst_px: np.ndarray,
+    flat_a: torch.Tensor,
+    flat_b: torch.Tensor,
+    W_g: int,
+    patch_size: int,
 ) -> np.ndarray:
     """Boolean mask: keep only mutual-nearest-neighbour correspondences."""
     N = flat_a.shape[0]
@@ -331,15 +350,15 @@ def align_images(
             sim_list.append(sim)
 
     if len(src_list) < 4:
-        raise RuntimeError(
-            f"Only {len(src_list)} matches above sim_threshold={MIN_MATCH_SIM}."
-        )
+        raise RuntimeError(f"Only {len(src_list)} matches above sim_threshold={MIN_MATCH_SIM}.")
 
     src_np = np.array(src_list, dtype=np.float32)
     dst_patch = torch.stack(dst_patch_list, dim=0)
     dst_px = (
         rescale_coords_to_image(dst_patch, (H_g, W_g), (H_img, W_img))
-        .cpu().numpy().astype(np.float32)
+        .cpu()
+        .numpy()
+        .astype(np.float32)
     )
 
     flat_a = F.normalize(feat_a.reshape(H_g * W_g, D), p=2, dim=1)
@@ -347,10 +366,11 @@ def align_images(
     mnn_mask = _mnn_filter(src_np, dst_px, flat_a, flat_b, W_g, encoder.patch_size)
     log.info(
         "Phase 2 | MNN filter: %d / %d correspondences retained",
-        int(mnn_mask.sum()), len(src_np),
+        int(mnn_mask.sum()),
+        len(src_np),
     )
-    src_np  = src_np[mnn_mask]
-    dst_px  = dst_px[mnn_mask]
+    src_np = src_np[mnn_mask]
+    dst_px = dst_px[mnn_mask]
     sims_np = np.array(sim_list, dtype=np.float32)[mnn_mask]
 
     if len(src_np) < 4:
@@ -361,7 +381,8 @@ def align_images(
     inlier_mask = inlier_mask.ravel().astype(bool)
     log.info(
         "Phase 2 | Homography inliers: %d / %d  (method=%s)",
-        int(inlier_mask.sum()), len(src_np),
+        int(inlier_mask.sum()),
+        len(src_np),
         "USAC_MAGSAC" if method == cv2.USAC_MAGSAC else "RANSAC",
     )
 
@@ -391,13 +412,19 @@ def refine_alignment(
         gray_a = cv2.GaussianBlur(gray_a, (ks, ks), 0)
         gray_b = cv2.GaussianBlur(gray_b, (ks, ks), 0)
 
-    H_fine: np.ndarray = np.eye(3, dtype=np.float32) if ECC_WARP_MODE == cv2.MOTION_HOMOGRAPHY \
+    H_fine: np.ndarray = (
+        np.eye(3, dtype=np.float32)
+        if ECC_WARP_MODE == cv2.MOTION_HOMOGRAPHY
         else np.eye(2, 3, dtype=np.float32)
+    )
     term = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, ECC_MAX_ITERS, ECC_EPS)
     try:
         _, H_fine = cv2.findTransformECC(
-            gray_a.astype(np.float32), gray_b.astype(np.float32),
-            H_fine, ECC_WARP_MODE, term,
+            gray_a.astype(np.float32),
+            gray_b.astype(np.float32),
+            H_fine,
+            ECC_WARP_MODE,
+            term,
         )
     except cv2.error as exc:
         log.warning("ECC did not converge (%s) — using identity residual", exc)
@@ -421,16 +448,20 @@ if not IMAGE_A_PATH.exists():
     )
 
 encoder = DinoEncoder(
-    version=DINO_VERSION,   # type: ignore[arg-type]
-    size=DINO_SIZE,         # type: ignore[arg-type]
+    version=DINO_VERSION,  # type: ignore[arg-type]
+    size=DINO_SIZE,  # type: ignore[arg-type]
     img_size=IMG_SIZE,
     layers=1,
     weights_dir=DINO_WEIGHTS_DIR,
 )
 log.info(
     "Backbone: DINOv%s-%s | patch_size=%d | grid=%dx%d | device=%s",
-    DINO_VERSION[1], DINO_SIZE,
-    encoder.patch_size, encoder.grid_h, encoder.grid_w, encoder.device,
+    DINO_VERSION[1],
+    DINO_SIZE,
+    encoder.patch_size,
+    encoder.grid_h,
+    encoder.grid_w,
+    encoder.device,
 )
 
 matcher = KeypointMatcherHead(sigma=MATCHER_SIGMA, beta=MATCHER_BETA)
@@ -444,9 +475,13 @@ image_a = cv2.resize(image_a, (IMG_SIZE, IMG_SIZE))
 # Synthetic I_B with a known ground-truth warp (replace with real I_B for actual data)
 rng_demo = np.random.default_rng(0)
 M_gt = _build_affine_matrix(
-    angle_deg=12.0, scale=0.92, shear_deg=3.0,
-    tx=15.0, ty=-10.0,
-    cx=IMG_SIZE / 2.0, cy=IMG_SIZE / 2.0,
+    angle_deg=12.0,
+    scale=0.92,
+    shear_deg=3.0,
+    tx=15.0,
+    ty=-10.0,
+    cx=IMG_SIZE / 2.0,
+    cy=IMG_SIZE / 2.0,
 )
 image_b = cv2.warpPerspective(image_a, M_gt, (IMG_SIZE, IMG_SIZE))
 log.info("Demo: I_B generated from I_A with a known synthetic warp")
@@ -500,10 +535,16 @@ fig, axes = plt.subplots(1, 2, figsize=(16, 7))
 # Left: keypoints on I_A coloured by MNN score
 axes[0].imshow(cv2.cvtColor(image_a, cv2.COLOR_BGR2RGB))
 sc = axes[0].scatter(
-    master_kp_px[:, 0], master_kp_px[:, 1],
-    c=mnn_scores, cmap="plasma",
-    vmin=MNN_THRESHOLD, vmax=1.0,
-    s=18, linewidths=0.3, edgecolors="white", zorder=5,
+    master_kp_px[:, 0],
+    master_kp_px[:, 1],
+    c=mnn_scores,
+    cmap="plasma",
+    vmin=MNN_THRESHOLD,
+    vmax=1.0,
+    s=18,
+    linewidths=0.3,
+    edgecolors="white",
+    zorder=5,
 )
 plt.colorbar(sc, ax=axes[0], label="MNN consensus score", fraction=0.03, pad=0.02)
 axes[0].set_title(
@@ -519,8 +560,13 @@ H_g, W_g, D = feat_a_all.shape
 flat_a_all = F.normalize(feat_a_all.reshape(H_g * W_g, D), p=2, dim=1)
 # Re-use the cycle_hits we'd need to recompute — approximate with the kept scores distribution
 axes[1].hist(mnn_scores, bins=20, color="#5b9bd5", edgecolor="white", linewidth=0.5)
-axes[1].axvline(MNN_THRESHOLD, color="red", linestyle="--", linewidth=1.5,
-                label=f"threshold={MNN_THRESHOLD:.2f}")
+axes[1].axvline(
+    MNN_THRESHOLD,
+    color="red",
+    linestyle="--",
+    linewidth=1.5,
+    label=f"threshold={MNN_THRESHOLD:.2f}",
+)
 axes[1].set_xlabel("MNN consensus score")
 axes[1].set_ylabel("count (kept keypoints)")
 axes[1].set_title("MNN score distribution (kept patches only)", fontsize=11)
@@ -536,6 +582,16 @@ plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "exp3_master_keypoints.png", dpi=150, bbox_inches="tight")
 plt.show()
 
+pd.DataFrame(
+    {"x_px": master_kp_px[:, 0], "y_px": master_kp_px[:, 1], "mnn_score": mnn_scores}
+).to_csv(OUTPUT_DIR / "exp3_master_keypoints.csv", index=False)
+log.info(
+    "Wrote %s (%d master keypoints, threshold=%.2f)",
+    OUTPUT_DIR / "exp3_master_keypoints.csv",
+    len(master_kp_px),
+    MNN_THRESHOLD,
+)
+
 # %% Experiment 4 — Feature matching and coarse homography
 log.info("Experiment 4: Feature matching + coarse homography …")
 
@@ -546,8 +602,7 @@ fig, axes = plt.subplots(1, 2, figsize=(16, 7))
 # Left: correspondence lines between I_A and I_B (inliers green, outliers red)
 canvas_w = IMG_SIZE * 2
 canvas = np.concatenate(
-    [cv2.cvtColor(image_a, cv2.COLOR_BGR2RGB),
-     cv2.cvtColor(image_b, cv2.COLOR_BGR2RGB)],
+    [cv2.cvtColor(image_a, cv2.COLOR_BGR2RGB), cv2.cvtColor(image_b, cv2.COLOR_BGR2RGB)],
     axis=1,
 )
 axes[0].imshow(canvas)
@@ -555,13 +610,16 @@ for i, (src, dst) in enumerate(zip(alignment.src_pts, alignment.dst_pts)):
     color = "#2ecc71" if alignment.inlier_mask[i] else "#e74c3c"
     lw = 0.8 if alignment.inlier_mask[i] else 0.4
     axes[0].plot(
-        [src[0], dst[0] + IMG_SIZE], [src[1], dst[1]],
-        color=color, linewidth=lw, alpha=0.7,
+        [src[0], dst[0] + IMG_SIZE],
+        [src[1], dst[1]],
+        color=color,
+        linewidth=lw,
+        alpha=0.7,
     )
-axes[0].scatter(alignment.src_pts[:, 0], alignment.src_pts[:, 1],
-                s=6, c="#2ecc71", zorder=5)
-axes[0].scatter(alignment.dst_pts[:, 0] + IMG_SIZE, alignment.dst_pts[:, 1],
-                s=6, c="#3498db", zorder=5)
+axes[0].scatter(alignment.src_pts[:, 0], alignment.src_pts[:, 1], s=6, c="#2ecc71", zorder=5)
+axes[0].scatter(
+    alignment.dst_pts[:, 0] + IMG_SIZE, alignment.dst_pts[:, 1], s=6, c="#3498db", zorder=5
+)
 axes[0].set_title(
     f"Correspondences  |  inliers {alignment.inlier_mask.sum()}/{len(alignment.inlier_mask)}\n"
     f"(green=inlier, red=outlier  |  left=I_A, right=I_B)",
@@ -630,7 +688,10 @@ ncc_c = _ncc(gray_a[ov_c], gray_c[ov_c])
 ncc_f = _ncc(gray_a[ov_f], gray_f[ov_f])
 log.info(
     "Metrics | coarse  MSE=%.2f  NCC=%.4f | final  MSE=%.2f  NCC=%.4f",
-    mse_c, ncc_c, mse_f, ncc_f,
+    mse_c,
+    ncc_c,
+    mse_f,
+    ncc_f,
 )
 
 labels_bar = ["Coarse", "Final (ECC)"]
@@ -645,7 +706,10 @@ for rect, v in zip(ax_mse.patches, [mse_c, mse_f]):
     ax_mse.text(
         rect.get_x() + rect.get_width() / 2.0,
         rect.get_height() * 1.01,
-        f"{v:.2f}", ha="center", va="bottom", fontsize=10,
+        f"{v:.2f}",
+        ha="center",
+        va="bottom",
+        fontsize=10,
     )
 
 ax_ncc.bar(labels_bar, [ncc_c, ncc_f], color=colors)
@@ -656,13 +720,35 @@ for rect, v in zip(ax_ncc.patches, [ncc_c, ncc_f]):
     ax_ncc.text(
         rect.get_x() + rect.get_width() / 2.0,
         rect.get_height() * 1.001,
-        f"{v:.4f}", ha="center", va="bottom", fontsize=10,
+        f"{v:.4f}",
+        ha="center",
+        va="bottom",
+        fontsize=10,
     )
 
 plt.suptitle("Exp 6: Alignment quality — coarse vs. ECC-refined", fontsize=12)
 plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "exp6_metrics.png", dpi=150, bbox_inches="tight")
 plt.show()
+
+run_metrics = pd.DataFrame(
+    [
+        {
+            "num_master_keypoints": len(master_kp_px),
+            "mnn_threshold": MNN_THRESHOLD,
+            "num_correspondences": len(alignment.inlier_mask),
+            "num_inliers": int(alignment.inlier_mask.sum()),
+            "inlier_ratio": float(alignment.inlier_mask.mean()),
+            "h_fine_deviation_from_identity": float(np.linalg.norm(H_fine - np.eye(3))),
+            "mse_coarse": mse_c,
+            "ncc_coarse": ncc_c,
+            "mse_final": mse_f,
+            "ncc_final": ncc_f,
+        }
+    ]
+)
+run_metrics.to_csv(OUTPUT_DIR / "exp6_metrics.csv", index=False)
+log.info("Wrote %s\n%s", OUTPUT_DIR / "exp6_metrics.csv", run_metrics.to_string(index=False))
 
 log.info("Done. Outputs written to %s", OUTPUT_DIR)
 

@@ -37,7 +37,6 @@ log = logging.getLogger("resolution_ablation.visualize_results")
 
 import argparse  # noqa: E402
 import dataclasses  # noqa: E402
-import pickle  # noqa: E402
 import sys  # noqa: E402
 from pathlib import Path  # noqa: E402
 
@@ -46,14 +45,14 @@ import pandas as pd  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "multiscale_ablation"))
 from common import (  # noqa: E402
-    CACHE_ROOT,
     DEFAULT_CROP_CONFIG,
     DEFAULT_SCORING_CONFIG,
     REPO_ROOT,
-    PairKey,
 )
 from methods import all_method_names  # noqa: E402
 from visualize_results import (  # noqa: E402
+    _pairs_root,
+    discover_cached_pairs,
     load_method_result,
     method_names_in,
     plot_metric_heatmap,
@@ -134,33 +133,6 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# ---------------------------------------------------------------------------
-# Cache readers — same shape as multiscale_ablation/visualize_results.py's, but
-# parameterised on crop_cfg (one per resolution) instead of a fixed module constant.
-# ---------------------------------------------------------------------------
-
-
-def _pairs_root(crop_cfg) -> Path:
-    return CACHE_ROOT / "methods" / f"{crop_cfg.hash()}__{SCORING_CFG.hash()}"
-
-
-def discover_cached_pairs(crop_cfg) -> list[tuple[PairKey, Path]]:
-    root = _pairs_root(crop_cfg)
-    if not root.exists():
-        return []
-    out = []
-    for pair_dir in sorted(root.iterdir()):
-        meta_path = pair_dir / "pair_meta.pkl"
-        if not meta_path.exists():
-            continue
-        meta = pickle.loads(meta_path.read_bytes())
-        pair = PairKey(
-            meta["part_type"], meta["instance_type"], meta["ref_number"], meta["query_number"]
-        )
-        out.append((pair, pair_dir))
-    return out
-
-
 def _display_order(
     method_names: list[str] | None, include_kmeans: bool, include_classifiers: bool
 ) -> list[str]:
@@ -190,14 +162,14 @@ def build_metrics_df(resolutions: list[int], sizes: list[str]) -> pd.DataFrame:
                 img_size=resolution,
                 layer_idx=LAYER_IDX_BY_SIZE[size],
             )
-            pairs = discover_cached_pairs(crop_cfg)
+            pairs = discover_cached_pairs(crop_cfg, SCORING_CFG)
             if not pairs:
                 log.warning(
                     "size=%s resolution=%dpx: no cached results under %s — "
                     "run run_experiments.py first",
                     size,
                     resolution,
-                    _pairs_root(crop_cfg),
+                    _pairs_root(crop_cfg, SCORING_CFG),
                 )
                 continue
             for pair, pair_dir in pairs:

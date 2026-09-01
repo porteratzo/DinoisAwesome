@@ -105,6 +105,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 from dotenv import load_dotenv
@@ -116,6 +117,7 @@ from dinoisawesome.abc3 import INSTANCE_TYPE_GROUPS, PART_TYPES, available_insta
 from dinoisawesome.instance_detection import extract_patch_tokens
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _shared.abc3_combos import combo_key  # noqa: E402
 from _shared.augmentations import (  # noqa: E402
     apply_blur,
     apply_color_jitter,
@@ -127,8 +129,8 @@ from _shared.augmentations import (  # noqa: E402
     pixel_only,
 )
 from _shared.mask_geometry import pixel_mask_to_patch_mask, scale_crop_box  # noqa: E402
-from _shared.prototype_ops import knn_fgbg_score  # noqa: E402
-from _shared.thresholding import iou_threshold_curve  # noqa: E402
+from _shared.prototype_ops import knn_score_heatmap, score_heatmap  # noqa: E402
+from _shared.thresholding import oracle_iou  # noqa: E402
 
 # %% Parameters
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -201,18 +203,6 @@ log.info(
 # %% Helpers shared across discovery / scoring / aggregation / plotting
 
 
-def combo_key(d: dict) -> tuple[str, str, str, int]:
-    """(part_type, instance_type group, class, instance_id) — a combo's stable identity."""
-    return (d["part_type"], d["group"], d["class"], d["instance_id"])
-
-
-def oracle_iou(raw: np.ndarray, gt_mask: np.ndarray, steps: int) -> float:
-    """Best patch-mask IoU any single global threshold on *raw* could achieve against
-    *gt_mask* — see augmented_prototype_oracle_iou.py's identical helper for rationale."""
-    _, ious = iou_threshold_curve(raw, gt_mask, steps)
-    return float(ious.max())
-
-
 def split_fg_bg_patches(
     patch_tokens: torch.Tensor,
     mask_px: np.ndarray,
@@ -255,20 +245,6 @@ def split_fg_bg_patches(
         bg = tokens
 
     return fg, bg
-
-
-def score_heatmap(tokens: torch.Tensor, prototype: torch.Tensor, h: int, w: int) -> np.ndarray:
-    """single_proto: cosine-similarity heatmap, prototype vs. every query patch."""
-    return (tokens @ prototype.T).reshape(h, w).cpu().float().numpy()
-
-
-def knn_score_heatmap(
-    tokens: torch.Tensor, fg_bank: torch.Tensor, bg_bank: torch.Tensor, k: int, h: int, w: int
-) -> np.ndarray:
-    """knn_fg/proto_fgbg heatmap — see _shared.prototype_ops.knn_fgbg_score. proto_fgbg
-    feeds single mean vectors (shape (1, C)) as fg_bank/bg_bank, so topk trivially reduces
-    to k=1 per side — the same formula, just with prototypes standing in for galleries."""
-    return knn_fgbg_score(tokens, fg_bank, bg_bank, k).reshape(h, w)
 
 
 def augmented_fg_gallery(clean_fg: torch.Tensor, fg_extra: list[torch.Tensor]) -> torch.Tensor:
@@ -488,9 +464,7 @@ clean_items: list[tuple] = []
 for combo in combos:
     ck = combo_key(combo)
     for scale, crop in combo["crops"].items():
-        clean_items.append(
-            (ck, scale, crop["img"], crop["mask_px"], crop["bg_exclude_mask_px"])
-        )
+        clean_items.append((ck, scale, crop["img"], crop["mask_px"], crop["bg_exclude_mask_px"]))
 
 for i in tqdm(range(0, len(clean_items), chunk_size), desc="Encoding clean baseline crops"):
     chunk = clean_items[i : i + chunk_size]
@@ -1122,7 +1096,6 @@ def plot_leaveoneout_bar(
     plt.close(fig)
 
 
-
 # %% Layer 1 figures — single-severity sweep, per method + cross-method comparison
 baseline_oracle_iou: dict[str, dict[str, float]] = {}
 best_over_baseline: dict[str, list[dict]] = {}
@@ -1153,6 +1126,23 @@ for method in METHOD_LABELS:
         OUTPUT_DIR / f"oracle_iou_curves__{method}.png",
         "oracle IoU (mean across combos)",
     )
+
+baseline_rows = [
+    {"method": method, "scale": scale, "baseline_oracle_iou": val}
+    for method, by_scale in baseline_oracle_iou.items()
+    for scale, val in by_scale.items()
+]
+pd.DataFrame(baseline_rows).to_csv(OUTPUT_DIR / "baseline_oracle_iou.csv", index=False)
+
+best_over_baseline_df = pd.DataFrame(
+    [{"method": method, **row} for method, rows in best_over_baseline.items() for row in rows]
+)
+best_over_baseline_df.to_csv(OUTPUT_DIR / "best_over_baseline.csv", index=False)
+log.info(
+    "Wrote %s and %s",
+    OUTPUT_DIR / "baseline_oracle_iou.csv",
+    OUTPUT_DIR / "best_over_baseline.csv",
+)
 
 log.info("Saved single-severity-sweep curve figures to %s", OUTPUT_DIR)
 
@@ -1258,6 +1248,12 @@ for method in METHOD_LABELS:
             row["n_combos"],
         )
 
+composed_endpoint_df = pd.DataFrame(
+    [{"method": method, **row} for method, rows in composed_endpoint_rows.items() for row in rows]
+)
+composed_endpoint_df.to_csv(OUTPUT_DIR / "composed_endpoint.csv", index=False)
+log.info("Wrote %s", OUTPUT_DIR / "composed_endpoint.csv")
+
 log.info("Saved composed-ensemble curve figures to %s", OUTPUT_DIR)
 
 # %% Layer 3 figures — all-augmentations composed, leave-one-out across families
@@ -1319,6 +1315,16 @@ for method in METHOD_LABELS:
             r["std_iou"],
             r["mean_delta_vs_baseline"],
         )
+
+leaveoneout_endpoint_df = pd.DataFrame(
+    [
+        {"method": method, **row}
+        for method, rows in leaveoneout_endpoint_rows.items()
+        for row in rows
+    ]
+)
+leaveoneout_endpoint_df.to_csv(OUTPUT_DIR / "leave_one_out_endpoint.csv", index=False)
+log.info("Wrote %s", OUTPUT_DIR / "leave_one_out_endpoint.csv")
 
 log.info("Saved leave-one-out figures (per method) to %s", OUTPUT_DIR)
 

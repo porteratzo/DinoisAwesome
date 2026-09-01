@@ -39,6 +39,14 @@ def iou_tuned_threshold(raw: np.ndarray, gt_mask: np.ndarray, steps: int) -> flo
     return float(candidates[int(np.argmax(ious))])
 
 
+def oracle_iou(raw: np.ndarray, gt_mask: np.ndarray, steps: int) -> float:
+    """Best patch-mask IoU any single global threshold on *raw* could achieve against
+    *gt_mask* — an oracle upper bound (unlike `iou_tuned_threshold`, this never returns
+    the threshold itself, only the resulting best IoU)."""
+    _, ious = iou_threshold_curve(raw, gt_mask, steps)
+    return float(ious.max())
+
+
 def roi_binary_mask(
     raw: np.ndarray, method: str, single_threshold: float, percentile: float | None = None
 ) -> np.ndarray:

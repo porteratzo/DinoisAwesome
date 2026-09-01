@@ -47,6 +47,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 from dotenv import load_dotenv
@@ -56,7 +57,12 @@ from PIL import Image
 from dinoisawesome import DinoEncoder, EncoderWithCache, compute_exemplar_features, load_annotations
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from _shared.mask_geometry import mask_bbox_px, pixel_mask_to_patch_mask  # noqa: E402
+from _shared.augmentations import mean_color  # noqa: E402
+from _shared.mask_geometry import (  # noqa: E402
+    mask_bbox_px,
+    pixel_mask_to_patch_mask,
+    scale_crop_box,
+)
 
 # %% Parameters
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -110,15 +116,7 @@ def scale_crop_boxes(
     """PIL-style crop boxes (x0, y0, x1, y1) linearly interpolated from the whole image
     (t=0) to a tight, padded bbox around *pixel_mask* (t=1)."""
     H, W = pixel_mask.shape
-    rmin, rmax, cmin, cmax = mask_bbox_px(pixel_mask)
-    pad_r = int((rmax - rmin) * padding_frac)
-    pad_c = int((cmax - cmin) * padding_frac)
-    close_box = (
-        max(0, cmin - pad_c),
-        max(0, rmin - pad_r),
-        min(W, cmax + pad_c),
-        min(H, rmax + pad_r),
-    )
+    close_box = scale_crop_box(pixel_mask, "close", padding_frac)
     if close_box[2] - close_box[0] < min_crop_size or close_box[3] - close_box[1] < min_crop_size:
         raise ValueError(
             f"Closest crop {close_box} is below MIN_CROP_SIZE={min_crop_size}px — "
@@ -201,6 +199,28 @@ cls_sim_to_global = cls_sim_matrix[0]  # whole-crop CLS token, same comparison
 
 log.info("Object-embedding similarity to global (t=0): %s", np.round(sim_to_global, 3))
 log.info("Object-embedding similarity to closest (t=1): %s", np.round(sim_to_closest, 3))
+
+# %% Numeric results — per-scale table + full similarity matrices
+scale_df = pd.DataFrame(
+    {
+        "t": t_values,
+        "crop_w": [box[2] - box[0] for box in boxes],
+        "crop_h": [box[3] - box[1] for box in boxes],
+        "n_masked_patches": n_masked_patches,
+        "sim_to_global": sim_to_global,
+        "sim_to_closest": sim_to_closest,
+        "cls_sim_to_global": cls_sim_to_global,
+    }
+)
+scale_df.to_csv(OUTPUT_DIR / "scale_similarity.csv", index=False)
+_t_labels = [f"{t:.2f}" for t in t_values]
+pd.DataFrame(sim_matrix, index=_t_labels, columns=_t_labels).to_csv(
+    OUTPUT_DIR / "scale_similarity_matrix.csv"
+)
+pd.DataFrame(cls_sim_matrix, index=_t_labels, columns=_t_labels).to_csv(
+    OUTPUT_DIR / "scale_cls_similarity_matrix.csv"
+)
+log.info("Wrote %s\n%s", OUTPUT_DIR / "scale_similarity.csv", scale_df.to_string(index=False))
 
 # %% Visualization — crop sequence with the instance bbox overlaid
 rmin, rmax, cmin, cmax = mask_bbox_px(mask)
@@ -329,7 +349,7 @@ def letterbox_pad(img: Image.Image) -> tuple[Image.Image, tuple[int, int]]:
     """
     w, h = img.size
     side = max(w, h)
-    fill = tuple(int(c) for c in np.array(img).reshape(-1, 3).mean(axis=0))
+    fill = mean_color(img)
     canvas = Image.new("RGB", (side, side), fill)
     left, top = (side - w) // 2, (side - h) // 2
     canvas.paste(img, (left, top))
@@ -408,6 +428,22 @@ log.info("Aspect ratios: %s", ASPECT_RATIOS)
 log.info("distort vs. conserve similarity, per ratio: %s", np.round(sim_distort_vs_conserve, 3))
 log.info("distort vs. ratio=1.0 anchor, per ratio:    %s", np.round(sim_distort_vs_anchor, 3))
 log.info("conserve vs. ratio=1.0 anchor, per ratio:   %s", np.round(sim_conserve_vs_anchor, 3))
+
+# %% Numeric results — aspect-ratio table
+aspect_df = pd.DataFrame(
+    {
+        "ratio": ASPECT_RATIOS,
+        "n_masked_patches_distort": [ar_masked_patches[(r, "distort")] for r in ASPECT_RATIOS],
+        "n_masked_patches_conserve": [ar_masked_patches[(r, "conserve")] for r in ASPECT_RATIOS],
+        "sim_distort_vs_conserve": sim_distort_vs_conserve,
+        "sim_distort_vs_anchor": sim_distort_vs_anchor,
+        "sim_conserve_vs_anchor": sim_conserve_vs_anchor,
+    }
+)
+aspect_df.to_csv(OUTPUT_DIR / "aspect_ratio_similarity.csv", index=False)
+log.info(
+    "Wrote %s\n%s", OUTPUT_DIR / "aspect_ratio_similarity.csv", aspect_df.to_string(index=False)
+)
 
 # %% Visualization — distort vs. conserve crops, one column per aspect ratio
 fig, axes = plt.subplots(2, len(ASPECT_RATIOS), figsize=(3.0 * len(ASPECT_RATIOS), 6.4))

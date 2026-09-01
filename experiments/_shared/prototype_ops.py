@@ -60,3 +60,15 @@ def knn_fgbg_score(
     fg_topk = fg_sim.topk(min(k, fg_sim.shape[1]), dim=1).values.mean(dim=1)
     bg_topk = bg_sim.topk(min(k, bg_sim.shape[1]), dim=1).values.mean(dim=1)
     return (fg_topk - bg_topk).cpu().float().numpy()
+
+
+def score_heatmap(tokens: torch.Tensor, prototype: torch.Tensor, h: int, w: int) -> np.ndarray:
+    """Single-prototype cosine-similarity heatmap: *prototype* vs. every query patch."""
+    return (tokens @ prototype.T).reshape(h, w).cpu().float().numpy()
+
+
+def knn_score_heatmap(
+    tokens: torch.Tensor, fg_bank: torch.Tensor, bg_bank: torch.Tensor, k: int, h: int, w: int
+) -> np.ndarray:
+    """``knn_fgbg_score`` reshaped to the query's own (h, w) patch grid."""
+    return knn_fgbg_score(tokens, fg_bank, bg_bank, k).reshape(h, w)

@@ -108,7 +108,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from dotenv import load_dotenv
 from PIL import Image
 from scipy import ndimage
@@ -121,9 +120,14 @@ from dinoisawesome.abc3 import INSTANCE_TYPE_GROUPS, PART_TYPES, available_insta
 from dinoisawesome.instance_detection import extract_patch_tokens
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _shared.abc3_combos import combo_key  # noqa: E402
 from _shared.mask_geometry import patch_fg_fraction, scale_crop_box  # noqa: E402
-from _shared.prototype_ops import knn_fgbg_score  # noqa: E402
-from _shared.thresholding import iou_threshold_curve  # noqa: E402
+from _shared.prototype_ops import (  # noqa: E402
+    extract_patch_tokens_batch_with_cls,
+    knn_score_heatmap,
+    score_heatmap,
+)
+from _shared.thresholding import oracle_iou  # noqa: E402
 
 # %% Parameters
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -228,58 +232,10 @@ log.info(
 # %% Core helpers — combo identity, scoring, oracle IoU
 
 
-def combo_key(d: dict) -> tuple[str, str, str, int]:
-    """(part_type, instance_type group, class, instance_id) — a combo's stable identity."""
-    return (d["part_type"], d["group"], d["class"], d["instance_id"])
-
-
-def oracle_iou(raw: np.ndarray, gt_mask: np.ndarray, steps: int) -> float:
-    """Best patch-mask IoU any single global threshold on *raw* could achieve against
-    *gt_mask* — see augmented_prototype_oracle_iou.py's identical helper for rationale."""
-    _, ious = iou_threshold_curve(raw, gt_mask, steps)
-    return float(ious.max())
-
-
 def annotate_bar_values(ax, bars, fmt: str = "%.3f") -> None:
     """Print each bar's own height above it — bar-chart differences in this file are often
     a few hundredths of oracle IoU, too small to read reliably off the y-axis alone."""
     ax.bar_label(bars, fmt=fmt, fontsize=7, padding=2)
-
-
-def score_heatmap(tokens: torch.Tensor, prototype: torch.Tensor, h: int, w: int) -> np.ndarray:
-    """ "proto" method: cosine-similarity heatmap, prototype vs. every query patch."""
-    return (tokens @ prototype.T).reshape(h, w).cpu().float().numpy()
-
-
-def knn_score_heatmap(
-    tokens: torch.Tensor, fg_bank: torch.Tensor, bg_bank: torch.Tensor, k: int, h: int, w: int
-) -> np.ndarray:
-    """ "knn_fgbg" method heatmap — see _shared.prototype_ops.knn_fgbg_score."""
-    return knn_fgbg_score(tokens, fg_bank, bg_bank, k).reshape(h, w)
-
-
-def extract_tokens_batch_with_cls(
-    encoder: DinoEncoder, images: list[Image.Image], layer_idx: int, debias: bool = False
-) -> list[tuple[torch.Tensor, torch.Tensor, int, int]]:
-    """Batched patch-token + [CLS]-token extraction — _shared.prototype_ops.
-    extract_patch_tokens_batch's sibling, also returning each image's own L2-normalised
-    [CLS] token (that helper discards it, matching extract_patch_tokens). CLS is *not*
-    L2-normalised by DinoEncoder itself (unlike patch tokens), so it's normalised here.
-    debias only ever affects patch tokens (see dinoisawesome.encoder), never CLS.
-    """
-    out = encoder(images, layers=[layer_idx], debias=debias)
-    patches = out.patches[:, 0]  # (B, H, W, D)
-    cls = F.normalize(out.cls[:, 0], p=2, dim=-1)  # (B, D)
-    _, grid_h, grid_w, D = patches.shape
-    return [
-        (
-            F.normalize(patches[b].reshape(grid_h * grid_w, D), p=2, dim=-1),
-            cls[b],
-            grid_h,
-            grid_w,
-        )
-        for b in range(patches.shape[0])
-    ]
 
 
 # %% Step 1/2 helpers — spatial filter + attention check
@@ -721,7 +677,7 @@ crop_items: list[tuple[tuple, str]] = [
 for i in tqdm(range(0, len(crop_items), chunk_size), desc="Encoding mid/close crops"):
     chunk = crop_items[i : i + chunk_size]
     images = [combos_by_key[ck]["crops"][scale]["img"] for ck, scale in chunk]
-    encoded = extract_tokens_batch_with_cls(encoder, images, LAYER_IDX, debias=DEBIAS)
+    encoded = extract_patch_tokens_batch_with_cls(encoder, images, LAYER_IDX, debias=DEBIAS)
     for (ck, scale), (tokens, cls, grid_h, grid_w) in zip(chunk, encoded):
         crop = combos_by_key[ck]["crops"][scale]
         crop["tokens"], crop["grid_h"], crop["grid_w"] = tokens, grid_h, grid_w
@@ -905,6 +861,23 @@ log.info(
     "Scoring complete: %d combos x %d stages x %d methods", len(combos), len(STAGES), len(METHODS)
 )
 
+_per_combo_rows = [
+    {
+        "method": method,
+        "stage": stage,
+        "part_type": ck[0],
+        "group": ck[1],
+        "class": ck[2],
+        "instance_id": ck[3],
+        "oracle_iou": iou,
+    }
+    for method, by_stage in iou_lookup.items()
+    for stage, by_ck in by_stage.items()
+    for ck, iou in by_ck.items()
+]
+pd.DataFrame(_per_combo_rows).to_csv(OUTPUT_DIR / "oracle_iou_per_combo.csv", index=False)
+log.info("Wrote %s (%d rows)", OUTPUT_DIR / "oracle_iou_per_combo.csv", len(_per_combo_rows))
+
 # %% Part 8 — aggregate + bar chart
 
 
@@ -988,6 +961,8 @@ def plot_oracle_iou_bar_chart(summary_df: pd.DataFrame, title: str, out_path: Pa
 summary_df = stage_method_summary()
 log.info("Oracle-IoU summary (mean +/- std across %d combos):", len(combos))
 log_stage_method_summary(summary_df)
+summary_df.to_csv(OUTPUT_DIR / "oracle_iou_by_stage.csv", index=False)
+log.info("Wrote %s", OUTPUT_DIR / "oracle_iou_by_stage.csv")
 
 _aggregate_chart_path = OUTPUT_DIR / "oracle_iou_by_stage.png"
 plot_oracle_iou_bar_chart(
@@ -1004,6 +979,7 @@ log.info("Saved oracle-IoU bar chart to %s", _aggregate_chart_path)
 # results" below) — one bar chart per instance-type group makes that visible directly in
 # the oracle-IoU numbers, rather than relying on the qualitative figures plus the Part 6
 # per-scale survival log to catch it.
+_group_summary_frames = []
 for _group in sorted(combos_by_group):
     _group_keys = {combo_key(c) for c in combos_by_group[_group]}
     _group_summary_df = stage_method_summary(_group_keys)
@@ -1014,6 +990,8 @@ for _group in sorted(combos_by_group):
         len(_group_keys),
     )
     log_stage_method_summary(_group_summary_df)
+    _group_summary_df.insert(0, "group", _group)
+    _group_summary_frames.append(_group_summary_df)
 
     _group_chart_path = OUTPUT_DIR / f"oracle_iou_by_stage__{_group.replace(' ', '_')}.png"
     plot_oracle_iou_bar_chart(
@@ -1023,6 +1001,11 @@ for _group in sorted(combos_by_group):
         _group_chart_path,
     )
     log.info("Saved oracle-IoU bar chart for group=%r to %s", _group, _group_chart_path)
+
+pd.concat(_group_summary_frames, ignore_index=True).to_csv(
+    OUTPUT_DIR / "oracle_iou_by_stage_per_group.csv", index=False
+)
+log.info("Wrote %s", OUTPUT_DIR / "oracle_iou_by_stage_per_group.csv")
 
 # %% [markdown]
 # ## Qualitative figures — one figure set per focus combo, all three scales
@@ -1676,6 +1659,7 @@ def run_composed_pipeline(branch: str) -> pd.DataFrame:
                 }
             )
     cascade_summary_df = pd.DataFrame(cascade_summary_rows)
+    cascade_summary_df["n_patches"] = cascade_summary_df["variant"].map(patch_counts)
 
     log.info(
         "Composed-pipeline (branch=%s) oracle-IoU summary (mean +/- std across %d combos):",
@@ -1702,6 +1686,7 @@ def run_composed_pipeline(branch: str) -> pd.DataFrame:
         "negative means removing it *helped* -> the step hurts in composition):",
         branch,
     )
+    leave_one_out_rows: list[dict] = []
     for method in METHODS:
         full_mean = cascade_summary_df[
             (cascade_summary_df.variant == "full") & (cascade_summary_df.method == method)
@@ -1719,6 +1704,25 @@ def run_composed_pipeline(branch: str) -> pd.DataFrame:
                 full_mean,
                 variant_mean,
             )
+            leave_one_out_rows.append(
+                {
+                    "method": method,
+                    "removed_step": variant,
+                    "full_mean_iou": full_mean,
+                    "without_mean_iou": variant_mean,
+                    "delta": delta,
+                }
+            )
+
+    cascade_summary_df.to_csv(OUTPUT_DIR / f"cascade_summary__{branch}.csv", index=False)
+    pd.DataFrame(leave_one_out_rows).to_csv(
+        OUTPUT_DIR / f"cascade_leave_one_out__{branch}.csv", index=False
+    )
+    log.info(
+        "Wrote %s and %s",
+        OUTPUT_DIR / f"cascade_summary__{branch}.csv",
+        OUTPUT_DIR / f"cascade_leave_one_out__{branch}.csv",
+    )
 
     fig, ax = plt.subplots(figsize=(11, 5.5))
     x = np.arange(len(CASCADE_CHART_ORDER))

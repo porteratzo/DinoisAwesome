@@ -117,6 +117,9 @@ load_dotenv(_REPO_ROOT / ".env")
 
 data_dir = _REPO_ROOT / "data" / "abc3"
 
+OUTPUT_DIR = _REPO_ROOT / "outputs" / "object_detection" / "multiscale_crop_ablation"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
 # %% Parameters
 # PART_TYPES imported from dinoisawesome.abc3 (shared with augmented_prototype_oracle_iou.py's
 # batch mode)
@@ -1514,6 +1517,7 @@ if not metrics_rows:
     )
 metrics_df = pd.DataFrame(metrics_rows)
 log.info("\n%s", metrics_df.to_string(index=False))
+metrics_df.to_csv(OUTPUT_DIR / "metrics.csv", index=False)
 
 summary_df = (
     metrics_df.groupby("method")[["precision", "recall", "f1", "mean_iou", "count_error"]]
@@ -1521,8 +1525,10 @@ summary_df = (
     .reindex(METHOD_DISPLAY_ORDER)
 )
 log.info("Summary (mean across part types):\n%s", summary_df.to_string())
+summary_df.to_csv(OUTPUT_DIR / "summary.csv")
 
 cross_df = pd.DataFrame(cross_rows)
+cross_df.to_csv(OUTPUT_DIR / "cross_scale.csv", index=False)
 cross_gt = cross_df[cross_df["gt_present"]]
 cross_matrix = (
     cross_gt.groupby(["roi_source", "score_scale"])["iou"]
@@ -1536,6 +1542,14 @@ log.info(
     len(cross_gt),
     len(cross_df),
     cross_matrix.to_string(),
+)
+cross_matrix.to_csv(OUTPUT_DIR / "cross_scale_matrix.csv")
+log.info(
+    "Wrote %s, %s, %s, %s",
+    OUTPUT_DIR / "metrics.csv",
+    OUTPUT_DIR / "summary.csv",
+    OUTPUT_DIR / "cross_scale.csv",
+    OUTPUT_DIR / "cross_scale_matrix.csv",
 )
 
 # %% [markdown]
@@ -2829,6 +2843,14 @@ log.info(
     FOCUS_PART_TYPE,
     PRED_DBSCAN_EPS,
     ms_sweep_df.to_string(index=False),
+)
+
+eps_sweep_df.to_csv(OUTPUT_DIR / f"eps_sweep__{FOCUS_PART_TYPE}.csv", index=False)
+ms_sweep_df.to_csv(OUTPUT_DIR / f"min_samples_sweep__{FOCUS_PART_TYPE}.csv", index=False)
+log.info(
+    "Wrote %s and %s",
+    OUTPUT_DIR / f"eps_sweep__{FOCUS_PART_TYPE}.csv",
+    OUTPUT_DIR / f"min_samples_sweep__{FOCUS_PART_TYPE}.csv",
 )
 
 fig, axes = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)

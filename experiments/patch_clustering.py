@@ -21,6 +21,7 @@ from urllib.request import urlretrieve
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch.nn.functional as F
 from dotenv import load_dotenv
 from PIL import Image
@@ -32,6 +33,9 @@ from dinoisawesome import DinoEncoder
 # %% Parameters
 _REPO_ROOT = Path(__file__).parent.parent
 load_dotenv(_REPO_ROOT / ".env")
+
+OUTPUT_DIR = _REPO_ROOT / "outputs" / "patch_clustering"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Set IMAGE_PATH to a local file path, or leave as None to download the example.
 IMAGE_PATH: Path | None = _REPO_ROOT / "data" / "tiger.jpeg"
@@ -200,6 +204,18 @@ for name, algo, X in algo_configs:
     log.info("%-44s  %d clusters  %d noise", name.replace("\n", " "), n_found, n_noise)
     cluster_results.append((name, labels))
 
+pd.DataFrame(
+    [
+        {
+            "algorithm": name.replace("\n", " "),
+            "n_clusters": len(set(labels) - {-1}),
+            "n_noise": int((labels == -1).sum()),
+        }
+        for name, labels in cluster_results
+    ]
+).to_csv(OUTPUT_DIR / "cluster_summary.csv", index=False)
+log.info("Wrote %s", OUTPUT_DIR / "cluster_summary.csv")
+
 # %% Visualise cluster assignments (full-image patches)
 OVERLAY_ALPHA = 0.60
 CMAP = plt.get_cmap("tab20")
@@ -364,6 +380,18 @@ for name, algo, X in algo_configs_fg:
     n_noise = int((labels == -1).sum())
     log.info("FG %-40s  %d clusters  %d noise", name.replace("\n", " "), n_found, n_noise)
     cluster_results_fg.append((name, labels))
+
+pd.DataFrame(
+    [
+        {
+            "algorithm": name.replace("\n", " "),
+            "n_clusters": len(set(labels) - {-1}),
+            "n_noise": int((labels == -1).sum()),
+        }
+        for name, labels in cluster_results_fg
+    ]
+).to_csv(OUTPUT_DIR / "cluster_summary_foreground.csv", index=False)
+log.info("Wrote %s", OUTPUT_DIR / "cluster_summary_foreground.csv")
 
 # %% Visualise foreground-only clustering
 fg_mask_2d = fg_result["foreground_mask_feature"]  # (H_GRID, W_GRID) bool

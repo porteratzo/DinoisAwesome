@@ -49,6 +49,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 from dotenv import load_dotenv
@@ -302,6 +303,40 @@ for family, spec in AUGMENTATIONS.items():
         np.round(mean_sim, 3),
         np.round(std_sim, 3),
     )
+
+# %% Numeric results — per-crop table + per-family/severity aggregate
+entries_df = pd.DataFrame(
+    [
+        {
+            "image_stem": e["image_stem"],
+            "class": e["class"],
+            "instance_id": e["instance_id"],
+            "family": e["family"],
+            "value": e["value"],
+            "n_masked_patches": e["n_masked_patches"],
+            "similarity": e["similarity"],
+        }
+        for e in entries
+    ]
+)
+entries_df.to_csv(OUTPUT_DIR / "per_crop_similarity.csv", index=False)
+
+summary_rows = [
+    {"family": family, "value": val, "mean_similarity": mean, "std_similarity": std}
+    for family, spec in AUGMENTATIONS.items()
+    for val, mean, std in zip(
+        spec["values"], drift_summary[family]["mean"], drift_summary[family]["std"]
+    )
+]
+summary_df = pd.DataFrame(summary_rows)
+summary_df.to_csv(OUTPUT_DIR / "drift_summary.csv", index=False)
+log.info(
+    "Wrote %s (%d rows) and %s\n%s",
+    OUTPUT_DIR / "per_crop_similarity.csv",
+    len(entries_df),
+    OUTPUT_DIR / "drift_summary.csv",
+    summary_df.to_string(index=False),
+)
 
 # %% Visualization — augmented crop grid, one row per family (reference instance only;
 # a grid across all instances would be unreadable, so this is a qualitative sample —

@@ -81,6 +81,7 @@ from dinoisawesome import DinoEncoder, EncoderWithCache, compute_exemplar_featur
 from dinoisawesome.abc3 import INSTANCE_TYPE_GROUPS, PART_TYPES, available_instance_groups
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _shared.abc3_combos import combo_key  # noqa: E402
 from _shared.feature_transforms import (  # noqa: E402
     apply_affine,
     fit_cov_eigh,
@@ -92,8 +93,8 @@ from _shared.feature_transforms import (  # noqa: E402
     zca_matrix,
 )
 from _shared.mask_geometry import pixel_mask_to_patch_mask, scale_crop_box  # noqa: E402
-from _shared.prototype_ops import knn_fgbg_score  # noqa: E402
-from _shared.thresholding import iou_threshold_curve  # noqa: E402
+from _shared.prototype_ops import knn_score_heatmap, score_heatmap  # noqa: E402
+from _shared.thresholding import oracle_iou  # noqa: E402
 
 # %% Parameters
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -193,18 +194,6 @@ log.info(
 # %% Helpers shared across discovery / scoring / aggregation / plotting
 
 
-def combo_key(d: dict) -> tuple[str, str, str, int]:
-    """(part_type, instance_type group, class, instance_id) — a combo's stable identity."""
-    return (d["part_type"], d["group"], d["class"], d["instance_id"])
-
-
-def oracle_iou(raw: np.ndarray, gt_mask: np.ndarray, steps: int) -> float:
-    """Best patch-mask IoU any single global threshold on *raw* could achieve against
-    *gt_mask* — see augmented_prototype_oracle_iou.py's identical helper for rationale."""
-    _, ious = iou_threshold_curve(raw, gt_mask, steps)
-    return float(ious.max())
-
-
 def split_fg_bg_patches_raw(
     patch_tokens: torch.Tensor,
     mask_px: np.ndarray,
@@ -242,17 +231,6 @@ def split_fg_bg_patches_raw(
         bg = tokens
 
     return fg, bg
-
-
-def score_heatmap(tokens: torch.Tensor, prototype: torch.Tensor, h: int, w: int) -> np.ndarray:
-    """single_proto: cosine-similarity heatmap, prototype vs. every query patch."""
-    return (tokens @ prototype.T).reshape(h, w).cpu().float().numpy()
-
-
-def knn_score_heatmap(
-    tokens: torch.Tensor, fg_bank: torch.Tensor, bg_bank: torch.Tensor, k: int, h: int, w: int
-) -> np.ndarray:
-    return knn_fgbg_score(tokens, fg_bank, bg_bank, k).reshape(h, w)
 
 
 def knn_euclid_score_heatmap(
@@ -666,6 +644,31 @@ for _, row in summary_df.iterrows():
         row.std_iou,
         row.n_combos,
     )
+summary_df.to_csv(OUTPUT_DIR / "oracle_iou_by_pipeline.csv", index=False)
+
+per_combo_rows = [
+    {
+        "pipeline": pipeline,
+        "param": param,
+        "method": method,
+        "part_type": ck[0],
+        "group": ck[1],
+        "class": ck[2],
+        "instance_id": ck[3],
+        "oracle_iou": iou,
+    }
+    for pipeline, by_param in iou_lookup.items()
+    for param, by_method in by_param.items()
+    for method, by_ck in by_method.items()
+    for ck, iou in by_ck.items()
+]
+pd.DataFrame(per_combo_rows).to_csv(OUTPUT_DIR / "oracle_iou_per_combo.csv", index=False)
+log.info(
+    "Wrote %s and %s (%d per-combo rows)",
+    OUTPUT_DIR / "oracle_iou_by_pipeline.csv",
+    OUTPUT_DIR / "oracle_iou_per_combo.csv",
+    len(per_combo_rows),
+)
 
 _headline_path = OUTPUT_DIR / "oracle_iou_by_pipeline.png"
 plot_pipeline_bar_chart(
@@ -684,6 +687,30 @@ overall_best_param: dict[str, dict[str, Any]] = {
 }
 
 # %% Part 7 — sweep curves: epsilon (global/bg ZCA + Mahalanobis), k (PCA truncation)
+eps_sweep_rows = []
+for pipeline, method in [
+    ("global_zca", "single_proto"),
+    ("global_zca", "knn_fgbg"),
+    ("bg_zca", "single_proto"),
+    ("bg_zca", "knn_fgbg"),
+    ("mahalanobis", "mahalanobis_knn"),
+]:
+    for eps in EPS_SWEEP:
+        mean, std, n = mean_std_iou(iou_lookup, pipeline, eps, method)
+        eps_sweep_rows.append(
+            {
+                "pipeline": pipeline,
+                "method": method,
+                "eps": eps,
+                "mean_iou": mean,
+                "std_iou": std,
+                "n_combos": n,
+            }
+        )
+eps_sweep_df = pd.DataFrame(eps_sweep_rows)
+eps_sweep_df.to_csv(OUTPUT_DIR / "eps_sweep.csv", index=False)
+log.info("Wrote %s", OUTPUT_DIR / "eps_sweep.csv")
+
 fig, ax = plt.subplots(figsize=(8, 5.5))
 for pipeline, method in [
     ("global_zca", "single_proto"),
@@ -705,6 +732,17 @@ _eps_path = OUTPUT_DIR / "eps_sweep.png"
 fig.savefig(_eps_path, dpi=150, bbox_inches="tight")
 plt.close(fig)
 log.info("Saved epsilon-sweep curve to %s", _eps_path)
+
+pca_sweep_rows = []
+for method in METHODS_BY_PIPELINE["pca_truncate"]:
+    for k in PCA_K_SWEEP:
+        mean, std, n = mean_std_iou(iou_lookup, "pca_truncate", k, method)
+        pca_sweep_rows.append(
+            {"method": method, "k": k, "mean_iou": mean, "std_iou": std, "n_combos": n}
+        )
+pca_sweep_df = pd.DataFrame(pca_sweep_rows)
+pca_sweep_df.to_csv(OUTPUT_DIR / "pca_k_sweep.csv", index=False)
+log.info("Wrote %s", OUTPUT_DIR / "pca_k_sweep.csv")
 
 fig, ax = plt.subplots(figsize=(7, 5.5))
 for method in METHODS_BY_PIPELINE["pca_truncate"]:
@@ -730,15 +768,25 @@ for combo in combos:
     if ck in fg_raw_lookup:
         combos_by_group[ck[1]].append(ck)
 
+group_summary_frames = []
 for group, cks in combos_by_group.items():
     group_df = pipeline_method_summary(iou_lookup, combo_keys=set(cks))
+    group_df.insert(0, "group", group)
+    group_summary_frames.append(group_df)
     _group_path = OUTPUT_DIR / f"oracle_iou_by_pipeline__{group.replace(' ', '_')}.png"
     plot_pipeline_bar_chart(
         group_df,
         f"Feature-space transforms — oracle IoU, group={group} (n={len(cks)} combos)",
         _group_path,
     )
-log.info("Saved %d per-group breakdown charts", len(combos_by_group))
+pd.concat(group_summary_frames, ignore_index=True).to_csv(
+    OUTPUT_DIR / "oracle_iou_by_pipeline_per_group.csv", index=False
+)
+log.info(
+    "Saved %d per-group breakdown charts and %s",
+    len(combos_by_group),
+    OUTPUT_DIR / "oracle_iou_by_pipeline_per_group.csv",
+)
 
 # %% Part 9 — qualitative figure: every pipeline's score map for one focus combo
 focus_combo = next(

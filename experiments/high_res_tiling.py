@@ -20,6 +20,7 @@
 # %% Logging — must be before torch import
 import logging
 import os
+import sys
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,6 +35,7 @@ from pathlib import Path
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 from dotenv import load_dotenv
@@ -48,6 +50,9 @@ from dinoisawesome.instance_detection import (
     extract_patch_tokens,
     extract_peaks,
 )
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _shared.mask_geometry import pixel_mask_to_patch_mask  # noqa: E402
 
 # %% Parameters
 _REPO_ROOT = Path(__file__).parent.parent
@@ -185,9 +190,7 @@ def encode_tiled(
                 np.array(image).transpose(2, 0, 1).astype(np.float32) / 255.0
             ).to(_dev)
         elif isinstance(image, np.ndarray):
-            img_t = torch.from_numpy(
-                image.transpose(2, 0, 1).astype(np.float32) / 255.0
-            ).to(_dev)
+            img_t = torch.from_numpy(image.transpose(2, 0, 1).astype(np.float32) / 255.0).to(_dev)
         else:
             img_t = image.float().to(_dev)
         # Resize full image on GPU
@@ -200,18 +203,21 @@ def encode_tiled(
         # Per-crop: slice → resize to encoder.img_size → ImageNet-normalise → stack
         _mean = _IMAGENET_MEAN_T.to(_dev)
         _std = _IMAGENET_STD_T.to(_dev)
-        batch_t = torch.stack([
-            (
-                F.interpolate(
-                    img_big_t[:, y0:y1, x0:x1].unsqueeze(0),
-                    size=(encoder.img_size, encoder.img_size),
-                    mode="bilinear",
-                    align_corners=False,
-                ).squeeze(0)
-                - _mean
-            ) / _std
-            for y0, y1, x0, x1, _, _ in tile_meta
-        ])  # (B, 3, img_size, img_size) — pre-processed, bypasses encoder.preprocess
+        batch_t = torch.stack(
+            [
+                (
+                    F.interpolate(
+                        img_big_t[:, y0:y1, x0:x1].unsqueeze(0),
+                        size=(encoder.img_size, encoder.img_size),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0)
+                    - _mean
+                )
+                / _std
+                for y0, y1, x0, x1, _, _ in tile_meta
+            ]
+        )  # (B, 3, img_size, img_size) — pre-processed, bypasses encoder.preprocess
         out = encoder(batch_t, debias=debias)
 
     else:
@@ -525,6 +531,11 @@ log.info(
     stats_h["within_std"],
 )
 
+pd.DataFrame([{"axis": "vertical", **stats_v}, {"axis": "horizontal", **stats_h}]).to_csv(
+    OUTPUT_DIR / "exp3_seam_quality.csv", index=False
+)
+log.info("Wrote %s", OUTPUT_DIR / "exp3_seam_quality.csv")
+
 # Visualise the cross-patch similarity map
 H_F, W_F, _ = feat_no_ov.shape
 sim_across_h = torch.zeros(H_F, W_F - 1)
@@ -712,6 +723,23 @@ fig.tight_layout()
 fig.savefig(OUTPUT_DIR / "exp4_seam_vs_overlap.png", dpi=150)
 plt.show()
 
+overlap_summary_df = pd.DataFrame(
+    [
+        {
+            "overlap_px": r["overlap_px"],
+            "seam_v_mean": r["stats_v"]["seam_mean"],
+            "seam_v_std": r["stats_v"]["seam_std"],
+            "seam_h_mean": r["stats_h"]["seam_mean"],
+            "seam_h_std": r["stats_h"]["seam_std"],
+            "within_mean": r["stats_v"]["within_mean"],
+            "within_std": r["stats_v"]["within_std"],
+        }
+        for r in overlap_results
+    ]
+)
+overlap_summary_df.to_csv(OUTPUT_DIR / "exp4_overlap_sweep.csv", index=False)
+log.info("Wrote %s", OUTPUT_DIR / "exp4_overlap_sweep.csv")
+
 log.info("Exp 4 complete.")
 
 # %% Experiment 5 — Blending method comparison (fixed overlap)
@@ -797,6 +825,23 @@ plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "exp5_blend_comparison.png", dpi=150, bbox_inches="tight")
 plt.show()
 
+blend_summary_df = pd.DataFrame(
+    [
+        {
+            "blend": blend,
+            "seam_v_mean": res["stats_v"]["seam_mean"],
+            "seam_v_std": res["stats_v"]["seam_std"],
+            "seam_h_mean": res["stats_h"]["seam_mean"],
+            "seam_h_std": res["stats_h"]["seam_std"],
+            "within_mean": res["stats_v"]["within_mean"],
+            "within_std": res["stats_v"]["within_std"],
+        }
+        for blend, res in blend_results.items()
+    ]
+)
+blend_summary_df.to_csv(OUTPUT_DIR / "exp5_blend_comparison.csv", index=False)
+log.info("Wrote %s", OUTPUT_DIR / "exp5_blend_comparison.csv")
+
 # %% Experiment 6 — Cross-scale self-similarity
 log.info("Experiment 6: Cross-scale self-similarity …")
 
@@ -821,6 +866,17 @@ log.info(
     cross_sim.min(),
     cross_sim.max(),
 )
+pd.DataFrame(
+    [
+        {
+            "mean": float(cross_sim.mean()),
+            "std": float(cross_sim.std()),
+            "min": float(cross_sim.min()),
+            "max": float(cross_sim.max()),
+        }
+    ]
+).to_csv(OUTPUT_DIR / "exp6_cross_scale_sim.csv", index=False)
+log.info("Wrote %s", OUTPUT_DIR / "exp6_cross_scale_sim.csv")
 
 fig, axes = plt.subplots(1, 3, figsize=(16, 5))
 
@@ -891,13 +947,7 @@ def extract_masked_exemplar(
     flat = feat_map.reshape(-1, feat_map.shape[-1])
     if pixel_mask is None:
         return flat
-    mask_pil = Image.fromarray(pixel_mask.astype(np.uint8) * 255)
-    mask_res = np.array(mask_pil.resize((img_size, img_size), Image.NEAREST)) > 0
-    ph = img_size // grid_h
-    pw = img_size // grid_w
-    tiled_m = mask_res.reshape(grid_h, ph, grid_w, pw)
-    patch_den = tiled_m.mean(axis=(1, 3))
-    patch_mask_2d = patch_den >= threshold
+    patch_mask_2d = pixel_mask_to_patch_mask(pixel_mask, grid_h, grid_w, img_size, threshold)
     sel = torch.from_numpy(patch_mask_2d.reshape(-1))
     return flat[sel] if sel.any() else flat
 
@@ -974,7 +1024,9 @@ feat_ex_full = compute_exemplar_features(exemplar_masked_full, mode=EXEMPLAR_MOD
 query_tokens_full, q_h_full, q_w_full = extract_patch_tokens(
     encoder_full, img, LAYER_IDX, debias=with_debias
 )
-dm_full = compute_density_map(query_tokens_full, feat_ex_full, q_h_full, q_w_full, DENSITY_THRESHOLD)
+dm_full = compute_density_map(
+    query_tokens_full, feat_ex_full, q_h_full, q_w_full, DENSITY_THRESHOLD
+)
 peaks_full = extract_peaks(dm_full, PEAK_KERNEL_SIZE, MIN_PEAK_THRESHOLD)
 
 log.info("Full-size peaks: %d", len(peaks_full))
@@ -1093,6 +1145,15 @@ plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "exp7_detection_comparison.png", dpi=150, bbox_inches="tight")
 plt.show()
 
+pd.DataFrame(
+    [
+        {"approach": "baseline", "grid": f"{H_GRID}x{W_GRID}", "n_peaks": len(peaks_base)},
+        {"approach": "tiled", "grid": f"{H_2x}x{W_2x}", "n_peaks": len(peaks_tiled)},
+        {"approach": "full-size", "grid": f"{ex_h_full}x{ex_w_full}", "n_peaks": len(peaks_full)},
+    ]
+).to_csv(OUTPUT_DIR / "exp7_detection_comparison.csv", index=False)
+log.info("Wrote %s", OUTPUT_DIR / "exp7_detection_comparison.csv")
+
 # %% Experiment 7.1 — Instance detection: LHa_1 as reference, LHa_2 as query
 log.info("Experiment 7.1: Instance detection — reference=LHa_1, query=LHa_2 …")
 
@@ -1158,7 +1219,12 @@ if len(peaks_base2):
     axes[0, 2].scatter(
         (pb2_np[:, 0] + 0.5) * PATCH_SIZE,
         (pb2_np[:, 1] + 0.5) * PATCH_SIZE,
-        c="red", s=120, marker="o", linewidths=1.5, edgecolors="white", zorder=5,
+        c="red",
+        s=120,
+        marker="o",
+        linewidths=1.5,
+        edgecolors="white",
+        zorder=5,
     )
 axes[0, 2].set_title(f"Baseline detections — {len(peaks_base2)} found", fontsize=10)
 axes[0, 2].axis("off")
@@ -1179,7 +1245,12 @@ if len(peaks_tiled2):
     axes[1, 2].scatter(
         (pt2_np[:, 0] + 0.5) * px_per_patch_2x2,
         (pt2_np[:, 1] + 0.5) * px_per_patch_2x2,
-        c="red", s=120, marker="o", linewidths=1.5, edgecolors="white", zorder=5,
+        c="red",
+        s=120,
+        marker="o",
+        linewidths=1.5,
+        edgecolors="white",
+        zorder=5,
     )
 axes[1, 2].set_title(f"Tiled detections — {len(peaks_tiled2)} found", fontsize=10)
 axes[1, 2].axis("off")
@@ -1200,7 +1271,12 @@ if len(peaks_full2):
     axes[2, 2].scatter(
         (pf2_np[:, 0] + 0.5) * px_per_patch_full2,
         (pf2_np[:, 1] + 0.5) * px_per_patch_full2,
-        c="red", s=120, marker="o", linewidths=1.5, edgecolors="white", zorder=5,
+        c="red",
+        s=120,
+        marker="o",
+        linewidths=1.5,
+        edgecolors="white",
+        zorder=5,
     )
 axes[2, 2].set_title(f"Full-size detections — {len(peaks_full2)} found", fontsize=10)
 axes[2, 2].axis("off")
@@ -1215,6 +1291,19 @@ plt.suptitle(
 plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "exp7_1_cross_image_detection.png", dpi=150, bbox_inches="tight")
 plt.show()
+
+pd.DataFrame(
+    [
+        {"approach": "baseline", "grid": f"{H_GRID}x{W_GRID}", "n_peaks": len(peaks_base2)},
+        {"approach": "tiled", "grid": f"{H_2x2}x{W_2x2}", "n_peaks": len(peaks_tiled2)},
+        {
+            "approach": "full-size",
+            "grid": f"{q_h_full2}x{q_w_full2}",
+            "n_peaks": len(peaks_full2),
+        },
+    ]
+).to_csv(OUTPUT_DIR / "exp7_1_cross_image_detection.csv", index=False)
+log.info("Wrote %s", OUTPUT_DIR / "exp7_1_cross_image_detection.csv")
 
 # %% Summary
 log.info("── High-Res Tiling Summary ─────────────────────────────────────────")
@@ -1321,7 +1410,7 @@ times_tiled = _time_runs(
         overlap_px=DEFAULT_OVERLAP,
         blend="linear",
         debias=with_debias,
-        resize_backend='cv2_linear'
+        resize_backend="cv2_linear",
     ),
     encoder.device,
 )
@@ -1344,7 +1433,7 @@ for label, t_arr in zip(
 
 labels_8 = [
     f"Baseline\n({BASE_IMG_SIZE}px  {H_GRID}×{W_GRID})",
-    f"Tiled {N_TILES}×{N_TILES}\n({EFFECTIVE_SIZE}px  {N_TILES*H_GRID}×{N_TILES*W_GRID})",
+    f"Tiled {N_TILES}×{N_TILES}\n({EFFECTIVE_SIZE}px  {N_TILES * H_GRID}×{N_TILES * W_GRID})",
     f"Full-size\n({EFFECTIVE_SIZE}px  {encoder_full.grid_h}×{encoder_full.grid_w})",
 ]
 means_8 = np.array([times_base.mean(), times_tiled.mean(), times_full.mean()]) * 1e3
@@ -1386,6 +1475,16 @@ plt.suptitle(
 plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "exp8_throughput.png", dpi=150, bbox_inches="tight")
 plt.show()
+
+pd.DataFrame(
+    {
+        "run": np.arange(N_TIMING_RUNS),
+        "baseline_ms": times_base * 1e3,
+        "tiled_ms": times_tiled * 1e3,
+        "full_size_ms": times_full * 1e3,
+    }
+).to_csv(OUTPUT_DIR / "exp8_throughput.csv", index=False)
+log.info("Wrote %s", OUTPUT_DIR / "exp8_throughput.csv")
 
 # %% Experiment 9 — encode_tiled step-level breakdown across resize backends
 #
@@ -1511,9 +1610,7 @@ def _encode_tiled_instrumented(
                 np.array(image).transpose(2, 0, 1).astype(np.float32) / 255.0
             ).to(dev)
         elif isinstance(image, np.ndarray):
-            _img_t = torch.from_numpy(
-                image.transpose(2, 0, 1).astype(np.float32) / 255.0
-            ).to(dev)
+            _img_t = torch.from_numpy(image.transpose(2, 0, 1).astype(np.float32) / 255.0).to(dev)
         else:
             _img_t = image.float().to(dev)
         img_big_t = F.interpolate(
@@ -1538,18 +1635,21 @@ def _encode_tiled_instrumented(
                 tile_meta.append((y0, y1, x0, x1, y1 - y0, x1 - x0))
         _mean = _IMAGENET_MEAN_T.to(dev)
         _std = _IMAGENET_STD_T.to(dev)
-        batch_t = torch.stack([
-            (
-                F.interpolate(
-                    img_big_t[:, y0:y1, x0:x1].unsqueeze(0),
-                    size=(encoder.img_size, encoder.img_size),
-                    mode="bilinear",
-                    align_corners=False,
-                ).squeeze(0)
-                - _mean
-            ) / _std
-            for y0, y1, x0, x1, _, _ in tile_meta
-        ])
+        batch_t = torch.stack(
+            [
+                (
+                    F.interpolate(
+                        img_big_t[:, y0:y1, x0:x1].unsqueeze(0),
+                        size=(encoder.img_size, encoder.img_size),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0)
+                    - _mean
+                )
+                / _std
+                for y0, y1, x0, x1, _, _ in tile_meta
+            ]
+        )
         _sync()
         t_crop = time.perf_counter() - t0
 
@@ -1622,9 +1722,9 @@ def _encode_tiled_instrumented(
 
 
 # Pre-build GPU tensor once — used for the "gpu" backend
-_img_gpu = torch.from_numpy(
-    np.array(img).transpose(2, 0, 1).astype(np.float32) / 255.0
-).to(encoder.device)
+_img_gpu = torch.from_numpy(np.array(img).transpose(2, 0, 1).astype(np.float32) / 255.0).to(
+    encoder.device
+)
 
 # Backends to compare: (label, resize_backend, image_input)
 _backends: list[tuple[str, str, "Image.Image | torch.Tensor"]] = [
@@ -1681,7 +1781,10 @@ for _blabel, _bname, _bimg in _backends:
         _arr = _all_results[_blabel][_s]
         log.info(
             "    %-12s  mean=%6.1f ms  std=%5.1f ms  (%4.1f%%)",
-            _s, _arr.mean(), _arr.std(), _arr.mean() / _total * 100,
+            _s,
+            _arr.mean(),
+            _arr.std(),
+            _arr.mean() / _total * 100,
         )
     log.info("    %-12s  mean=%6.1f ms", "TOTAL", _total)
 
@@ -1694,14 +1797,16 @@ fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 _bar_w = 0.55
 _x_pos = np.arange(_n_backends)
 for _si, (_s, _color) in enumerate(zip(_step_names, _colors_9)):
-    _bottoms_arr = np.array([
-        sum(_all_results[bl][ss].mean() for ss in _step_names[:_si])
-        for bl in _b_labels
-    ])
+    _bottoms_arr = np.array(
+        [sum(_all_results[bl][ss].mean() for ss in _step_names[:_si]) for bl in _b_labels]
+    )
     _means_arr = np.array([_all_results[bl][_s].mean() for bl in _b_labels])
     axes[0].bar(
-        _x_pos, _means_arr, bottom=_bottoms_arr,
-        color=_color, width=_bar_w,
+        _x_pos,
+        _means_arr,
+        bottom=_bottoms_arr,
+        color=_color,
+        width=_bar_w,
         label=_step_names[_si].capitalize(),
     )
 
@@ -1709,8 +1814,13 @@ for _si, (_s, _color) in enumerate(zip(_step_names, _colors_9)):
 for _xi, _bl in zip(_x_pos, _b_labels):
     _tot = sum(_all_results[_bl][_s].mean() for _s in _step_names)
     axes[0].text(
-        _xi, _tot + _tot * 0.01, f"{_tot:.1f} ms",
-        ha="center", va="bottom", fontsize=8, fontweight="bold",
+        _xi,
+        _tot + _tot * 0.01,
+        f"{_tot:.1f} ms",
+        ha="center",
+        va="bottom",
+        fontsize=8,
+        fontweight="bold",
     )
 
 axes[0].set_xticks(_x_pos)
@@ -1721,9 +1831,7 @@ axes[0].legend(loc="upper right", fontsize=8)
 axes[0].grid(axis="y", alpha=0.3)
 
 # Right: box plot of total time per backend
-_totals_per_backend = [
-    sum(_all_results[bl][_s] for _s in _step_names) for bl in _b_labels
-]
+_totals_per_backend = [sum(_all_results[bl][_s] for _s in _step_names) for bl in _b_labels]
 axes[1].boxplot(
     _totals_per_backend,
     patch_artist=True,
@@ -1744,5 +1852,19 @@ plt.suptitle(
 plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "exp9_encode_tiled_breakdown.png", dpi=150, bbox_inches="tight")
 plt.show()
+
+pd.DataFrame(
+    [
+        {
+            "backend": _bname,
+            "step": _s,
+            "mean_ms": float(_all_results[_blabel][_s].mean()),
+            "std_ms": float(_all_results[_blabel][_s].std()),
+        }
+        for _blabel, _bname, _ in _backends
+        for _s in _step_names
+    ]
+).to_csv(OUTPUT_DIR / "exp9_encode_tiled_breakdown.csv", index=False)
+log.info("Wrote %s", OUTPUT_DIR / "exp9_encode_tiled_breakdown.csv")
 
 # %%
