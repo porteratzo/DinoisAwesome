@@ -127,6 +127,18 @@ MIN_CROP_SIZE = 128
 ORACLE_THRESHOLD_STEPS = 25
 SCALES: list[str] = ["close", "mid"]  # crop scales; "global" (full ref image) is bg-only, Part 3.6
 
+# Which scales feed each variant's fg gallery, swept as an outer axis over every pipeline x
+# method x param cell below. bg stays fixed at close+mid+global ("all") for every scale combo,
+# mirroring multiscale_crop_ablation.py's FGBG_SOURCE_COMBOS convention (bg is always the full
+# "all" set regardless of which fg combo is scored) — isolates "does broadening the fg gallery's
+# own scales help" from any bg-side effect. "close+mid" is the combo every pipeline comparison
+# in this file used before this sweep existed, kept here as the reference point.
+SCALE_COMBOS: dict[str, list[str]] = {
+    "close+mid": ["close", "mid"],
+    "global+mid": ["global", "mid"],
+    "global+mid+close": ["global", "mid", "close"],
+}
+
 KNN_FGBG_NUM_NEIGHBOURS = 10
 
 # Matches the taxonomy's stated epsilon range; shared by global_zca, bg_zca, and mahalanobis
@@ -178,7 +190,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 log.info(
     "RUN_PART_TYPES=%s ref_number=%d query_number=%d  |  DINO%s-%s img_size=%d layer=%d  |  "
-    "pipelines=%s eps_sweep=%s pca_k_sweep=%s",
+    "pipelines=%s eps_sweep=%s pca_k_sweep=%s scale_combos=%s",
     RUN_PART_TYPES,
     REF_NUMBER,
     QUERY_NUMBER,
@@ -189,6 +201,7 @@ log.info(
     PIPELINES,
     EPS_SWEEP,
     PCA_K_SWEEP,
+    SCALE_COMBOS,
 )
 
 # %% Helpers shared across discovery / scoring / aggregation / plotting
@@ -446,10 +459,11 @@ for (part_type, group), pixel_mask in group_query_masks.items():
         pixel_mask, q_h, q_w, IMG_SIZE, MASK_PATCH_THRESHOLD
     )
 
-# %% Part 3.6 — RAW full-reference-image patch tokens: the "global" bg source
-# One full-image encode per part type, reused as every one of that part type's combos'
-# extra bg source below (Part 4) — same role as the sibling fundamental scripts' "global"
-# scale, just kept raw here instead of normalized.
+# %% Part 3.6 — RAW full-reference-image patch tokens: the "global" scale source
+# One full-image encode per part type, reused below (Part 4) as every one of that part
+# type's combos' "global" scale — both the always-on bg source and, for scale combos whose
+# SCALE_COMBOS entry includes "global", an fg source too. Same role as the sibling
+# fundamental scripts' "global" scale, just kept raw here instead of normalized.
 ref_raw_encodings: dict[str, tuple[torch.Tensor, int, int]] = {}
 for part_type in tqdm(sorted(ref_images), desc="Encoding ref images (raw, global bg source)"):
     out = encoder(ref_images[part_type], layers=[LAYER_IDX], debias=True)
@@ -458,10 +472,12 @@ for part_type in tqdm(sorted(ref_images), desc="Encoding ref images (raw, global
     ref_raw_encodings[part_type] = (patches[0].reshape(r_h * r_w, -1).float(), r_h, r_w)
 
 # %% Part 4 — encode every combo's close/mid crops (RAW), pool per-combo fg/bg galleries
-# fg = close+mid fg patches; bg = close+mid bg patches + this combo's own "global" bg
-# (Part 3.6's full ref-image tokens, minus the whole instance-type group's ref mask) — the
-# same multiscale pooling augmented_prototype_oracle_iou_knn_fgbg.py's Part 3.5 builds, kept
-# raw here instead of L2-normalized.
+# bg = close+mid bg patches + this combo's own "global" bg (Part 3.6's full ref-image tokens,
+# minus the whole instance-type group's ref mask) — the same multiscale pooling
+# augmented_prototype_oracle_iou_knn_fgbg.py's Part 3.5 builds, kept raw here instead of
+# L2-normalized, and always "all" scales regardless of which fg SCALE_COMBOS entry is being
+# scored (see SCALE_COMBOS' docstring above). fg is built per (combo, scale) below and
+# assembled into whichever scale combo a given sweep cell asks for, further down in this part.
 fg_by_scale_raw: dict[tuple, torch.Tensor] = {}
 bg_by_scale_raw: dict[tuple, torch.Tensor] = {}
 
@@ -488,11 +504,25 @@ for i in tqdm(range(0, len(clean_items), chunk_size), desc="Encoding combo crops
         fg_by_scale_raw[(ck, scale)] = fg
         bg_by_scale_raw[(ck, scale)] = bg
 
-combo_bg_global_raw: dict[tuple, torch.Tensor] = {}
+# "global" scale, per combo: fg is this combo's own ref_mask projected onto the full
+# ref-image patch grid (the object's own patches, at the encoder's whole-image resolution);
+# bg is the same full-image tokens with the whole instance-type group's ref mask excluded
+# (unchanged from before this sweep existed — previously its own combo_bg_global_raw dict).
 for combo in combos:
     ck = combo_key(combo)
     part_type, group = ck[0], ck[1]
     r_tokens_raw, r_h, r_w = ref_raw_encodings[part_type]
+
+    fg_patch_mask = pixel_mask_to_patch_mask(
+        combo["ref_mask"], r_h, r_w, IMG_SIZE, MASK_PATCH_THRESHOLD
+    )
+    fg_flat = torch.from_numpy(fg_patch_mask.reshape(-1)).to(r_tokens_raw.device)
+    global_fg = r_tokens_raw[fg_flat]
+    if global_fg.shape[0] == 0:
+        log.warning("%s: global fg mask empty after patch-grid projection — using all patches", ck)
+        global_fg = r_tokens_raw
+    fg_by_scale_raw[(ck, "global")] = global_fg
+
     exclude_mask_px = group_ref_masks.get((part_type, group), combo["ref_mask"])
     exclude_patch_mask = pixel_mask_to_patch_mask(
         exclude_mask_px, r_h, r_w, IMG_SIZE, MASK_PATCH_THRESHOLD
@@ -502,42 +532,80 @@ for combo in combos:
     if global_bg.shape[0] == 0:
         log.warning("%s: global bg mask empty after patch-grid projection — using all patches", ck)
         global_bg = r_tokens_raw
-    combo_bg_global_raw[ck] = global_bg
+    bg_by_scale_raw[(ck, "global")] = global_bg
 
-fg_raw_lookup: dict[tuple, torch.Tensor] = {}
 bg_raw_lookup: dict[tuple, torch.Tensor] = {}
 for ck, scales in scales_by_ck.items():
-    fg_raw_lookup[ck] = torch.cat([fg_by_scale_raw[(ck, s)] for s in scales], dim=0)
     bg_raw_lookup[ck] = torch.cat(
-        [bg_by_scale_raw[(ck, s)] for s in scales] + [combo_bg_global_raw[ck]], dim=0
+        [bg_by_scale_raw[(ck, s)] for s in scales] + [bg_by_scale_raw[(ck, "global")]], dim=0
     )
 
-log.info("Built raw fg/bg galleries for %d combos", len(fg_raw_lookup))
+# fg gallery, per (combo, scale-combo name): built for every SCALE_COMBOS entry whose scales
+# are all present for this combo. "close"/"mid" can be missing (dropped below MIN_CROP_SIZE,
+# see scales_by_ck in Part 2); "global" is always present since it's just the full ref image.
+fg_raw_lookup: dict[tuple[tuple, str], torch.Tensor] = {}
+for ck, scales in scales_by_ck.items():
+    available = {*scales, "global"}
+    for combo_name, combo_scales in SCALE_COMBOS.items():
+        if not all(s in available for s in combo_scales):
+            log.warning(
+                "%s: scale combo %r needs %s, only %s available — skipping this combo",
+                ck,
+                combo_name,
+                combo_scales,
+                sorted(available),
+            )
+            continue
+        fg_raw_lookup[(ck, combo_name)] = torch.cat(
+            [fg_by_scale_raw[(ck, s)] for s in combo_scales], dim=0
+        )
 
-# %% Part 5 — main per-combo fit + score sweep
-iou_lookup: IouLookup = {}
-for pipeline in PIPELINES:
-    params = SWEPT_PIPELINES.get(pipeline, [None])
-    iou_lookup[pipeline] = {
-        param: {method: {} for method in METHODS_BY_PIPELINE[pipeline]} for param in params
-    }
+log.info(
+    "Built raw bg galleries for %d combos and raw fg galleries for %d (combo, scale-combo) cells",
+    len(bg_raw_lookup),
+    len(fg_raw_lookup),
+)
+
+# %% Part 5 — main per-combo fit + score sweep, repeated once per SCALE_COMBOS entry
+
+
+def new_iou_lookup() -> IouLookup:
+    lookup: IouLookup = {}
+    for pipeline in PIPELINES:
+        params = SWEPT_PIPELINES.get(pipeline, [None])
+        lookup[pipeline] = {
+            param: {method: {} for method in METHODS_BY_PIPELINE[pipeline]} for param in params
+        }
+    return lookup
+
+
+iou_lookup_by_combo: dict[str, IouLookup] = {name: new_iou_lookup() for name in SCALE_COMBOS}
 
 for combo in tqdm(combos, desc="Part 5: fitting + scoring"):
     ck = combo_key(combo)
     part_type, group = ck[0], ck[1]
-    if ck not in fg_raw_lookup:
+    if ck not in bg_raw_lookup:
         continue
-    fg_raw, bg_raw = fg_raw_lookup[ck], bg_raw_lookup[ck]
-    if fg_raw.shape[0] == 0 or bg_raw.shape[0] == 0:
-        log.warning("%s: empty fg/bg raw gallery — skipping", ck)
+    bg_raw = bg_raw_lookup[ck]
+    if bg_raw.shape[0] == 0:
+        log.warning("%s: empty bg raw gallery — skipping", ck)
         continue
     gt = gt_patch_masks.get((part_type, group))
     if gt is None:
         continue
     q_raw, q_h, q_w = query_raw_encodings[part_type]
-    score_combo(ck, fg_raw, bg_raw, q_raw, q_h, q_w, gt, iou_lookup)
+    for scale_combo_name in SCALE_COMBOS:
+        fg_raw = fg_raw_lookup.get((ck, scale_combo_name))
+        if fg_raw is None or fg_raw.shape[0] == 0:
+            continue
+        score_combo(ck, fg_raw, bg_raw, q_raw, q_h, q_w, gt, iou_lookup_by_combo[scale_combo_name])
 
-log.info("Scoring complete: %d combos x %d pipelines", len(fg_raw_lookup), len(PIPELINES))
+log.info(
+    "Scoring complete: %d combos x %d pipelines x %d scale combos",
+    len(bg_raw_lookup),
+    len(PIPELINES),
+    len(SCALE_COMBOS),
+)
 
 # %% Part 6 — aggregate + headline bar chart
 
@@ -629,25 +697,41 @@ def plot_pipeline_bar_chart(summary_df: pd.DataFrame, title: str, out_path: Path
     plt.close(fig)
 
 
-summary_df = pipeline_method_summary(iou_lookup)
-log.info(
-    "Oracle-IoU summary (mean +/- std across %d combos, best swept param per pipeline):",
-    len(fg_raw_lookup),
-)
-for _, row in summary_df.iterrows():
+summary_by_combo: dict[str, pd.DataFrame] = {}
+for scale_combo_name, lookup in iou_lookup_by_combo.items():
+    summary_df = pipeline_method_summary(lookup)
+    summary_by_combo[scale_combo_name] = summary_df
     log.info(
-        "  %-16s %-14s param=%-10s iou=%.3f+/-%.3f (n=%d)",
-        row.pipeline,
-        row.method,
-        row.param,
-        row.mean_iou,
-        row.std_iou,
-        row.n_combos,
+        "[scale_combo=%s] Oracle-IoU summary (mean +/- std, best swept param per pipeline):",
+        scale_combo_name,
     )
-summary_df.to_csv(OUTPUT_DIR / "oracle_iou_by_pipeline.csv", index=False)
+    for _, row in summary_df.iterrows():
+        log.info(
+            "  %-16s %-14s param=%-10s iou=%.3f+/-%.3f (n=%d)",
+            row.pipeline,
+            row.method,
+            row.param,
+            row.mean_iou,
+            row.std_iou,
+            row.n_combos,
+        )
+    _headline_path = OUTPUT_DIR / f"oracle_iou_by_pipeline__{scale_combo_name}.png"
+    plot_pipeline_bar_chart(
+        summary_df,
+        f"Feature-space transforms — oracle IoU by pipeline, fg scales={scale_combo_name} "
+        f"({len(RUN_PART_TYPES)} part types)",
+        _headline_path,
+    )
+    log.info("Saved headline bar chart to %s", _headline_path)
+
+combined_summary_df = pd.concat(
+    [df.assign(scale_combo=name) for name, df in summary_by_combo.items()], ignore_index=True
+)
+combined_summary_df.to_csv(OUTPUT_DIR / "oracle_iou_by_pipeline.csv", index=False)
 
 per_combo_rows = [
     {
+        "scale_combo": scale_combo_name,
         "pipeline": pipeline,
         "param": param,
         "method": method,
@@ -657,7 +741,8 @@ per_combo_rows = [
         "instance_id": ck[3],
         "oracle_iou": iou,
     }
-    for pipeline, by_param in iou_lookup.items()
+    for scale_combo_name, lookup in iou_lookup_by_combo.items()
+    for pipeline, by_param in lookup.items()
     for param, by_method in by_param.items()
     for method, by_ck in by_method.items()
     for ck, iou in by_ck.items()
@@ -670,125 +755,185 @@ log.info(
     len(per_combo_rows),
 )
 
-_headline_path = OUTPUT_DIR / "oracle_iou_by_pipeline.png"
-plot_pipeline_bar_chart(
-    summary_df,
-    f"Feature-space transforms — oracle IoU by pipeline "
-    f"({len(fg_raw_lookup)} combos across {len(RUN_PART_TYPES)} part types)",
-    _headline_path,
-)
-log.info("Saved headline bar chart to %s", _headline_path)
 
-overall_best_param: dict[str, dict[str, Any]] = {
-    pipeline: {
-        method: best_param(iou_lookup, pipeline, method) for method in METHODS_BY_PIPELINE[pipeline]
+def plot_scale_combo_comparison(combined_df: pd.DataFrame, title: str, out_path: Path) -> None:
+    """Grouped bar chart: one x-position per (pipeline, method), one bar per scale combo —
+    the direct answer to "does broadening the fg gallery's scales help, and does it help every
+    pipeline/method the same way" (vs. plot_pipeline_bar_chart's per-combo view, which answers
+    "which pipeline is best" for a single fixed scale combo)."""
+    cell_order = list(
+        combined_df[["pipeline", "method"]].drop_duplicates().itertuples(index=False, name=None)
+    )
+    combo_names = list(SCALE_COMBOS)
+    combo_colors = plt.get_cmap("tab10").colors
+    fig, ax = plt.subplots(figsize=(16, 6))
+    x = np.arange(len(cell_order))
+    width = 0.8 / len(combo_names)
+    indexed = combined_df.set_index(["scale_combo", "pipeline", "method"])["mean_iou"]
+    for i, combo_name in enumerate(combo_names):
+        means = [indexed.get((combo_name, p, m), float("nan")) for p, m in cell_order]
+        ax.bar(
+            x + i * width,
+            means,
+            width=width,
+            label=combo_name,
+            color=combo_colors[i % len(combo_colors)],
+        )
+    ax.set_xticks(
+        x + width * (len(combo_names) - 1) / 2,
+        [f"{p}\n({m})" for p, m in cell_order],
+        rotation=30,
+        ha="right",
+        fontsize=8,
+    )
+    ax.set_ylabel("oracle IoU (mean across combos)")
+    ax.set_title(title)
+    ax.set_ylim(0, 1.0)
+    ax.grid(alpha=0.3, axis="y")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+_comparison_path = OUTPUT_DIR / "oracle_iou_by_scale_combo_comparison.png"
+plot_scale_combo_comparison(
+    combined_summary_df,
+    f"Feature-space transforms — fg scale combo comparison ({len(RUN_PART_TYPES)} part types)",
+    _comparison_path,
+)
+log.info("Saved scale-combo comparison chart to %s", _comparison_path)
+
+overall_best_param_by_combo: dict[str, dict[str, dict[str, Any]]] = {
+    scale_combo_name: {
+        pipeline: {
+            method: best_param(lookup, pipeline, method) for method in METHODS_BY_PIPELINE[pipeline]
+        }
+        for pipeline in PIPELINES
     }
-    for pipeline in PIPELINES
+    for scale_combo_name, lookup in iou_lookup_by_combo.items()
 }
 
-# %% Part 7 — sweep curves: epsilon (global/bg ZCA + Mahalanobis), k (PCA truncation)
-eps_sweep_rows = []
-for pipeline, method in [
+# %% Part 7 — sweep curves: epsilon (global/bg ZCA + Mahalanobis), k (PCA truncation), per
+# scale combo. These explore each transform's own hyperparameter, orthogonal to which fg
+# scales feed it, so every SCALE_COMBOS entry gets its own pair of CSV/PNG outputs.
+ZCA_MAHALANOBIS_CELLS = [
     ("global_zca", "single_proto"),
     ("global_zca", "knn_fgbg"),
     ("bg_zca", "single_proto"),
     ("bg_zca", "knn_fgbg"),
     ("mahalanobis", "mahalanobis_knn"),
-]:
-    for eps in EPS_SWEEP:
-        mean, std, n = mean_std_iou(iou_lookup, pipeline, eps, method)
-        eps_sweep_rows.append(
-            {
-                "pipeline": pipeline,
-                "method": method,
-                "eps": eps,
-                "mean_iou": mean,
-                "std_iou": std,
-                "n_combos": n,
-            }
-        )
+]
+
+eps_sweep_rows = []
+for scale_combo_name, lookup in iou_lookup_by_combo.items():
+    for pipeline, method in ZCA_MAHALANOBIS_CELLS:
+        for eps in EPS_SWEEP:
+            mean, std, n = mean_std_iou(lookup, pipeline, eps, method)
+            eps_sweep_rows.append(
+                {
+                    "scale_combo": scale_combo_name,
+                    "pipeline": pipeline,
+                    "method": method,
+                    "eps": eps,
+                    "mean_iou": mean,
+                    "std_iou": std,
+                    "n_combos": n,
+                }
+            )
 eps_sweep_df = pd.DataFrame(eps_sweep_rows)
 eps_sweep_df.to_csv(OUTPUT_DIR / "eps_sweep.csv", index=False)
 log.info("Wrote %s", OUTPUT_DIR / "eps_sweep.csv")
 
-fig, ax = plt.subplots(figsize=(8, 5.5))
-for pipeline, method in [
-    ("global_zca", "single_proto"),
-    ("global_zca", "knn_fgbg"),
-    ("bg_zca", "single_proto"),
-    ("bg_zca", "knn_fgbg"),
-    ("mahalanobis", "mahalanobis_knn"),
-]:
-    means = [mean_std_iou(iou_lookup, pipeline, eps, method)[0] for eps in EPS_SWEEP]
-    ax.plot(EPS_SWEEP, means, marker="o", label=f"{pipeline}/{method}")
-ax.set_xscale("log")
-ax.set_xlabel("epsilon (ZCA regularization)")
-ax.set_ylabel("oracle IoU (mean across combos)")
-ax.set_title("Epsilon sweep — global/bg ZCA whitening and Mahalanobis")
-ax.legend(fontsize=8)
-ax.grid(alpha=0.3)
-fig.tight_layout()
-_eps_path = OUTPUT_DIR / "eps_sweep.png"
-fig.savefig(_eps_path, dpi=150, bbox_inches="tight")
-plt.close(fig)
-log.info("Saved epsilon-sweep curve to %s", _eps_path)
+for scale_combo_name, lookup in iou_lookup_by_combo.items():
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    for pipeline, method in ZCA_MAHALANOBIS_CELLS:
+        means = [mean_std_iou(lookup, pipeline, eps, method)[0] for eps in EPS_SWEEP]
+        ax.plot(EPS_SWEEP, means, marker="o", label=f"{pipeline}/{method}")
+    ax.set_xscale("log")
+    ax.set_xlabel("epsilon (ZCA regularization)")
+    ax.set_ylabel("oracle IoU (mean across combos)")
+    ax.set_title(
+        f"Epsilon sweep — global/bg ZCA whitening and Mahalanobis, fg scales={scale_combo_name}"
+    )
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    _eps_path = OUTPUT_DIR / f"eps_sweep__{scale_combo_name}.png"
+    fig.savefig(_eps_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    log.info("Saved epsilon-sweep curve to %s", _eps_path)
 
 pca_sweep_rows = []
-for method in METHODS_BY_PIPELINE["pca_truncate"]:
-    for k in PCA_K_SWEEP:
-        mean, std, n = mean_std_iou(iou_lookup, "pca_truncate", k, method)
-        pca_sweep_rows.append(
-            {"method": method, "k": k, "mean_iou": mean, "std_iou": std, "n_combos": n}
-        )
+for scale_combo_name, lookup in iou_lookup_by_combo.items():
+    for method in METHODS_BY_PIPELINE["pca_truncate"]:
+        for k in PCA_K_SWEEP:
+            mean, std, n = mean_std_iou(lookup, "pca_truncate", k, method)
+            pca_sweep_rows.append(
+                {
+                    "scale_combo": scale_combo_name,
+                    "method": method,
+                    "k": k,
+                    "mean_iou": mean,
+                    "std_iou": std,
+                    "n_combos": n,
+                }
+            )
 pca_sweep_df = pd.DataFrame(pca_sweep_rows)
 pca_sweep_df.to_csv(OUTPUT_DIR / "pca_k_sweep.csv", index=False)
 log.info("Wrote %s", OUTPUT_DIR / "pca_k_sweep.csv")
 
-fig, ax = plt.subplots(figsize=(7, 5.5))
-for method in METHODS_BY_PIPELINE["pca_truncate"]:
-    means = [mean_std_iou(iou_lookup, "pca_truncate", k, method)[0] for k in PCA_K_SWEEP]
-    ax.plot(PCA_K_SWEEP, means, marker="o", label=method)
-ax.set_xlabel("k (retained principal components, of C=1024)")
-ax.set_ylabel("oracle IoU (mean across combos)")
-ax.set_title("PCA truncation — dimensionality sweep")
-ax.legend(fontsize=8)
-ax.grid(alpha=0.3)
-fig.tight_layout()
-_pca_path = OUTPUT_DIR / "pca_k_sweep.png"
-fig.savefig(_pca_path, dpi=150, bbox_inches="tight")
-plt.close(fig)
-log.info("Saved PCA k-sweep curve to %s", _pca_path)
+for scale_combo_name, lookup in iou_lookup_by_combo.items():
+    fig, ax = plt.subplots(figsize=(7, 5.5))
+    for method in METHODS_BY_PIPELINE["pca_truncate"]:
+        means = [mean_std_iou(lookup, "pca_truncate", k, method)[0] for k in PCA_K_SWEEP]
+        ax.plot(PCA_K_SWEEP, means, marker="o", label=method)
+    ax.set_xlabel("k (retained principal components, of C=1024)")
+    ax.set_ylabel("oracle IoU (mean across combos)")
+    ax.set_title(f"PCA truncation — dimensionality sweep, fg scales={scale_combo_name}")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    _pca_path = OUTPUT_DIR / f"pca_k_sweep__{scale_combo_name}.png"
+    fig.savefig(_pca_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    log.info("Saved PCA k-sweep curve to %s", _pca_path)
 
-# %% Part 8 — per-instance-type (group) breakdown. The headline chart above pools every
-# group together, which can hide a group-specific effect — see noisy_fgbg_cleaning.py's
-# identical rationale for its own per-group breakdown.
+# %% Part 8 — per-instance-type (group) breakdown, per scale combo. The headline chart above
+# pools every group together, which can hide a group-specific effect — see
+# noisy_fgbg_cleaning.py's identical rationale for its own per-group breakdown.
 combos_by_group: dict[str, list[tuple]] = defaultdict(list)
 for combo in combos:
     ck = combo_key(combo)
-    if ck in fg_raw_lookup:
+    if ck in bg_raw_lookup:
         combos_by_group[ck[1]].append(ck)
 
 group_summary_frames = []
-for group, cks in combos_by_group.items():
-    group_df = pipeline_method_summary(iou_lookup, combo_keys=set(cks))
-    group_df.insert(0, "group", group)
-    group_summary_frames.append(group_df)
-    _group_path = OUTPUT_DIR / f"oracle_iou_by_pipeline__{group.replace(' ', '_')}.png"
-    plot_pipeline_bar_chart(
-        group_df,
-        f"Feature-space transforms — oracle IoU, group={group} (n={len(cks)} combos)",
-        _group_path,
-    )
+for scale_combo_name, lookup in iou_lookup_by_combo.items():
+    for group, cks in combos_by_group.items():
+        group_df = pipeline_method_summary(lookup, combo_keys=set(cks))
+        group_df.insert(0, "group", group)
+        group_df["scale_combo"] = scale_combo_name
+        group_summary_frames.append(group_df)
+        _group_slug = group.replace(" ", "_")
+        _group_path = OUTPUT_DIR / f"oracle_iou_by_pipeline__{_group_slug}__{scale_combo_name}.png"
+        plot_pipeline_bar_chart(
+            group_df,
+            f"Feature-space transforms — oracle IoU, group={group}, fg scales={scale_combo_name} "
+            f"(n={len(cks)} combos)",
+            _group_path,
+        )
 pd.concat(group_summary_frames, ignore_index=True).to_csv(
     OUTPUT_DIR / "oracle_iou_by_pipeline_per_group.csv", index=False
 )
 log.info(
     "Saved %d per-group breakdown charts and %s",
-    len(combos_by_group),
+    len(combos_by_group) * len(SCALE_COMBOS),
     OUTPUT_DIR / "oracle_iou_by_pipeline_per_group.csv",
 )
 
-# %% Part 9 — qualitative figure: every pipeline's score map for one focus combo
+# %% Part 9 — qualitative figure: every pipeline's score map for one focus combo, per scale
+# combo (fg gallery differs by scale combo, so the score maps do too).
 focus_combo = next(
     (
         c
@@ -811,68 +956,78 @@ if (focus_combo["part_type"], focus_combo["class"], focus_combo["instance_id"]) 
         focus_ck,
     )
 
-if focus_ck not in fg_raw_lookup:
-    log.warning(
-        "Focus combo %s has no usable fg/bg gallery — skipping qualitative figure", focus_ck
-    )
+if focus_ck not in bg_raw_lookup:
+    log.warning("Focus combo %s has no usable bg gallery — skipping qualitative figure", focus_ck)
 else:
     focus_part_type, focus_group = focus_ck[0], focus_ck[1]
     focus_gt = gt_patch_masks[(focus_part_type, focus_group)]
     focus_q_raw, focus_q_h, focus_q_w = query_raw_encodings[focus_part_type]
-    # Re-scores the focus combo a second time (Part 5 already covered it) — deterministic
-    # given the same inputs, and keeps this section self-contained without threading every
-    # combo's raw maps through the whole run just for one figure.
-    focus_raw_maps = score_combo(
-        focus_ck,
-        fg_raw_lookup[focus_ck],
-        bg_raw_lookup[focus_ck],
-        focus_q_raw,
-        focus_q_h,
-        focus_q_w,
-        focus_gt,
-        iou_lookup,
-    )
 
-    query_img = query_images[focus_part_type]
-    n_panels = 1 + len(PIPELINES)
-    n_cols = 3
-    n_rows = -(-n_panels // n_cols)
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.2 * n_cols, 4.2 * n_rows))
-    axes_flat = axes.reshape(-1)
+    for scale_combo_name in SCALE_COMBOS:
+        if (focus_ck, scale_combo_name) not in fg_raw_lookup:
+            log.warning(
+                "Focus combo %s has no usable fg gallery for scale combo %r — skipping",
+                focus_ck,
+                scale_combo_name,
+            )
+            continue
+        # Re-scores the focus combo a second time (Part 5 already covered it) — deterministic
+        # given the same inputs, and keeps this section self-contained without threading every
+        # combo's raw maps through the whole run just for one figure.
+        focus_raw_maps = score_combo(
+            focus_ck,
+            fg_raw_lookup[(focus_ck, scale_combo_name)],
+            bg_raw_lookup[focus_ck],
+            focus_q_raw,
+            focus_q_h,
+            focus_q_w,
+            focus_gt,
+            iou_lookup_by_combo[scale_combo_name],
+        )
 
-    axes_flat[0].imshow(query_img)
-    gt_overlay = np.zeros((*focus_gt.shape, 4))
-    gt_overlay[focus_gt] = (0.2, 0.8, 0.2, 0.45)
-    axes_flat[0].imshow(gt_overlay, extent=(0, query_img.width, query_img.height, 0))
-    axes_flat[0].set_title("query + GT")
-    axes_flat[0].axis("off")
+        query_img = query_images[focus_part_type]
+        n_panels = 1 + len(PIPELINES)
+        n_cols = 3
+        n_rows = -(-n_panels // n_cols)
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4.2 * n_cols, 4.2 * n_rows))
+        axes_flat = axes.reshape(-1)
 
-    for i, pipeline in enumerate(PIPELINES, start=1):
-        # The last method in each pipeline's list is the one the pipeline is actually about
-        # (single_proto is every cosine pipeline's simpler baseline, already its own bar).
-        method = METHODS_BY_PIPELINE[pipeline][-1]
-        param = overall_best_param[pipeline][method]
-        raw = focus_raw_maps[(pipeline, param, method)]
-        im = axes_flat[i].imshow(raw, cmap="magma")
-        if isinstance(param, float):
-            param_str = f"\neps={param:.0e}"
-        elif isinstance(param, int):
-            param_str = f"\nk={param}"
-        else:
-            param_str = ""
-        axes_flat[i].set_title(f"{pipeline} ({method}){param_str}", fontsize=9)
-        axes_flat[i].axis("off")
-        plt.colorbar(im, ax=axes_flat[i], fraction=0.046)
+        axes_flat[0].imshow(query_img)
+        gt_overlay = np.zeros((*focus_gt.shape, 4))
+        gt_overlay[focus_gt] = (0.2, 0.8, 0.2, 0.45)
+        axes_flat[0].imshow(gt_overlay, extent=(0, query_img.width, query_img.height, 0))
+        axes_flat[0].set_title("query + GT")
+        axes_flat[0].axis("off")
 
-    for j in range(n_panels, len(axes_flat)):
-        axes_flat[j].axis("off")
+        for i, pipeline in enumerate(PIPELINES, start=1):
+            # The last method in each pipeline's list is the one the pipeline is actually
+            # about (single_proto is every cosine pipeline's simpler baseline, already its
+            # own bar).
+            method = METHODS_BY_PIPELINE[pipeline][-1]
+            param = overall_best_param_by_combo[scale_combo_name][pipeline][method]
+            raw = focus_raw_maps[(pipeline, param, method)]
+            im = axes_flat[i].imshow(raw, cmap="magma")
+            if isinstance(param, float):
+                param_str = f"\neps={param:.0e}"
+            elif isinstance(param, int):
+                param_str = f"\nk={param}"
+            else:
+                param_str = ""
+            axes_flat[i].set_title(f"{pipeline} ({method}){param_str}", fontsize=9)
+            axes_flat[i].axis("off")
+            plt.colorbar(im, ax=axes_flat[i], fraction=0.046)
 
-    fig.suptitle(f"Feature-transform score maps — focus combo {focus_ck}")
-    fig.tight_layout()
-    _focus_path = OUTPUT_DIR / "focus_combo_pipeline_grid.png"
-    fig.savefig(_focus_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    log.info("Saved qualitative focus-combo grid to %s", _focus_path)
+        for j in range(n_panels, len(axes_flat)):
+            axes_flat[j].axis("off")
+
+        fig.suptitle(
+            f"Feature-transform score maps — focus combo {focus_ck}, fg scales={scale_combo_name}"
+        )
+        fig.tight_layout()
+        _focus_path = OUTPUT_DIR / f"focus_combo_pipeline_grid__{scale_combo_name}.png"
+        fig.savefig(_focus_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        log.info("Saved qualitative focus-combo grid to %s", _focus_path)
 
 # %% [markdown]
 # ## Reading the results
