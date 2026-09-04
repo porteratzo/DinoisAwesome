@@ -63,9 +63,16 @@ const _me = {
     // Options
     filterByPrompt: false,
 
+    // Mask cleanup — re-applied server-side against the cached raw result of
+    // the last /api/segment call via /api/segment/adjust (no re-inference).
+    maskThreshold: 0.5,
+    morphKernelSize: 0,
+    keepLargestOnly: false,
+
     // Debounce / busy flag
     isProcessing: false,
     debounceTimer: null,
+    adjustDebounceTimer: null,
 
     // Polarity of the box/point currently being drawn (1 = positive, 0 = negative)
     boxPolarity: 1,
@@ -240,6 +247,26 @@ async function loadModelInfo() {
         }
     } catch { /* non-critical — leave default text */ }
     _updatePromptAvailability();
+    _updateMaskThresholdRange();
+}
+
+/**
+ * Sam3Model's mask_threshold operates on a ~0-1 probability scale (default
+ * 0.5); Sam3TrackerModel's operates on the raw logit scale (default 0.0).
+ * Re-range the slider to match whichever backend is active so its default
+ * position reproduces the model's own default cutoff.
+ */
+function _updateMaskThresholdRange() {
+    const slider = $id('mask-threshold-slider');
+    if (_me.useTracker) {
+        slider.min = '-4'; slider.max = '4'; slider.step = '0.25';
+        _me.maskThreshold = 0.0;
+    } else {
+        slider.min = '0.05'; slider.max = '0.95'; slider.step = '0.05';
+        _me.maskThreshold = 0.5;
+    }
+    slider.value = _me.maskThreshold;
+    $id('mask-threshold-value').textContent = _me.maskThreshold.toFixed(2);
 }
 
 /**
@@ -362,6 +389,21 @@ document.addEventListener('DOMContentLoaded', () => {
     $id('save-btn').addEventListener('click', saveAnnotation);
     $id('filter-by-prompt').addEventListener('change', e => {
         _me.filterByPrompt = e.target.checked;
+    });
+
+    $id('mask-threshold-slider').addEventListener('input', e => {
+        _me.maskThreshold = parseFloat(e.target.value);
+        $id('mask-threshold-value').textContent = _me.maskThreshold.toFixed(2);
+        scheduleAdjust();
+    });
+    $id('morph-kernel-slider').addEventListener('input', e => {
+        _me.morphKernelSize = parseInt(e.target.value, 10);
+        $id('morph-kernel-value').textContent = _me.morphKernelSize;
+        scheduleAdjust();
+    });
+    $id('keep-largest-only').addEventListener('change', e => {
+        _me.keepLargestOnly = e.target.checked;
+        scheduleAdjust();
     });
 
     // Re-fit canvas when the window is resized (also resets view)
@@ -1137,7 +1179,7 @@ function updateMaskPreviews(count) {
         `;
 
         const btn = document.createElement('button');
-        btn.className = `mask-btn${i === 0 ? ' active' : ''}`;
+        btn.className = `mask-btn${i === _me.selectedMaskIdx ? ' active' : ''}`;
         btn.appendChild(swatch);
         btn.appendChild(document.createTextNode(`Mask ${i + 1}`));
         btn.addEventListener('click', () => {
@@ -1155,6 +1197,54 @@ function updateMaskPreviews(count) {
 function scheduleSegment() {
     if (_me.debounceTimer !== null) clearTimeout(_me.debounceTimer);
     _me.debounceTimer = setTimeout(_meRunSAM, 400);
+}
+
+// ── Mask cleanup (re-threshold last result, no re-inference) ───────────────
+function scheduleAdjust() {
+    if (_me.adjustDebounceTimer !== null) clearTimeout(_me.adjustDebounceTimer);
+    _me.adjustDebounceTimer = setTimeout(_meRunAdjust, 150);
+}
+
+async function _meRunAdjust() {
+    _me.adjustDebounceTimer = null;
+    if (_me.currentMasks.length === 0 || _me.isProcessing) return;
+
+    _me.isProcessing = true;
+    try {
+        const resp = await fetch('/api/segment/adjust', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                mask_threshold:     _me.maskThreshold,
+                morph_kernel_size:  _me.morphKernelSize,
+                keep_largest_only:  _me.keepLargestOnly,
+            }),
+        });
+
+        if (resp.status === 429) {
+            setStatus('Model busy — try again');
+            return;
+        }
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            setStatus(`Error ${resp.status}: ${err.error || 'unknown'}`);
+            return;
+        }
+
+        const data = await resp.json();
+        const masks = (data.masks || []).map(m => decodeMaskRLE(m.shape, m.rle));
+        if (masks.length === 0) return;
+        _me.currentMasks = masks;
+        if (_me.selectedMaskIdx >= masks.length) _me.selectedMaskIdx = 0;
+        redrawOverlay();
+        updateMaskPreviews(data.count);
+        setStatus(`${data.count} mask(s) — cleaned`);
+    } catch (err) {
+        setStatus('Network error');
+        console.error('[mask_editor] adjust error:', err);
+    } finally {
+        _me.isProcessing = false;
+    }
 }
 
 async function _meRunSAM() {

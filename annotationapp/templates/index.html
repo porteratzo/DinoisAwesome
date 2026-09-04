@@ -108,6 +108,17 @@
       <div id="mask-prev-container"></div>
     </section>
 
+    <section id="cleanup-section">
+      <h3 class="section-title">Mask Cleanup</h3>
+      <label class="brush-size-label">Mask threshold: <span id="mask-threshold-value">0.50</span></label>
+      <input id="mask-threshold-slider" type="range" min="0.05" max="0.95" step="0.05" value="0.5">
+      <label class="brush-size-label">Remove specks under <span id="morph-kernel-value">0</span>px</label>
+      <input id="morph-kernel-slider" type="range" min="0" max="40" step="2" value="0">
+      <label class="radio-label">
+        <input type="checkbox" id="keep-largest-only"> Keep largest blob only
+      </label>
+    </section>
+
     <section>
       <h3 class="section-title">Annotations</h3>
       <ul id="annotation-list"></ul>

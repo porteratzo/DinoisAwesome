@@ -295,6 +295,39 @@ def segment():
     return jsonify({"masks": masks_out, "count": len(masks_out)})
 
 
+@app.route("/api/segment/adjust", methods=["POST"])
+def segment_adjust():
+    """Re-threshold/clean the most recent SAM 3 result without re-running the model.
+
+    Lets the UI expose live sliders (mask threshold, speck-removal kernel size,
+    keep-largest-blob) without paying for a fresh forward pass on every move.
+    Returns 400 if no prior /api/segment call has been made yet.
+    """
+    body = request.get_json(force=True)
+    default_mask_threshold = 0.0 if _sam.use_tracker else 0.5
+    mask_threshold = float(body.get("mask_threshold", default_mask_threshold))
+    keep_largest_only = bool(body.get("keep_largest_only", False))
+    morph_kernel_size = int(body.get("morph_kernel_size", 0))
+
+    if _sam.is_processing:
+        return jsonify({"error": "Model busy"}), 429
+
+    try:
+        masks = _sam.adjust(
+            mask_threshold=mask_threshold,
+            keep_largest_only=keep_largest_only,
+            morph_kernel_size=morph_kernel_size,
+        )
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "busy" in msg.lower():
+            return jsonify({"error": "Model busy"}), 429
+        return jsonify({"error": msg}), 400
+
+    masks_out = [_rle_encode(m) for m in masks]
+    return jsonify({"masks": masks_out, "count": len(masks_out)})
+
+
 @app.route("/api/save", methods=["POST"])
 def save_annotation():
     """Persist a boolean mask and its metadata into the per-image flat files.

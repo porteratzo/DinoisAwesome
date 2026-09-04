@@ -35,11 +35,13 @@ HTTP 429 rather than queueing up and exhausting GPU memory.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import threading
 from typing import Any
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -68,6 +70,14 @@ class SAM3Service:
         self._processing = False
         self._processor: Any = None
         self._model: Any = None
+
+        # Cached raw output of the most recent segment_*() call, kept so that
+        # adjust() can re-threshold and clean the result without a forward pass.
+        self._last_outputs: Any = None
+        self._last_image: Image.Image | None = None
+        self._last_inputs_dev: dict[str, Any] | None = None
+        self._last_prompt_region: np.ndarray | None = None
+
         self._load()
 
     @property
@@ -631,6 +641,13 @@ class SAM3Service:
             if prompt_region is not None and masks:
                 masks = self._filter_masks_by_overlap(masks, prompt_region)
 
+            # Cache raw state so adjust() can re-threshold/clean this result
+            # later without re-running the model.
+            self._last_outputs = outputs
+            self._last_image = image
+            self._last_inputs_dev = inputs_dev
+            self._last_prompt_region = prompt_region
+
             _log.info(
                 "Inference complete — %d mask(s) returned (filter_by_prompt=%s)",
                 len(masks),
@@ -642,32 +659,146 @@ class SAM3Service:
             self._processing = False
             self._lock.release()
 
-    def _postprocess_sam3(self, outputs: Any, image: Image.Image) -> list[np.ndarray]:
+    def _postprocess_sam3(
+        self, outputs: Any, image: Image.Image, mask_threshold: float = 0.5
+    ) -> list[np.ndarray]:
         """Post-process Sam3Model outputs via post_process_instance_segmentation."""
         target_sizes = [(image.height, image.width)]
         results = self._processor.post_process_instance_segmentation(
             outputs,
             threshold=0.5,
-            mask_threshold=0.5,
+            mask_threshold=mask_threshold,
             target_sizes=target_sizes,
         )
         if results and "masks" in results[0]:
             return [m.cpu().numpy().astype(bool) for m in results[0]["masks"]]
         return []
 
-    def _postprocess_tracker(self, outputs: Any, inputs_dev: dict[str, Any]) -> list[np.ndarray]:
+    def _postprocess_tracker(
+        self, outputs: Any, inputs_dev: dict[str, Any], mask_threshold: float = 0.0
+    ) -> list[np.ndarray]:
         """Post-process Sam3TrackerModel outputs via post_process_masks.
 
         With multimask_output=False the tracker returns pred_masks of shape
         (num_objects, 1, H, W) — one mask per object/point.  We return them as
         a flat list of (H, W) bool arrays, one entry per instance.
+
+        ``mask_threshold`` is forwarded only if the installed transformers
+        version's ``post_process_masks`` actually accepts it (true for the
+        SAM/SAM2 lineage this tracker descends from, per this module's
+        docstring — but unverified against the exact pinned version here).
+        Falls back to the processor's own default threshold otherwise, so an
+        API mismatch degrades to "threshold slider is a no-op" rather than
+        crashing tracker segmentation.
         """
         original_sizes = inputs_dev.get("original_sizes")
-        masks_tensor = self._processor.post_process_masks(outputs.pred_masks.cpu(), original_sizes)[
-            0
-        ]
+        kwargs: dict[str, Any] = {}
+        try:
+            if "mask_threshold" in inspect.signature(self._processor.post_process_masks).parameters:
+                kwargs["mask_threshold"] = mask_threshold
+        except (TypeError, ValueError):
+            pass
+        masks_tensor = self._processor.post_process_masks(
+            outputs.pred_masks.cpu(), original_sizes, **kwargs
+        )[0]
         # masks_tensor shape: (num_objects, 1, H, W)
         return [
             masks_tensor[obj_idx, 0].numpy().astype(bool)
             for obj_idx in range(masks_tensor.shape[0])
         ]
+
+    # ------------------------------------------------------------------
+    # Post-hoc mask cleanup / re-thresholding
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _clean_mask(
+        mask: np.ndarray, morph_kernel_size: int, keep_largest_only: bool
+    ) -> np.ndarray:
+        """Apply morphological opening and/or largest-component selection.
+
+        Args:
+            mask:              (H, W) bool array.
+            morph_kernel_size: Side length (px) of the square opening kernel.
+                                0 or 1 disables opening.
+            keep_largest_only: If True, keep only the largest 8-connected
+                                component (drops every other blob).
+        """
+        if morph_kernel_size > 1:
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_RECT, (morph_kernel_size, morph_kernel_size)
+            )
+            mask = (
+                cv2.morphologyEx(
+                    mask.astype(np.uint8) * 255,
+                    cv2.MORPH_OPEN,
+                    kernel,
+                    borderType=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+                > 0
+            )
+
+        if keep_largest_only:
+            num_labels, labels_im, stats, _ = cv2.connectedComponentsWithStats(
+                mask.astype(np.uint8), connectivity=8
+            )
+            if num_labels > 1:  # label 0 is background
+                largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+                mask = labels_im == largest_label
+            else:
+                mask = np.zeros_like(mask, dtype=bool)
+
+        return mask
+
+    def adjust(
+        self,
+        mask_threshold: float,
+        keep_largest_only: bool = False,
+        morph_kernel_size: int = 0,
+    ) -> list[np.ndarray]:
+        """Re-threshold and clean the most recent segment_*() result.
+
+        Reuses the raw model outputs cached by the last call — no forward
+        pass — so it's cheap enough to call on every slider movement.
+
+        Args:
+            mask_threshold:     Per-pixel cutoff forwarded to the same
+                                post-processing path used by the original
+                                call (probability scale ~0-1 for Sam3Model,
+                                logit scale for Sam3TrackerModel).
+            keep_largest_only:  Keep only the largest connected component of
+                                each returned mask.
+            morph_kernel_size:  Square opening-kernel side length (px) used
+                                to strip speckle before largest-component
+                                selection. 0 disables opening.
+
+        Raises:
+            RuntimeError: If no prior inference exists, or the model is busy
+                          with a concurrent segment_*()/adjust() call.
+        """
+        if not self._lock.acquire(blocking=False):
+            raise RuntimeError("busy")
+        self._processing = True
+        try:
+            if self._last_outputs is None:
+                raise RuntimeError("no prior inference to adjust — run segment first")
+
+            if self._use_tracker:
+                assert self._last_inputs_dev is not None
+                masks = self._postprocess_tracker(
+                    self._last_outputs, self._last_inputs_dev, mask_threshold=mask_threshold
+                )
+            else:
+                assert self._last_image is not None
+                masks = self._postprocess_sam3(
+                    self._last_outputs, self._last_image, mask_threshold=mask_threshold
+                )
+
+            if self._last_prompt_region is not None and masks:
+                masks = self._filter_masks_by_overlap(masks, self._last_prompt_region)
+
+            return [self._clean_mask(m, morph_kernel_size, keep_largest_only) for m in masks]
+        finally:
+            self._processing = False
+            self._lock.release()
