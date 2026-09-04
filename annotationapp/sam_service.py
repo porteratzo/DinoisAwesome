@@ -24,6 +24,11 @@ Two backends are supported, selected by the USE_TRACKER environment variable:
   boxes are silently dropped.  Express exclusion regions as background click-
   points (label=0) instead.
 
+  **Limitation — no text/concept-prompt support**: Sam3TrackerProcessor has no
+  ``text`` argument at all (it is a purely visual-prompt model).  Passing text
+  raises ``ValueError`` from :meth:`segment_with_text` and from
+  :meth:`segment_mixed` when text is non-empty; use points or boxes instead.
+
 Both backends use a non-blocking threading.Lock so concurrent requests receive
 HTTP 429 rather than queueing up and exhausting GPU memory.
 """
@@ -180,8 +185,17 @@ class SAM3Service:
     def segment_with_text(self, image: Image.Image, text: str) -> list[np.ndarray]:
         """Segment using a free-text concept prompt.
 
-        Supported by both Sam3Model and Sam3TrackerModel.
+        Only supported by Sam3Model — Sam3TrackerProcessor has no ``text``
+        argument at all (Sam3TrackerModel is a purely visual-prompt model).
+
+        Raises:
+            ValueError: If ``use_tracker`` is True.
         """
+        if self._use_tracker:
+            raise ValueError(
+                "Text prompts are not supported by Sam3TrackerModel (USE_TRACKER=1) — "
+                "use points or boxes instead."
+            )
         inputs = self._processor(images=image, text=text, return_tensors="pt")
         return self._run(image, inputs)
 
@@ -520,16 +534,26 @@ class SAM3Service:
     ) -> list[np.ndarray]:
         """Segment using text + box prompts together.
 
-        Supported by both Sam3Model and Sam3TrackerModel.  For the tracker,
-        only positive-label (label=1) boxes are forwarded since it has no
-        box-label concept.
+        Full text+box combination is only supported by Sam3Model.  For the
+        tracker, text is not supported at all (Sam3TrackerProcessor has no
+        ``text`` argument) — a non-empty ``text`` raises ``ValueError``;
+        boxes alone are forwarded otherwise, with only positive-label
+        (label=1) boxes passed through since the tracker has no box-label
+        concept.
+
+        Raises:
+            ValueError: If ``use_tracker`` is True and ``text`` is non-empty.
         """
         fg_boxes = [b for b, lbl in zip(boxes, labels) if lbl == 1]
 
         if self._use_tracker:
+            if text.strip():
+                raise ValueError(
+                    "Text prompts are not supported by Sam3TrackerModel (USE_TRACKER=1) — "
+                    "clear the text field and use boxes only."
+                )
             inputs = self._processor(
                 images=image,
-                text=text,
                 input_boxes=[fg_boxes],
                 return_tensors="pt",
             )

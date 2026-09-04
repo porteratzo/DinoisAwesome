@@ -255,10 +255,13 @@ async function loadModelInfo() {
  *   - No negative-box support. Sam3TrackerProcessor has no box-label argument;
  *     negative boxes are silently dropped.
  *   → Warns at draw-time (not disabled here — positive boxes still work).
+ *   - No text/concept-prompt support at all. Sam3TrackerProcessor has no
+ *     `text` argument.
+ *   → Disables: "text"; "mixed" stays enabled but is box-only (see backend).
  */
 function _updatePromptAvailability() {
     // Per-mode limitation messages (null = available).
-    const SAM3_WARNINGS = {
+    const SAM3_MODEL_WARNINGS = {
         points:
             'Not available with Sam3Model.\n\n' +
             'Sam3Processor has no native point input — clicks are converted to tiny ' +
@@ -270,10 +273,18 @@ function _updatePromptAvailability() {
             'input_points argument). Only boxes would reach the model.\n\n' +
             'Fix: set USE_TRACKER=1, or use the "Boxes" mode directly.',
     };
+    const TRACKER_WARNINGS = {
+        text:
+            'Not available with Sam3TrackerModel.\n\n' +
+            'Sam3TrackerProcessor has no text/concept-prompt argument at all (it is a ' +
+            'purely visual-prompt model).\n\n' +
+            'Fix: set USE_TRACKER=0 to load Sam3Model, which supports text prompts.',
+    };
 
     document.querySelectorAll('input[name="prompt-type"]').forEach(radio => {
         const label = radio.closest('label') || radio.parentElement;
-        const warning = !_me.useTracker ? (SAM3_WARNINGS[radio.value] || null) : null;
+        const warnings = _me.useTracker ? TRACKER_WARNINGS : SAM3_MODEL_WARNINGS;
+        const warning = warnings[radio.value] || null;
 
         if (warning) {
             radio.disabled = true;
@@ -1180,8 +1191,12 @@ async function _meRunSAM() {
     _me.isProcessing = true;
     setStatus('Segmenting…');
 
-    // Encode the image currently drawn on imageCanvas as JPEG base64
-    const imageB64 = imageCanvas.toDataURL('image/jpeg', 0.92).split(',')[1];
+    // Encode the image currently drawn on imageCanvas as lossless PNG base64.
+    // This re-encodes on every segment call, so JPEG would add a second
+    // generation of compression artifacts (blocking/ringing near mask
+    // boundaries) on top of whatever the source file already has — not worth
+    // it for a local annotation tool where payload size isn't a constraint.
+    const imageB64 = imageCanvas.toDataURL('image/png').split(',')[1];
 
     let promptData = {};
     if (promptType === 'points') {
