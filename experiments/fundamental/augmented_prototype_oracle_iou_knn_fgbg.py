@@ -113,7 +113,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from dinoisawesome import DinoEncoder, EncoderWithCache, compute_exemplar_features, load_annotations
-from dinoisawesome.abc3 import INSTANCE_TYPE_GROUPS, PART_TYPES, available_instance_groups
+from dinoisawesome.abc3 import INSTANCE_TYPE_GROUPS, available_instance_groups
 from dinoisawesome.instance_detection import extract_patch_tokens
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -128,7 +128,15 @@ from _shared.augmentations import (  # noqa: E402
     mean_color,
     pixel_only,
 )
+from _shared.dataset_pairs import REF_QUERY_PAIRS, RefQueryPair  # noqa: E402
 from _shared.mask_geometry import pixel_mask_to_patch_mask, scale_crop_box  # noqa: E402
+from _shared.pooled_gallery_cv import (  # noqa: E402
+    MAX_BANK_SIZE_KNN_53,
+    N_FOLDS_53,
+    cap_bank_size,
+    discover_all_instances,
+    make_fold_role_splits,
+)
 from _shared.prototype_ops import knn_score_heatmap, score_heatmap  # noqa: E402
 from _shared.thresholding import oracle_iou  # noqa: E402
 
@@ -136,24 +144,22 @@ from _shared.thresholding import oracle_iou  # noqa: E402
 _REPO_ROOT = Path(__file__).parent.parent.parent
 load_dotenv(_REPO_ROOT / ".env")
 
-data_dir = _REPO_ROOT / "data" / "abc3"
+DATA_ROOT = _REPO_ROOT / "data"
 
-REF_NUMBER = 1
-QUERY_NUMBER = 2
-
-# Same knob as augmented_prototype_oracle_iou.py — narrow for fast iteration, e.g. ["LHa"].
-RUN_PART_TYPES: list[str] = PART_TYPES
+# abc5 has four ref/query pairs per part type — (1,2)/(3,4)/(5,6)/(7,8) (see
+# _shared/dataset_pairs.py) — narrow for fast iteration, e.g. REF_QUERY_PAIRS[:1].
+RUN_PAIRS: list[RefQueryPair] = REF_QUERY_PAIRS
 
 # Same focus combo as augmented_prototype_oracle_iou.py, for direct comparability of the
 # qualitative figures.
-FOCUS_PART_TYPE = "LHa"
+FOCUS_UNIT = "LHa_1-2"
 FOCUS_CLASS = "donut foam single"
 FOCUS_INSTANCE_ID = 1
 
 DINO_VERSION = "v3"
-DINO_SIZE = "large"
+DINO_SIZE = "base"
 IMG_SIZE = 768
-LAYER_IDX = 23
+LAYER_IDX = 11  # last block of ViT-B/16 (depth 12)
 DINO_WEIGHTS_DIR: str | None = os.environ.get("DINO_WEIGHTS_DIR")
 DINO_ENCODING_CACHE_DIR: str | None = os.environ.get("DINO_ENCODING_CACHE_DIR")
 
@@ -183,15 +189,13 @@ METHOD_TITLES: dict[str, str] = {
 SEED = 0
 torch.manual_seed(SEED)
 
-OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental" / "augmented_prototype_oracle_iou_knn_fgbg"
+OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental_abc5" / "augmented_prototype_oracle_iou_knn_fgbg"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 log.info(
-    "RUN_PART_TYPES=%s ref_number=%d query_number=%d  |  DINO%s-%s img_size=%d layer=%d  |  "
-    "knn_k=%d methods=%s",
-    RUN_PART_TYPES,
-    REF_NUMBER,
-    QUERY_NUMBER,
+    "RUN_PAIRS=%d units (%s)  |  DINO%s-%s img_size=%d layer=%d  |  knn_k=%d methods=%s",
+    len(RUN_PAIRS),
+    [p.unit for p in RUN_PAIRS],
     DINO_VERSION,
     DINO_SIZE,
     IMG_SIZE,
@@ -292,30 +296,32 @@ group_ref_masks: dict[tuple[str, str], np.ndarray] = {}
 ref_images: dict[str, Image.Image] = {}
 query_images: dict[str, Image.Image] = {}
 
-for part_type in tqdm(RUN_PART_TYPES, desc="Discovering combos"):
-    ref_stem = f"{part_type}_{REF_NUMBER}"
-    query_stem = f"{part_type}_{QUERY_NUMBER}"
-    ref_ann_path = data_dir / "annotations" / ref_stem
-    query_ann_path = data_dir / "annotations" / query_stem
+for pair in tqdm(RUN_PAIRS, desc="Discovering combos"):
+    unit = pair.unit
+    pair_data_dir = DATA_ROOT / pair.dataset
+    ref_stem = f"{pair.part_type}_{pair.ref}"
+    query_stem = f"{pair.part_type}_{pair.query}"
+    ref_ann_path = pair_data_dir / "annotations" / ref_stem
+    query_ann_path = pair_data_dir / "annotations" / query_stem
 
     groups = available_instance_groups(ref_ann_path)
     if not groups:
-        log.warning("part_type=%s: no instance-type groups annotated — skipping", part_type)
+        log.warning("unit=%s: no instance-type groups annotated — skipping", unit)
         continue
 
     ref_anns = load_annotations(ref_ann_path)
     query_anns = load_annotations(query_ann_path)
-    ref_images[part_type] = Image.open(data_dir / f"{ref_stem}.jpg").convert("RGB")
-    query_images[part_type] = Image.open(data_dir / f"{query_stem}.jpg").convert("RGB")
+    ref_images[unit] = Image.open(pair_data_dir / f"{ref_stem}.jpg").convert("RGB")
+    query_images[unit] = Image.open(pair_data_dir / f"{query_stem}.jpg").convert("RGB")
 
     for group in groups:
         classes = INSTANCE_TYPE_GROUPS[group]
         ref_group_anns = [a for a in ref_anns if a["class"] in classes]
         query_group_anns = [a for a in query_anns if a["class"] in classes]
         if not query_group_anns:
-            log.warning("part_type=%s group=%s: no query GT instances — skipping", part_type, group)
+            log.warning("unit=%s group=%s: no query GT instances — skipping", unit, group)
             continue
-        group_query_masks[(part_type, group)] = np.stack([a["mask"] for a in query_group_anns]).any(
+        group_query_masks[(unit, group)] = np.stack([a["mask"] for a in query_group_anns]).any(
             axis=0
         )
         if ref_group_anns:
@@ -323,13 +329,15 @@ for part_type in tqdm(RUN_PART_TYPES, desc="Discovering combos"):
             # "global" bg gallery below (Part 3.6/3.5) so a neighbouring same-type
             # instance elsewhere in the ref image never leaks into a combo's own bg
             # patches, mirroring multiscale_ablation's exclude_patch_mask.
-            group_ref_masks[(part_type, group)] = np.stack([a["mask"] for a in ref_group_anns]).any(
+            group_ref_masks[(unit, group)] = np.stack([a["mask"] for a in ref_group_anns]).any(
                 axis=0
             )
         for ref_ann in ref_group_anns:
             combos.append(
                 {
-                    "part_type": part_type,
+                    "unit": unit,
+                    "dataset": pair.dataset,
+                    "part_type": pair.part_type,
                     "group": group,
                     "class": ref_ann["class"],
                     "instance_id": ref_ann["instance_id"],
@@ -339,12 +347,13 @@ for part_type in tqdm(RUN_PART_TYPES, desc="Discovering combos"):
 
 if not combos:
     raise RuntimeError(
-        f"No combos discovered for RUN_PART_TYPES={RUN_PART_TYPES} — every part type was "
+        f"No combos discovered for RUN_PAIRS={[p.unit for p in RUN_PAIRS]} — every pair was "
         "skipped (no annotated instance-type groups or no query GT)."
     )
 log.info(
-    "Discovered %d (part_type, group, instance) combos across %d part types",
+    "Discovered %d (unit, group, instance) combos across %d units (%d part types)",
     len(combos),
+    len({c["unit"] for c in combos}),
     len({c["part_type"] for c in combos}),
 )
 
@@ -362,8 +371,8 @@ log.info(
 combo_keys_by_scale: dict[str, list[tuple]] = defaultdict(list)
 scales_by_ck: dict[tuple, list[str]] = defaultdict(list)
 for combo in tqdm(combos, desc="Building close/mid crops"):
-    ref_img = ref_images[combo["part_type"]]
-    group_mask = group_ref_masks.get((combo["part_type"], combo["group"]), combo["ref_mask"])
+    ref_img = ref_images[combo["unit"]]
+    group_mask = group_ref_masks.get((combo["unit"], combo["group"]), combo["ref_mask"])
     combo["crops"] = {}
     for scale in SCALES:
         box = scale_crop_box(combo["ref_mask"], scale, CROP_PADDING_FRACTION)
@@ -404,21 +413,20 @@ encoder = EncoderWithCache(encoder, cache_dir=DINO_ENCODING_CACHE_DIR)
 chunk_size = encoder.max_batch_size
 
 query_encodings: dict[str, dict] = {}
-for part_type in tqdm(sorted(query_images), desc="Encoding query images"):
-    q_tokens, q_h, q_w = extract_patch_tokens(
-        encoder, query_images[part_type], LAYER_IDX, debias=True
-    )
+for unit in tqdm(sorted(query_images), desc="Encoding query images"):
+    q_tokens, q_h, q_w = extract_patch_tokens(encoder, query_images[unit], LAYER_IDX, debias=True)
     # Kept on the encoder's own device (GPU, when available), not moved to CPU: there are
-    # only as many entries here as part types (a handful), so the memory-safety concern
-    # that drives the combo-major restructuring elsewhere in this file doesn't apply — and
-    # every knn_fgbg_score call below multiplies this tensor against a gallery, so keeping
-    # it on GPU is what actually makes those matmuls fast instead of CPU-bound.
-    query_encodings[part_type] = {"q_tokens": q_tokens, "q_h": q_h, "q_w": q_w}
+    # only as many entries here as ref/query units (a couple dozen), so the memory-safety
+    # concern that drives the combo-major restructuring elsewhere in this file doesn't
+    # apply — and every knn_fgbg_score call below multiplies this tensor against a
+    # gallery, so keeping it on GPU is what actually makes those matmuls fast instead of
+    # CPU-bound.
+    query_encodings[unit] = {"q_tokens": q_tokens, "q_h": q_h, "q_w": q_w}
 
 gt_patch_masks: dict[tuple[str, str], np.ndarray] = {}
-for (part_type, group), pixel_mask in group_query_masks.items():
-    q = query_encodings[part_type]
-    gt_patch_masks[(part_type, group)] = pixel_mask_to_patch_mask(
+for (unit, group), pixel_mask in group_query_masks.items():
+    q = query_encodings[unit]
+    gt_patch_masks[(unit, group)] = pixel_mask_to_patch_mask(
         pixel_mask, q["q_h"], q["q_w"], IMG_SIZE, MASK_PATCH_THRESHOLD
     )
 
@@ -434,11 +442,9 @@ for (part_type, group), pixel_mask in group_query_masks.items():
 # just the local crop border. This mirrors that: one full-image encode per part type,
 # reused as every combo's extra bg source below.
 ref_encodings: dict[str, dict] = {}
-for part_type in tqdm(sorted(ref_images), desc="Encoding ref images (global bg scale)"):
-    r_tokens, r_h, r_w = extract_patch_tokens(
-        encoder, ref_images[part_type], LAYER_IDX, debias=True
-    )
-    ref_encodings[part_type] = {"r_tokens": r_tokens, "r_h": r_h, "r_w": r_w}
+for unit in tqdm(sorted(ref_images), desc="Encoding ref images (global bg scale)"):
+    r_tokens, r_h, r_w = extract_patch_tokens(encoder, ref_images[unit], LAYER_IDX, debias=True)
+    ref_encodings[unit] = {"r_tokens": r_tokens, "r_h": r_h, "r_w": r_w}
 
 # %% Part 3.5 — encode every combo's *clean* (unaugmented) crops once, up front, to build
 # the baseline prototype (single_proto), fg gallery (knn_fg), and fg/bg prototypes
@@ -488,12 +494,12 @@ for i in tqdm(range(0, len(clean_items), chunk_size), desc="Encoding clean basel
 
 for combo in combos:
     ck = combo_key(combo)
-    part_type, group = ck[0], ck[1]
-    r = ref_encodings[part_type]
+    unit, group = ck[0], ck[1]
+    r = ref_encodings[unit]
     # Exclude every ref instance in this combo's group (not just this one) from the
     # global bg gallery — a neighbouring same-type instance elsewhere in the ref image
     # must not leak into "background", mirroring multiscale_ablation's exclude_patch_mask.
-    exclude_mask_px = group_ref_masks.get((part_type, group), combo["ref_mask"])
+    exclude_mask_px = group_ref_masks.get((unit, group), combo["ref_mask"])
     exclude_patch_mask = pixel_mask_to_patch_mask(
         exclude_mask_px, r["r_h"], r["r_w"], IMG_SIZE, MASK_PATCH_THRESHOLD
     )
@@ -557,7 +563,7 @@ focus_combo = next(
     (
         c
         for c in combos
-        if c["part_type"] == FOCUS_PART_TYPE
+        if c["unit"] == FOCUS_UNIT
         and c["class"] == FOCUS_CLASS
         and c["instance_id"] == FOCUS_INSTANCE_ID
     ),
@@ -566,12 +572,12 @@ focus_combo = next(
 if focus_combo is None:
     focus_combo = combos[0]
     log.warning(
-        "Focus combo part_type=%s class=%r instance_id=%d not found under RUN_PART_TYPES=%s "
+        "Focus combo unit=%s class=%r instance_id=%d not found under RUN_PAIRS=%s "
         "— falling back to %s",
-        FOCUS_PART_TYPE,
+        FOCUS_UNIT,
         FOCUS_CLASS,
         FOCUS_INSTANCE_ID,
-        RUN_PART_TYPES,
+        [p.unit for p in RUN_PAIRS],
         combo_key(focus_combo),
     )
 focus_key = combo_key(focus_combo)
@@ -593,10 +599,10 @@ focus_heatmaps: dict[str, dict[str, dict]] = {}  # scale -> method -> {"baseline
 
 for combo in tqdm(combos, desc="Main per-combo sweep"):
     ck = combo_key(combo)
-    part_type, group = ck[0], ck[1]
-    q = query_encodings[part_type]
+    unit, group = ck[0], ck[1]
+    q = query_encodings[unit]
     q_tokens, q_h, q_w = q["q_tokens"], q["q_h"], q["q_w"]
-    gt = gt_patch_masks[(part_type, group)]
+    gt = gt_patch_masks[(unit, group)]
     is_focus = ck == focus_key
     if is_focus:
         focus_crop_grid.clear()
@@ -1327,6 +1333,322 @@ leaveoneout_endpoint_df.to_csv(OUTPUT_DIR / "leave_one_out_endpoint.csv", index=
 log.info("Wrote %s", OUTPUT_DIR / "leave_one_out_endpoint.csv")
 
 log.info("Saved leave-one-out figures (per method) to %s", OUTPUT_DIR)
+
+# %% Part 6 — 5-3 pooled gallery, cross-validated: does "one well-chosen severity gives a
+# modest gain, don't compose" (Layer 1's finding) hold when the clean baseline gallery is
+# pooled from 5 training images instead of one? Reuses `split_fg_bg_patches`,
+# `score_and_store` unchanged — only discovery, per-instance crop-building, and fold/role
+# assignment are new (see `_shared/pooled_gallery_cv.py`). Scoped to Layer 1 (single-severity
+# sweep) only, at "mid" scale only — this file's combo-major per-(family,severity) encoding
+# is the most expensive of the three complex scripts to extend fairly (every pool instance
+# still needs its own 36 augmented crops encoded before pooling, same fixed cost as
+# augmentation_sensitivity.py's own ~13 min run), so this section answers the one question
+# the published report actually cites rather than replicating Layers 2-3 (composed ensemble,
+# leave-one-out) or the "close" scale too.
+PART_TYPES_53 = sorted({c["part_type"] for c in combos})
+discovery_53 = discover_all_instances(DATA_ROOT, "abc5", PART_TYPES_53)
+POOL_SCALE_53 = "mid"
+
+usable_instances_53: list[dict] = []
+for inst in tqdm(discovery_53.instances, desc="5-3: building mid crops"):
+    img = discovery_53.images[(inst.part_type, inst.image_number)]
+    x0, y0, x1, y1 = scale_crop_box(inst.mask, POOL_SCALE_53, CROP_PADDING_FRACTION)
+    if x1 - x0 < MIN_CROP_SIZE or y1 - y0 < MIN_CROP_SIZE:
+        continue
+    crop_img = img.crop((x0, y0, x1, y1))
+    usable_instances_53.append(
+        {
+            "part_type": inst.part_type,
+            "group": inst.group,
+            "image_number": inst.image_number,
+            "img": crop_img,
+            "mask_px": inst.mask[y0:y1, x0:x1],
+            "bg_exclude_mask_px": inst.bg_exclude_mask[y0:y1, x0:x1],
+            "full_bg_exclude_mask": inst.bg_exclude_mask,
+            "fill": mean_color(crop_img),
+        }
+    )
+log.info("5-3: usable instances %d/%d", len(usable_instances_53), len(discovery_53.instances))
+
+image_encodings_53: dict[tuple[str, int], dict] = {}
+for key in tqdm(sorted(discovery_53.images), desc="5-3: encoding images"):
+    tokens, h, w = extract_patch_tokens(encoder, discovery_53.images[key], LAYER_IDX, debias=True)
+    image_encodings_53[key] = {"tokens": tokens, "h": h, "w": w}
+
+gt_patch_masks_53: dict[tuple[str, str, int], np.ndarray] = {}
+for (part_type, group, n), pixel_mask in discovery_53.gt_masks.items():
+    q = image_encodings_53[(part_type, n)]
+    gt_patch_masks_53[(part_type, group, n)] = pixel_mask_to_patch_mask(
+        pixel_mask, q["h"], q["w"], IMG_SIZE, MASK_PATCH_THRESHOLD
+    )
+
+# Clean (unaugmented) mid-crop encode per instance -> clean fg/bg bank, plus each instance's
+# own "global" bg source (mirrors Part 3.5/3.6, generalized off combos onto every instance).
+clean_fg_53: dict[int, torch.Tensor] = {}
+clean_bg_53: dict[int, torch.Tensor] = {}
+clean_items_53 = [
+    (i, inst["img"], inst["mask_px"], inst["bg_exclude_mask_px"])
+    for i, inst in enumerate(usable_instances_53)
+]
+for i in tqdm(range(0, len(clean_items_53), chunk_size), desc="5-3: encoding clean crops"):
+    chunk = clean_items_53[i : i + chunk_size]
+    out = encoder([c[1] for c in chunk], layers=[LAYER_IDX], debias=True)
+    chunk_patches = out.patches[:, 0]
+    g_h, g_w = chunk_patches.shape[1], chunk_patches.shape[2]
+    for (idx, _, mask_px, bg_exclude_mask_px), patch_tokens in zip(chunk, chunk_patches):
+        fg, bg = split_fg_bg_patches(
+            patch_tokens,
+            mask_px,
+            g_h,
+            g_w,
+            f"5-3 inst{idx} clean",
+            bg_exclude_mask_px=bg_exclude_mask_px,
+        )
+        # Moved to CPU here, not kept resident on GPU: 227 discovered instances (roughly
+        # double this file's own 113-combo 1-1 pipeline) each holding a clean fg/bg bank
+        # simultaneously is exactly the peak-memory mistake this section can't afford, same
+        # fix as every other 5-3 addition's per-instance/per-scale banks.
+        clean_fg_53[idx] = fg.cpu()
+        clean_bg_53[idx] = bg.cpu()
+
+clean_bg_global_53: dict[int, torch.Tensor] = {}
+for i, inst in enumerate(usable_instances_53):
+    r = image_encodings_53[(inst["part_type"], inst["image_number"])]
+    exclude_patch_mask = pixel_mask_to_patch_mask(
+        inst["full_bg_exclude_mask"], r["h"], r["w"], IMG_SIZE, MASK_PATCH_THRESHOLD
+    )
+    exclude_flat = torch.from_numpy(exclude_patch_mask.reshape(-1)).to(r["tokens"].device)
+    global_bg = r["tokens"][~exclude_flat]
+    if global_bg.shape[0] == 0:
+        global_bg = r["tokens"]
+    clean_bg_global_53[i] = global_bg.cpu()
+
+# Every instance's own 36 augmented mid-crops (6 families x 6 severities), encoded once and
+# discarded into per-(instance, family, severity) fg-patch banks — the fixed encoding cost
+# this section can't avoid (same order of magnitude as augmentation_sensitivity.py's own
+# run), reused cheaply across every fold/group that later pools this instance in.
+#
+# Specs only (instance index, family, severity) are materialized up front — cheap, no image
+# data. The actual augmented PIL image is generated lazily per chunk, immediately before
+# encoding, and goes out of scope once that chunk is processed. Building all 8172 augmented
+# images up front (as an earlier version did) held every one of them in host RAM
+# simultaneously and drove the process to a system-RAM OOM kill; Part 4/5 above never makes
+# this mistake because it stays combo-major (one combo's ~36 crops materialized at a time).
+aug_fg_by_inst: dict[tuple[int, str, float], torch.Tensor] = {}
+aug_specs_53: list[tuple[int, str, float]] = []
+for i, inst in enumerate(usable_instances_53):
+    for family, spec in AUGMENTATIONS.items():
+        for val in spec["values"]:
+            aug_specs_53.append((i, family, val))
+
+for i in tqdm(range(0, len(aug_specs_53), chunk_size), desc="5-3: encoding augmented crops"):
+    spec_chunk = aug_specs_53[i : i + chunk_size]
+    chunk = []
+    for idx, family, val in spec_chunk:
+        inst = usable_instances_53[idx]
+        img, mask_px = AUGMENTATIONS[family]["apply"](
+            inst["img"], inst["mask_px"], val, inst["fill"]
+        )
+        chunk.append((idx, family, val, img, mask_px))
+    out = encoder([c[3] for c in chunk], layers=[LAYER_IDX], debias=True)
+    chunk_patches = out.patches[:, 0]
+    g_h, g_w = chunk_patches.shape[1], chunk_patches.shape[2]
+    for (idx, family, val, _, mask_px), patch_tokens in zip(chunk, chunk_patches):
+        fg, _bg = split_fg_bg_patches(
+            patch_tokens, mask_px, g_h, g_w, f"5-3 inst{idx} {family}={val}"
+        )
+        # Moved to CPU — 8172 (instance, family, severity) fg banks held on GPU
+        # simultaneously is the same peak-memory mistake as clean_fg_53/clean_bg_53 above,
+        # at a much larger multiplier.
+        aug_fg_by_inst[(idx, family, val)] = fg.cpu()
+
+instances_by_pg_53: dict[tuple[str, str], list[int]] = defaultdict(list)
+for i, inst in enumerate(usable_instances_53):
+    instances_by_pg_53[(inst["part_type"], inst["group"])].append(i)
+groups_by_pt_53: dict[str, list[str]] = defaultdict(list)
+for pt, g in instances_by_pg_53:
+    groups_by_pt_53[pt].append(g)
+log.info(
+    "5-3: built clean + augmented banks for %d instances across %d (part_type, group) pairs",
+    len(usable_instances_53),
+    len(instances_by_pg_53),
+)
+
+# Cross-validated sweep: for each fold x part_type x group, pool the fold's training
+# instances' clean galleries, then for every (family, severity) pool that severity's
+# augmented fg patches in too and score all three methods — same pairing logic as Layer 1's
+# per-combo sweep above, just operating on pooled multi-instance banks.
+fold_splits_53 = make_fold_role_splits(PART_TYPES_53, seed=SEED)
+iou_lookup_53: dict[str, dict[tuple, float]] = {m: {} for m in METHOD_LABELS}
+n_units_53 = N_FOLDS_53 * len(PART_TYPES_53)
+
+with tqdm(total=n_units_53, desc="5-3: cross-validated fit + score") as pbar:
+    for fold_idx, split in enumerate(fold_splits_53):
+        for part_type in PART_TYPES_53:
+            train_numbers, eval_numbers = split[part_type]
+            for group in groups_by_pt_53.get(part_type, []):
+                idxs = instances_by_pg_53[(part_type, group)]
+                pool_idxs = [
+                    i for i in idxs if usable_instances_53[i]["image_number"] in train_numbers
+                ]
+                if not pool_idxs:
+                    continue
+
+                clean_fg_pool = cap_bank_size(
+                    torch.cat([clean_fg_53[i] for i in pool_idxs], dim=0),
+                    MAX_BANK_SIZE_KNN_53,
+                    SEED,
+                ).to(encoder.device)
+                clean_bg_pool = cap_bank_size(
+                    torch.cat(
+                        [clean_bg_53[i] for i in pool_idxs]
+                        + [clean_bg_global_53[i] for i in pool_idxs],
+                        dim=0,
+                    ),
+                    MAX_BANK_SIZE_KNN_53,
+                    SEED,
+                ).to(encoder.device)
+                if clean_fg_pool.shape[0] == 0 or clean_bg_pool.shape[0] == 0:
+                    continue
+                clean_proto_pool = compute_exemplar_features(clean_fg_pool, mode="mean")
+                clean_bg_proto_pool = compute_exemplar_features(clean_bg_pool, mode="mean")
+
+                for eval_number in eval_numbers:
+                    key = (part_type, group, eval_number)
+                    if key not in gt_patch_masks_53:
+                        continue
+                    q = image_encodings_53[(part_type, eval_number)]
+                    gt = gt_patch_masks_53[key]
+                    q_tokens = q["tokens"]
+
+                    for family, spec in AUGMENTATIONS.items():
+                        for val in spec["values"]:
+                            is_baseline = val == spec["values"][0]
+                            samp_key = (
+                                f"fold{fold_idx}",
+                                part_type,
+                                group,
+                                eval_number,
+                                family,
+                                val,
+                            )
+                            if is_baseline:
+                                paired_proto = clean_proto_pool
+                                fg_bank = clean_fg_pool
+                            else:
+                                aug_fg_pool = cap_bank_size(
+                                    torch.cat(
+                                        [aug_fg_by_inst[(i, family, val)] for i in pool_idxs],
+                                        dim=0,
+                                    ),
+                                    MAX_BANK_SIZE_KNN_53,
+                                    SEED,
+                                ).to(encoder.device)
+                                aug_proto_pool = (
+                                    compute_exemplar_features(aug_fg_pool, mode="mean")
+                                    if aug_fg_pool.shape[0] > 0
+                                    else clean_proto_pool
+                                )
+                                paired_proto = F.normalize(
+                                    torch.cat([clean_proto_pool, aug_proto_pool], dim=0).mean(
+                                        dim=0, keepdim=True
+                                    ),
+                                    p=2,
+                                    dim=-1,
+                                )
+                                fg_bank = cap_bank_size(
+                                    torch.cat([clean_fg_pool, aug_fg_pool], dim=0),
+                                    MAX_BANK_SIZE_KNN_53,
+                                    SEED,
+                                )
+
+                            score_and_store(
+                                iou_lookup_53,
+                                "single_proto",
+                                samp_key,
+                                q_tokens,
+                                q["h"],
+                                q["w"],
+                                gt,
+                                proto=paired_proto,
+                            )
+                            score_and_store(
+                                iou_lookup_53,
+                                "knn_fg",
+                                samp_key,
+                                q_tokens,
+                                q["h"],
+                                q["w"],
+                                gt,
+                                fg_bank=fg_bank,
+                                bg_bank=clean_bg_pool,
+                            )
+                            score_and_store(
+                                iou_lookup_53,
+                                "proto_fgbg",
+                                samp_key,
+                                q_tokens,
+                                q["h"],
+                                q["w"],
+                                gt,
+                                fg_bank=paired_proto,
+                                bg_bank=clean_bg_proto_pool,
+                            )
+            pbar.update(1)
+
+log.info("5-3: scoring complete, %d samples scored", sum(len(v) for v in iou_lookup_53.values()))
+
+# Best-over-baseline per family, matching the 1-1 Layer-1 table's shape (mid scale rows only,
+# since this section is mid-only) — the direct comparison to `best_over_baseline.csv`.
+comparison_53_rows = []
+for method in METHOD_LABELS:
+    samples = sorted({k[:4] for k in iou_lookup_53[method]})
+    for family, spec in AUGMENTATIONS.items():
+        best_list, delta_list = [], []
+        for samp in samples:
+            per_sev = {
+                v: iou_lookup_53[method].get((*samp, family, v))
+                for v in spec["values"]
+                if (*samp, family, v) in iou_lookup_53[method]
+            }
+            if not per_sev:
+                continue
+            best_iou = max(per_sev.values())
+            baseline_iou = per_sev.get(spec["values"][0])
+            best_list.append(best_iou)
+            if baseline_iou is not None:
+                delta_list.append(best_iou - baseline_iou)
+        mean_best_53 = float(np.mean(best_list)) if best_list else float("nan")
+        row_11 = next(
+            r
+            for r in best_over_baseline[method]
+            if r["scale"] == POOL_SCALE_53 and r["family"] == family
+        )
+        comparison_53_rows.append(
+            {
+                "method": method,
+                "family": family,
+                "mean_best_iou_1_1": row_11["mean_best_iou"],
+                "mean_delta_1_1": row_11["mean_delta_vs_baseline"],
+                "mean_best_iou_5_3": mean_best_53,
+                "mean_delta_5_3": float(np.mean(delta_list)) if delta_list else float("nan"),
+                "n_samples_5_3": len(best_list),
+            }
+        )
+comparison_53_df = pd.DataFrame(comparison_53_rows)
+comparison_53_df.to_csv(OUTPUT_DIR / "comparison_1_1_vs_5_3.csv", index=False)
+log.info("1-1 vs 5-3 comparison (Layer 1, scale=%s):", POOL_SCALE_53)
+for _, row in comparison_53_df.iterrows():
+    log.info(
+        "  %-14s %-22s 1-1 best=%.3f (%+.3f vs baseline)  5-3 best=%.3f (%+.3f vs baseline)",
+        row.method,
+        row.family,
+        row.mean_best_iou_1_1,
+        row.mean_delta_1_1,
+        row.mean_best_iou_5_3,
+        row.mean_delta_5_3,
+    )
+log.info("Wrote %s", OUTPUT_DIR / "comparison_1_1_vs_5_3.csv")
 
 # %% [markdown]
 # ## Reading the results

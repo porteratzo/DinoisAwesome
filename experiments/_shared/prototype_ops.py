@@ -26,25 +26,38 @@ def extract_patch_tokens_batch(
 
 
 def extract_patch_tokens_batch_with_cls(
-    encoder: DinoEncoder, images: list[Image.Image], layer_idx: int, debias: bool = False
-) -> list[tuple[torch.Tensor, torch.Tensor, int, int]]:
+    encoder: DinoEncoder,
+    images: list[Image.Image],
+    layer_idx: int,
+    debias: bool = False,
+    return_raw: bool = False,
+) -> (
+    list[tuple[torch.Tensor, torch.Tensor, int, int]]
+    | list[tuple[torch.Tensor, torch.Tensor, int, int, torch.Tensor]]
+):
     """``extract_patch_tokens_batch``'s sibling, additionally returning each image's own
     L2-normalised [CLS] token (that helper discards it). CLS is *not* L2-normalised by
     ``DinoEncoder`` itself (unlike patch tokens), so it's normalised here.
+
+    *return_raw* (default False, fully backward compatible — every existing caller gets the
+    original 4-tuples unchanged) appends each image's own RAW, pre-L2-normalise patch tokens
+    as a 5th tuple element — needed by feature-space transforms (e.g. ZCA whitening) that are
+    only meaningful on magnitude-preserving tokens, computed from a covariance that a plain
+    L2-normalise would already have destroyed (see ``_shared/feature_transforms.py``).
     """
     out = encoder(images, layers=[layer_idx], debias=debias)
     patches = out.patches[:, 0]  # (B, H, W, D)
     cls = F.normalize(out.cls[:, 0], p=2, dim=-1)  # (B, D)
     _, grid_h, grid_w, D = patches.shape
-    return [
-        (
-            F.normalize(patches[b].reshape(grid_h * grid_w, D), p=2, dim=-1),
-            cls[b],
-            grid_h,
-            grid_w,
-        )
-        for b in range(patches.shape[0])
-    ]
+    results = []
+    for b in range(patches.shape[0]):
+        raw = patches[b].reshape(grid_h * grid_w, D)
+        normalized = F.normalize(raw, p=2, dim=-1)
+        if return_raw:
+            results.append((normalized, cls[b], grid_h, grid_w, raw))
+        else:
+            results.append((normalized, cls[b], grid_h, grid_w))
+    return results
 
 
 def knn_fgbg_score(

@@ -15,7 +15,7 @@
 # taking it on faith.
 #
 # Steps:
-#   1. Load one abc3 image + the mask of a single annotated instance.
+#   1. Load one abc5 image + the mask of a single annotated instance.
 #   2. Build N progressively tighter crops, interpolating from the whole image (t=0)
 #      down to a tight, padded bbox around the instance (t=1).
 #   3. Re-encode each crop at native resolution (so "closer" really means more pixels
@@ -68,9 +68,9 @@ from _shared.mask_geometry import (  # noqa: E402
 _REPO_ROOT = Path(__file__).parent.parent.parent
 load_dotenv(_REPO_ROOT / ".env")
 
-data_dir = _REPO_ROOT / "data" / "abc3"
+data_dir = _REPO_ROOT / "data" / "abc5"
 
-# "donut foam single" has exactly one instance in every abc3 image and a small bbox
+# "donut foam single" has exactly one instance in every abc5 image and a small bbox
 # (~100x90px in a 3840x2160 frame) relative to the full image — a good, dramatic case
 # for a scale study. Swap IMAGE_STEM / TARGET_CLASS to try others (see classes.json).
 IMAGE_STEM = "LHa_1"
@@ -78,9 +78,9 @@ TARGET_CLASS = "donut foam single"
 INSTANCE_INDEX = 0  # which matching instance, if TARGET_CLASS has more than one
 
 DINO_VERSION = "v3"
-DINO_SIZE = "large"
-IMG_SIZE = 1024  # must be divisible by patch_size (16 for v3)
-LAYER_IDX = 23  # penultimate/last block of ViT-L/16 (depth 24)
+DINO_SIZE = "base"
+IMG_SIZE = 768  # must be divisible by patch_size (16 for v3)
+LAYER_IDX = 11  # last block of ViT-B/16 (depth 12)
 DINO_WEIGHTS_DIR: str | None = os.environ.get("DINO_WEIGHTS_DIR")
 DINO_ENCODING_CACHE_DIR: str | None = os.environ.get("DINO_ENCODING_CACHE_DIR")
 
@@ -525,7 +525,7 @@ log.info("Saved aspect-ratio figures to %s", OUTPUT_DIR)
 # - **Rotation / in-plane orientation** — same masked-mean-embedding-drift protocol,
 #   but sweeping rotation angle around the instance centroid instead of crop tightness.
 # - **Lighting / exposure** — sweep brightness/contrast/gamma on the same tight crop
-#   and measure drift the same way; relevant here since abc3 is real factory-floor
+#   and measure drift the same way; relevant here since abc5 is real factory-floor
 #   imagery with uncontrolled lighting.
 # - **Occlusion** — progressively mask out a growing fraction of the instance's own
 #   patches (independent of the crop box) and see how fast the masked-mean embedding

@@ -31,6 +31,16 @@
 #   6. Visualize the augmented crop grid for one representative instance (same
 #      image/class as `scale_crop_similarity.py`, for comparability) alongside the
 #      aggregated drift plot.
+#
+# Not a per-dataset-update rerun: this measures how robust the backbone's own
+# masked-mean pooling is to synthetic perturbations — a property of the encoder
+# (model/layer/img_size) and the crop/pooling method, not of which reference/query
+# images happen to be in the dataset. Confirmed empirically: results replicated to
+# 3 decimals across abc3 (n=60) -> abc3+abc4 (n=227) -> abc5's physical merge of the
+# same images (n=227, bit-identical crops). Only rerun this when the backbone, layer,
+# img_size, or crop/pooling method changes — a routine dataset-merge/consolidation
+# rerun of the `fundamental/` suite doesn't need to include it (it's also the
+# second-most expensive script in the suite at ~13 min, ~21% of a full run).
 
 # %% Logging — must be before torch import
 import logging
@@ -75,24 +85,30 @@ from _shared.mask_geometry import pixel_mask_to_patch_mask, scale_crop_box  # no
 _REPO_ROOT = Path(__file__).parent.parent.parent
 load_dotenv(_REPO_ROOT / ".env")
 
-data_dir = _REPO_ROOT / "data" / "abc3"
+DATA_ROOT = _REPO_ROOT / "data"
 
-# Every abc3 image, every annotated instance of every class in it — not just one
-# image/instance. IMAGE_STEMS is discovered from disk so a new abc3 capture is picked
-# up automatically.
-IMAGE_STEMS = sorted(p.stem for p in data_dir.glob("*.jpg"))
+# Every abc5 image, every annotated instance of every class in it — not just one
+# image/instance. IMAGE_STEMS is discovered from disk so a new capture is picked up
+# automatically. DATASETS/the (dataset, stem) tupling is a holdover from when this ran
+# across abc3+abc4 separately (see _shared/dataset_pairs.py's docstring) — abc5 merged
+# those into one dataset, but the plumbing still works unchanged with a single entry.
+DATASETS: list[str] = ["abc5"]
+IMAGE_STEMS: list[tuple[str, str]] = sorted(
+    (dataset, p.stem) for dataset in DATASETS for p in (DATA_ROOT / dataset).glob("*.jpg")
+)
 
 # Reference instance used only for the augmented-crop-grid visualization (a full grid
 # across all instances would be unreadable) — same object as scale_crop_similarity.py,
 # for comparability. Drift curves aggregate every instance, not just this one.
+REFERENCE_DATASET = "abc5"
 REFERENCE_IMAGE_STEM = "LHa_1"
 REFERENCE_TARGET_CLASS = "donut foam single"
 REFERENCE_INSTANCE_ID = 1  # annotation "instance_id" (1-based, per class per image)
 
 DINO_VERSION = "v3"
-DINO_SIZE = "large"
+DINO_SIZE = "base"
 IMG_SIZE = 768  # must be divisible by patch_size (16 for v3)
-LAYER_IDX = 23  # penultimate/last block of ViT-L/16 (depth 24)
+LAYER_IDX = 11  # last block of ViT-B/16 (depth 12)
 DINO_WEIGHTS_DIR: str | None = os.environ.get("DINO_WEIGHTS_DIR")
 DINO_ENCODING_CACHE_DIR: str | None = os.environ.get("DINO_ENCODING_CACHE_DIR")
 
@@ -102,12 +118,12 @@ MID_PADDING_FRACTION = 1.0  # mid-crop padding around the mask bbox, fraction of
 SEED = 0
 torch.manual_seed(SEED)
 
-OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental" / "augmentation_sensitivity"
+OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental_abc5" / "augmentation_sensitivity"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 log.info(
     "images=%s  |  DINO%s-%s img_size=%d layer=%d",
-    IMAGE_STEMS,
+    [f"{d}/{s}" for d, s in IMAGE_STEMS],
     DINO_VERSION,
     DINO_SIZE,
     IMG_SIZE,
@@ -123,9 +139,10 @@ log.info(
 # real mid crop — silently understating drift for this "mid" setting; see scale_crop_box
 # in _shared/mask_geometry.py for the close/mid/global definitions.)
 instances: list[dict] = []
-for image_stem in tqdm(IMAGE_STEMS, desc="Loading images/annotations"):
-    anns = load_annotations(data_dir / "annotations" / image_stem)
-    ref_img = Image.open(data_dir / f"{image_stem}.jpg").convert("RGB")
+for dataset, image_stem in tqdm(IMAGE_STEMS, desc="Loading images/annotations"):
+    dataset_dir = DATA_ROOT / dataset
+    anns = load_annotations(dataset_dir / "annotations" / image_stem)
+    ref_img = Image.open(dataset_dir / f"{image_stem}.jpg").convert("RGB")
     for ann in anns:
         mask = ann["mask"]  # (H, W) bool, full native resolution
         mid_box = scale_crop_box(mask, "mid", MID_PADDING_FRACTION)
@@ -134,6 +151,7 @@ for image_stem in tqdm(IMAGE_STEMS, desc="Loading images/annotations"):
         base_mask_px = mask[y0:y1, x0:x1]
         instances.append(
             {
+                "dataset": dataset,
                 "image_stem": image_stem,
                 "class": ann["class"],
                 "instance_id": ann["instance_id"],
@@ -147,7 +165,8 @@ reference_instance = next(
     (
         inst
         for inst in instances
-        if inst["image_stem"] == REFERENCE_IMAGE_STEM
+        if inst["dataset"] == REFERENCE_DATASET
+        and inst["image_stem"] == REFERENCE_IMAGE_STEM
         and inst["class"] == REFERENCE_TARGET_CLASS
         and inst["instance_id"] == REFERENCE_INSTANCE_ID
     ),
@@ -155,8 +174,9 @@ reference_instance = next(
 )
 if reference_instance is None:
     raise ValueError(
-        f"Reference instance image={REFERENCE_IMAGE_STEM!r} class={REFERENCE_TARGET_CLASS!r} "
-        f"instance_id={REFERENCE_INSTANCE_ID} not found among loaded instances"
+        f"Reference instance dataset={REFERENCE_DATASET!r} image={REFERENCE_IMAGE_STEM!r} "
+        f"class={REFERENCE_TARGET_CLASS!r} instance_id={REFERENCE_INSTANCE_ID} not found "
+        "among loaded instances"
     )
 
 log.info("Loaded %d instances across %d images", len(instances), len(IMAGE_STEMS))
@@ -202,35 +222,13 @@ AUGMENTATIONS: dict[str, dict] = {
     },
 }
 
-# %% Build every augmented crop up front (severity=0 == that instance's own base_crop)
-entries: list[dict] = []
-for inst in tqdm(instances, desc="Building augmented crops"):
-    for family, spec in AUGMENTATIONS.items():
-        for val in spec["values"]:
-            img, mask_px = spec["apply"](inst["base_crop"], inst["base_mask_px"], val, inst["fill"])
-            entries.append(
-                {
-                    "image_stem": inst["image_stem"],
-                    "class": inst["class"],
-                    "instance_id": inst["instance_id"],
-                    "family": family,
-                    "value": val,
-                    "img": img,
-                    "mask_px": mask_px,
-                }
-            )
-
-log.info(
-    "Built %d augmented crops across %d instances x %d families",
-    len(entries),
-    len(instances),
-    len(AUGMENTATIONS),
-)
-
-# %% Encode + pool every augmented crop, chunked to encoder.max_batch_size. Pooling happens
-# inside the same loop that encodes each chunk so only one chunk's (grid_h, grid_w, D) patch
-# grid is ever resident at a time — holding all entries' full patch grids simultaneously (a
-# separate encode-everything-then-pool-everything pass) is what was exhausting RAM.
+# %% Build + encode every instance's augmented crops together, one instance at a time.
+# Building all ~36 x N_instances augmented PIL images up front (a separate build-everything-
+# then-encode-everything pass) exhausted host RAM once abc4 pushed the instance count from
+# abc3-alone's ~60 to ~230 — only one instance's own 36 crops are ever resident now, chunked
+# to encoder.max_batch_size same as before; only the reference instance's own images are kept
+# afterward (for the qualitative crop-grid figure below), every other instance's img/mask_px
+# is dropped right after encoding so the persisted `entries` list stays small (embeddings only).
 encoder = DinoEncoder(
     version=DINO_VERSION,
     size=DINO_SIZE,
@@ -242,33 +240,69 @@ encoder = DinoEncoder(
 )
 encoder = EncoderWithCache(encoder, cache_dir=DINO_ENCODING_CACHE_DIR)
 chunk_size = encoder.max_batch_size
-for i in tqdm(range(0, len(entries), chunk_size), desc="Encoding + pooling crops"):
-    chunk = entries[i : i + chunk_size]
-    out = encoder([e["img"] for e in chunk], layers=[LAYER_IDX], debias=True)
-    chunk_patches = out.patches[:, 0].cpu()  # (chunk, grid_h, grid_w, D) — freed at loop end
-    D = chunk_patches.shape[-1]
 
-    for entry, patch_tokens in zip(chunk, chunk_patches):
-        patch_mask = pixel_mask_to_patch_mask(
-            entry["mask_px"], encoder.grid_h, encoder.grid_w, IMG_SIZE, MASK_PATCH_THRESHOLD
-        )
-        tokens = F.normalize(patch_tokens.reshape(encoder.grid_h * encoder.grid_w, D), p=2, dim=-1)
-        patch_flat = torch.from_numpy(patch_mask.reshape(-1)).to(tokens.device)
-
-        masked = tokens[patch_flat]
-        if masked.shape[0] == 0:
-            log.warning(
-                "image=%s class=%s instance=%s family=%s value=%s: mask empty after patch-grid "
-                "projection — using all crop patches",
-                entry["image_stem"],
-                entry["class"],
-                entry["instance_id"],
-                entry["family"],
-                entry["value"],
+entries: list[dict] = []
+for inst in tqdm(instances, desc="Building + encoding augmented crops"):
+    is_reference = inst is reference_instance
+    inst_entries: list[dict] = []
+    for family, spec in AUGMENTATIONS.items():
+        for val in spec["values"]:
+            img, mask_px = spec["apply"](inst["base_crop"], inst["base_mask_px"], val, inst["fill"])
+            inst_entries.append(
+                {
+                    "dataset": inst["dataset"],
+                    "image_stem": inst["image_stem"],
+                    "class": inst["class"],
+                    "instance_id": inst["instance_id"],
+                    "family": family,
+                    "value": val,
+                    "img": img,
+                    "mask_px": mask_px,
+                }
             )
-            masked = tokens
-        entry["embedding"] = compute_exemplar_features(masked, mode="mean")  # (1, D)
-        entry["n_masked_patches"] = int(patch_flat.sum())
+
+    for i in range(0, len(inst_entries), chunk_size):
+        chunk = inst_entries[i : i + chunk_size]
+        out = encoder([e["img"] for e in chunk], layers=[LAYER_IDX], debias=True)
+        chunk_patches = out.patches[:, 0].cpu()  # (chunk, grid_h, grid_w, D) — freed at loop end
+        D = chunk_patches.shape[-1]
+
+        for entry, patch_tokens in zip(chunk, chunk_patches):
+            patch_mask = pixel_mask_to_patch_mask(
+                entry["mask_px"], encoder.grid_h, encoder.grid_w, IMG_SIZE, MASK_PATCH_THRESHOLD
+            )
+            tokens = F.normalize(
+                patch_tokens.reshape(encoder.grid_h * encoder.grid_w, D), p=2, dim=-1
+            )
+            patch_flat = torch.from_numpy(patch_mask.reshape(-1)).to(tokens.device)
+
+            masked = tokens[patch_flat]
+            if masked.shape[0] == 0:
+                log.warning(
+                    "image=%s class=%s instance=%s family=%s value=%s: mask empty after patch-grid "
+                    "projection — using all crop patches",
+                    entry["image_stem"],
+                    entry["class"],
+                    entry["instance_id"],
+                    entry["family"],
+                    entry["value"],
+                )
+                masked = tokens
+            entry["embedding"] = compute_exemplar_features(masked, mode="mean")  # (1, D)
+            entry["n_masked_patches"] = int(patch_flat.sum())
+
+    if not is_reference:
+        for e in inst_entries:
+            e.pop("img", None)
+            e.pop("mask_px", None)
+    entries.extend(inst_entries)
+
+log.info(
+    "Built + encoded %d augmented crops across %d instances x %d families",
+    len(entries),
+    len(instances),
+    len(AUGMENTATIONS),
+)
 
 # %% Similarity vs. each instance's own severity=0 (unperturbed) embedding, then
 # aggregated (mean + std) across all instances per family/severity
@@ -277,11 +311,23 @@ for family, spec in AUGMENTATIONS.items():
     baseline_val = spec["values"][0]
     for entry in entries:
         if entry["family"] == family and entry["value"] == baseline_val:
-            key = (entry["image_stem"], entry["class"], entry["instance_id"], family)
+            key = (
+                entry["dataset"],
+                entry["image_stem"],
+                entry["class"],
+                entry["instance_id"],
+                family,
+            )
             baseline_by_instance_family[key] = entry["embedding"]
 
 for entry in entries:
-    key = (entry["image_stem"], entry["class"], entry["instance_id"], entry["family"])
+    key = (
+        entry["dataset"],
+        entry["image_stem"],
+        entry["class"],
+        entry["instance_id"],
+        entry["family"],
+    )
     baseline = baseline_by_instance_family[key]
     entry["similarity"] = float((entry["embedding"] @ baseline.T).item())
 
@@ -308,6 +354,7 @@ for family, spec in AUGMENTATIONS.items():
 entries_df = pd.DataFrame(
     [
         {
+            "dataset": e["dataset"],
             "image_stem": e["image_stem"],
             "class": e["class"],
             "instance_id": e["instance_id"],
@@ -344,7 +391,8 @@ log.info(
 ref_entries = [
     e
     for e in entries
-    if e["image_stem"] == reference_instance["image_stem"]
+    if e["dataset"] == reference_instance["dataset"]
+    and e["image_stem"] == reference_instance["image_stem"]
     and e["class"] == reference_instance["class"]
     and e["instance_id"] == reference_instance["instance_id"]
 ]
@@ -362,7 +410,7 @@ for row, (family, spec) in enumerate(AUGMENTATIONS.items()):
         axes[row, col].axis("off")
     axes[row, 0].set_ylabel(family, fontsize=9)
 fig.suptitle(
-    f"Augmentation sweeps — {reference_instance['image_stem']} / "
+    f"Augmentation sweeps — {reference_instance['dataset']}/{reference_instance['image_stem']} / "
     f"{reference_instance['class']!r} instance {reference_instance['instance_id']} (mid crop)"
 )
 fig.tight_layout(rect=(0, 0, 1, 0.97))

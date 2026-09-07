@@ -82,6 +82,7 @@ from dinoisawesome.abc3 import INSTANCE_TYPE_GROUPS, PART_TYPES, available_insta
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from _shared.abc3_combos import combo_key  # noqa: E402
+from _shared.dataset_pairs import REF_QUERY_PAIRS, RefQueryPair  # noqa: E402
 from _shared.feature_transforms import (  # noqa: E402
     apply_affine,
     fit_cov_eigh,
@@ -93,6 +94,13 @@ from _shared.feature_transforms import (  # noqa: E402
     zca_matrix,
 )
 from _shared.mask_geometry import pixel_mask_to_patch_mask, scale_crop_box  # noqa: E402
+from _shared.pooled_gallery_cv import (  # noqa: E402
+    MAX_BANK_SIZE_TRANSFORM_53,
+    N_FOLDS_53,
+    cap_bank_size,
+    discover_all_instances,
+    make_fold_role_splits,
+)
 from _shared.prototype_ops import knn_score_heatmap, score_heatmap  # noqa: E402
 from _shared.thresholding import oracle_iou  # noqa: E402
 
@@ -100,23 +108,21 @@ from _shared.thresholding import oracle_iou  # noqa: E402
 _REPO_ROOT = Path(__file__).parent.parent.parent
 load_dotenv(_REPO_ROOT / ".env")
 
-data_dir = _REPO_ROOT / "data" / "abc3"
+DATA_ROOT = _REPO_ROOT / "data"
 
-REF_NUMBER = 1
-QUERY_NUMBER = 2
-
-# Narrow for fast iteration, e.g. ["LHa"] — same knob as the sibling fundamental scripts.
-RUN_PART_TYPES: list[str] = PART_TYPES
+# abc5 has four ref/query pairs per part type — (1,2)/(3,4)/(5,6)/(7,8) (see
+# _shared/dataset_pairs.py) — narrow for fast iteration, e.g. REF_QUERY_PAIRS[:1].
+RUN_PAIRS: list[RefQueryPair] = REF_QUERY_PAIRS
 
 # Same focus combo as the sibling fundamental scripts, for direct comparability of figures.
-FOCUS_PART_TYPE = "LHa"
+FOCUS_UNIT = "LHa_1-2"
 FOCUS_CLASS = "donut foam single"
 FOCUS_INSTANCE_ID = 1
 
 DINO_VERSION = "v3"
-DINO_SIZE = "large"
+DINO_SIZE = "base"
 IMG_SIZE = 768
-LAYER_IDX = 23
+LAYER_IDX = 11  # last block of ViT-B/16 (depth 12)
 DINO_WEIGHTS_DIR: str | None = os.environ.get("DINO_WEIGHTS_DIR")
 DINO_ENCODING_CACHE_DIR: str | None = os.environ.get("DINO_ENCODING_CACHE_DIR")
 
@@ -185,15 +191,14 @@ METHOD_COLOR: dict[str, str] = {
 SEED = 0
 torch.manual_seed(SEED)
 
-OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental" / "feature_transform_oracle_iou"
+OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental_abc5" / "feature_transform_oracle_iou"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 log.info(
-    "RUN_PART_TYPES=%s ref_number=%d query_number=%d  |  DINO%s-%s img_size=%d layer=%d  |  "
+    "RUN_PAIRS=%d units (%s)  |  DINO%s-%s img_size=%d layer=%d  |  "
     "pipelines=%s eps_sweep=%s pca_k_sweep=%s scale_combos=%s",
-    RUN_PART_TYPES,
-    REF_NUMBER,
-    QUERY_NUMBER,
+    len(RUN_PAIRS),
+    [p.unit for p in RUN_PAIRS],
     DINO_VERSION,
     DINO_SIZE,
     IMG_SIZE,
@@ -351,40 +356,44 @@ group_ref_masks: dict[tuple[str, str], np.ndarray] = {}
 ref_images: dict[str, Image.Image] = {}
 query_images: dict[str, Image.Image] = {}
 
-for part_type in tqdm(RUN_PART_TYPES, desc="Discovering combos"):
-    ref_stem = f"{part_type}_{REF_NUMBER}"
-    query_stem = f"{part_type}_{QUERY_NUMBER}"
-    ref_ann_path = data_dir / "annotations" / ref_stem
-    query_ann_path = data_dir / "annotations" / query_stem
+for pair in tqdm(RUN_PAIRS, desc="Discovering combos"):
+    unit = pair.unit
+    pair_data_dir = DATA_ROOT / pair.dataset
+    ref_stem = f"{pair.part_type}_{pair.ref}"
+    query_stem = f"{pair.part_type}_{pair.query}"
+    ref_ann_path = pair_data_dir / "annotations" / ref_stem
+    query_ann_path = pair_data_dir / "annotations" / query_stem
 
     groups = available_instance_groups(ref_ann_path)
     if not groups:
-        log.warning("part_type=%s: no instance-type groups annotated — skipping", part_type)
+        log.warning("unit=%s: no instance-type groups annotated — skipping", unit)
         continue
 
     ref_anns = load_annotations(ref_ann_path)
     query_anns = load_annotations(query_ann_path)
-    ref_images[part_type] = Image.open(data_dir / f"{ref_stem}.jpg").convert("RGB")
-    query_images[part_type] = Image.open(data_dir / f"{query_stem}.jpg").convert("RGB")
+    ref_images[unit] = Image.open(pair_data_dir / f"{ref_stem}.jpg").convert("RGB")
+    query_images[unit] = Image.open(pair_data_dir / f"{query_stem}.jpg").convert("RGB")
 
     for group in groups:
         classes = INSTANCE_TYPE_GROUPS[group]
         ref_group_anns = [a for a in ref_anns if a["class"] in classes]
         query_group_anns = [a for a in query_anns if a["class"] in classes]
         if not query_group_anns:
-            log.warning("part_type=%s group=%s: no query GT instances — skipping", part_type, group)
+            log.warning("unit=%s group=%s: no query GT instances — skipping", unit, group)
             continue
-        group_query_masks[(part_type, group)] = np.stack([a["mask"] for a in query_group_anns]).any(
+        group_query_masks[(unit, group)] = np.stack([a["mask"] for a in query_group_anns]).any(
             axis=0
         )
         if ref_group_anns:
-            group_ref_masks[(part_type, group)] = np.stack([a["mask"] for a in ref_group_anns]).any(
+            group_ref_masks[(unit, group)] = np.stack([a["mask"] for a in ref_group_anns]).any(
                 axis=0
             )
         for ref_ann in ref_group_anns:
             combos.append(
                 {
-                    "part_type": part_type,
+                    "unit": unit,
+                    "dataset": pair.dataset,
+                    "part_type": pair.part_type,
                     "group": group,
                     "class": ref_ann["class"],
                     "instance_id": ref_ann["instance_id"],
@@ -394,20 +403,21 @@ for part_type in tqdm(RUN_PART_TYPES, desc="Discovering combos"):
 
 if not combos:
     raise RuntimeError(
-        f"No combos discovered for RUN_PART_TYPES={RUN_PART_TYPES} — every part type was "
+        f"No combos discovered for RUN_PAIRS={[p.unit for p in RUN_PAIRS]} — every pair was "
         "skipped (no annotated instance-type groups or no query GT)."
     )
 log.info(
-    "Discovered %d (part_type, group, instance) combos across %d part types",
+    "Discovered %d (unit, group, instance) combos across %d units (%d part types)",
     len(combos),
+    len({c["unit"] for c in combos}),
     len({c["part_type"] for c in combos}),
 )
 
 # %% Part 2 — build close/mid crops per combo
 scales_by_ck: dict[tuple, list[str]] = defaultdict(list)
 for combo in tqdm(combos, desc="Building close/mid crops"):
-    ref_img = ref_images[combo["part_type"]]
-    group_mask = group_ref_masks.get((combo["part_type"], combo["group"]), combo["ref_mask"])
+    ref_img = ref_images[combo["unit"]]
+    group_mask = group_ref_masks.get((combo["unit"], combo["group"]), combo["ref_mask"])
     combo["crops"] = {}
     for scale in SCALES:
         box = scale_crop_box(combo["ref_mask"], scale, CROP_PADDING_FRACTION)
@@ -446,16 +456,16 @@ encoder = EncoderWithCache(encoder, cache_dir=DINO_ENCODING_CACHE_DIR)
 chunk_size = encoder.max_batch_size
 
 query_raw_encodings: dict[str, tuple[torch.Tensor, int, int]] = {}
-for part_type in tqdm(sorted(query_images), desc="Encoding query images (raw)"):
-    out = encoder(query_images[part_type], layers=[LAYER_IDX], debias=True)
+for unit in tqdm(sorted(query_images), desc="Encoding query images (raw)"):
+    out = encoder(query_images[unit], layers=[LAYER_IDX], debias=True)
     patches = out.patches[:, 0]  # (1, H, W, D)
     q_h, q_w = patches.shape[1], patches.shape[2]
-    query_raw_encodings[part_type] = (patches[0].reshape(q_h * q_w, -1).float(), q_h, q_w)
+    query_raw_encodings[unit] = (patches[0].reshape(q_h * q_w, -1).float(), q_h, q_w)
 
 gt_patch_masks: dict[tuple[str, str], np.ndarray] = {}
-for (part_type, group), pixel_mask in group_query_masks.items():
-    _, q_h, q_w = query_raw_encodings[part_type]
-    gt_patch_masks[(part_type, group)] = pixel_mask_to_patch_mask(
+for (unit, group), pixel_mask in group_query_masks.items():
+    _, q_h, q_w = query_raw_encodings[unit]
+    gt_patch_masks[(unit, group)] = pixel_mask_to_patch_mask(
         pixel_mask, q_h, q_w, IMG_SIZE, MASK_PATCH_THRESHOLD
     )
 
@@ -465,11 +475,11 @@ for (part_type, group), pixel_mask in group_query_masks.items():
 # SCALE_COMBOS entry includes "global", an fg source too. Same role as the sibling
 # fundamental scripts' "global" scale, just kept raw here instead of normalized.
 ref_raw_encodings: dict[str, tuple[torch.Tensor, int, int]] = {}
-for part_type in tqdm(sorted(ref_images), desc="Encoding ref images (raw, global bg source)"):
-    out = encoder(ref_images[part_type], layers=[LAYER_IDX], debias=True)
+for unit in tqdm(sorted(ref_images), desc="Encoding ref images (raw, global bg source)"):
+    out = encoder(ref_images[unit], layers=[LAYER_IDX], debias=True)
     patches = out.patches[:, 0]
     r_h, r_w = patches.shape[1], patches.shape[2]
-    ref_raw_encodings[part_type] = (patches[0].reshape(r_h * r_w, -1).float(), r_h, r_w)
+    ref_raw_encodings[unit] = (patches[0].reshape(r_h * r_w, -1).float(), r_h, r_w)
 
 # %% Part 4 — encode every combo's close/mid crops (RAW), pool per-combo fg/bg galleries
 # bg = close+mid bg patches + this combo's own "global" bg (Part 3.6's full ref-image tokens,
@@ -501,8 +511,12 @@ for i in tqdm(range(0, len(clean_items), chunk_size), desc="Encoding combo crops
             f"{ck} scale={scale}",
             bg_exclude_mask_px=bg_exclude_mask_px,
         )
-        fg_by_scale_raw[(ck, scale)] = fg
-        bg_by_scale_raw[(ck, scale)] = bg
+        # Kept on CPU: with REF_QUERY_PAIRS spanning 16 ref/query pairs, every combo's raw
+        # (non-L2-normalised, float32) fg/bg bank held on GPU simultaneously no longer fits
+        # (abc3-only fit in ~12GB, the combined pool doesn't) — moved back to the query's
+        # device per combo in Part 5.
+        fg_by_scale_raw[(ck, scale)] = fg.cpu()
+        bg_by_scale_raw[(ck, scale)] = bg.cpu()
 
 # "global" scale, per combo: fg is this combo's own ref_mask projected onto the full
 # ref-image patch grid (the object's own patches, at the encoder's whole-image resolution);
@@ -510,8 +524,8 @@ for i in tqdm(range(0, len(clean_items), chunk_size), desc="Encoding combo crops
 # (unchanged from before this sweep existed — previously its own combo_bg_global_raw dict).
 for combo in combos:
     ck = combo_key(combo)
-    part_type, group = ck[0], ck[1]
-    r_tokens_raw, r_h, r_w = ref_raw_encodings[part_type]
+    unit, group = ck[0], ck[1]
+    r_tokens_raw, r_h, r_w = ref_raw_encodings[unit]
 
     fg_patch_mask = pixel_mask_to_patch_mask(
         combo["ref_mask"], r_h, r_w, IMG_SIZE, MASK_PATCH_THRESHOLD
@@ -521,9 +535,9 @@ for combo in combos:
     if global_fg.shape[0] == 0:
         log.warning("%s: global fg mask empty after patch-grid projection — using all patches", ck)
         global_fg = r_tokens_raw
-    fg_by_scale_raw[(ck, "global")] = global_fg
+    fg_by_scale_raw[(ck, "global")] = global_fg.cpu()
 
-    exclude_mask_px = group_ref_masks.get((part_type, group), combo["ref_mask"])
+    exclude_mask_px = group_ref_masks.get((unit, group), combo["ref_mask"])
     exclude_patch_mask = pixel_mask_to_patch_mask(
         exclude_mask_px, r_h, r_w, IMG_SIZE, MASK_PATCH_THRESHOLD
     )
@@ -532,7 +546,7 @@ for combo in combos:
     if global_bg.shape[0] == 0:
         log.warning("%s: global bg mask empty after patch-grid projection — using all patches", ck)
         global_bg = r_tokens_raw
-    bg_by_scale_raw[(ck, "global")] = global_bg
+    bg_by_scale_raw[(ck, "global")] = global_bg.cpu()
 
 bg_raw_lookup: dict[tuple, torch.Tensor] = {}
 for ck, scales in scales_by_ck.items():
@@ -583,21 +597,22 @@ iou_lookup_by_combo: dict[str, IouLookup] = {name: new_iou_lookup() for name in 
 
 for combo in tqdm(combos, desc="Part 5: fitting + scoring"):
     ck = combo_key(combo)
-    part_type, group = ck[0], ck[1]
+    unit, group = ck[0], ck[1]
     if ck not in bg_raw_lookup:
         continue
-    bg_raw = bg_raw_lookup[ck]
+    gt = gt_patch_masks.get((unit, group))
+    if gt is None:
+        continue
+    q_raw, q_h, q_w = query_raw_encodings[unit]
+    bg_raw = bg_raw_lookup[ck].to(q_raw.device)
     if bg_raw.shape[0] == 0:
         log.warning("%s: empty bg raw gallery — skipping", ck)
         continue
-    gt = gt_patch_masks.get((part_type, group))
-    if gt is None:
-        continue
-    q_raw, q_h, q_w = query_raw_encodings[part_type]
     for scale_combo_name in SCALE_COMBOS:
         fg_raw = fg_raw_lookup.get((ck, scale_combo_name))
         if fg_raw is None or fg_raw.shape[0] == 0:
             continue
+        fg_raw = fg_raw.to(q_raw.device)
         score_combo(ck, fg_raw, bg_raw, q_raw, q_h, q_w, gt, iou_lookup_by_combo[scale_combo_name])
 
 log.info(
@@ -719,7 +734,7 @@ for scale_combo_name, lookup in iou_lookup_by_combo.items():
     plot_pipeline_bar_chart(
         summary_df,
         f"Feature-space transforms — oracle IoU by pipeline, fg scales={scale_combo_name} "
-        f"({len(RUN_PART_TYPES)} part types)",
+        f"({len(RUN_PAIRS)} part types)",
         _headline_path,
     )
     log.info("Saved headline bar chart to %s", _headline_path)
@@ -735,7 +750,7 @@ per_combo_rows = [
         "pipeline": pipeline,
         "param": param,
         "method": method,
-        "part_type": ck[0],
+        "unit": ck[0],
         "group": ck[1],
         "class": ck[2],
         "instance_id": ck[3],
@@ -799,7 +814,7 @@ def plot_scale_combo_comparison(combined_df: pd.DataFrame, title: str, out_path:
 _comparison_path = OUTPUT_DIR / "oracle_iou_by_scale_combo_comparison.png"
 plot_scale_combo_comparison(
     combined_summary_df,
-    f"Feature-space transforms — fg scale combo comparison ({len(RUN_PART_TYPES)} part types)",
+    f"Feature-space transforms — fg scale combo comparison ({len(RUN_PAIRS)} part types)",
     _comparison_path,
 )
 log.info("Saved scale-combo comparison chart to %s", _comparison_path)
@@ -938,30 +953,30 @@ focus_combo = next(
     (
         c
         for c in combos
-        if c["part_type"] == FOCUS_PART_TYPE
+        if c["unit"] == FOCUS_UNIT
         and c["class"] == FOCUS_CLASS
         and c["instance_id"] == FOCUS_INSTANCE_ID
     ),
     combos[0],
 )
 focus_ck = combo_key(focus_combo)
-if (focus_combo["part_type"], focus_combo["class"], focus_combo["instance_id"]) != (
-    FOCUS_PART_TYPE,
+if (focus_combo["unit"], focus_combo["class"], focus_combo["instance_id"]) != (
+    FOCUS_UNIT,
     FOCUS_CLASS,
     FOCUS_INSTANCE_ID,
 ):
     log.warning(
-        "Focus combo %s not found under RUN_PART_TYPES — falling back to %s",
-        (FOCUS_PART_TYPE, FOCUS_CLASS, FOCUS_INSTANCE_ID),
+        "Focus combo %s not found under RUN_PAIRS — falling back to %s",
+        (FOCUS_UNIT, FOCUS_CLASS, FOCUS_INSTANCE_ID),
         focus_ck,
     )
 
 if focus_ck not in bg_raw_lookup:
     log.warning("Focus combo %s has no usable bg gallery — skipping qualitative figure", focus_ck)
 else:
-    focus_part_type, focus_group = focus_ck[0], focus_ck[1]
-    focus_gt = gt_patch_masks[(focus_part_type, focus_group)]
-    focus_q_raw, focus_q_h, focus_q_w = query_raw_encodings[focus_part_type]
+    focus_unit, focus_group = focus_ck[0], focus_ck[1]
+    focus_gt = gt_patch_masks[(focus_unit, focus_group)]
+    focus_q_raw, focus_q_h, focus_q_w = query_raw_encodings[focus_unit]
 
     for scale_combo_name in SCALE_COMBOS:
         if (focus_ck, scale_combo_name) not in fg_raw_lookup:
@@ -976,8 +991,8 @@ else:
         # combo's raw maps through the whole run just for one figure.
         focus_raw_maps = score_combo(
             focus_ck,
-            fg_raw_lookup[(focus_ck, scale_combo_name)],
-            bg_raw_lookup[focus_ck],
+            fg_raw_lookup[(focus_ck, scale_combo_name)].to(focus_q_raw.device),
+            bg_raw_lookup[focus_ck].to(focus_q_raw.device),
             focus_q_raw,
             focus_q_h,
             focus_q_w,
@@ -985,7 +1000,7 @@ else:
             iou_lookup_by_combo[scale_combo_name],
         )
 
-        query_img = query_images[focus_part_type]
+        query_img = query_images[focus_unit]
         n_panels = 1 + len(PIPELINES)
         n_cols = 3
         n_rows = -(-n_panels // n_cols)
@@ -1028,6 +1043,269 @@ else:
         fig.savefig(_focus_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         log.info("Saved qualitative focus-combo grid to %s", _focus_path)
+
+# %% Part 10 — 5-3 pooled gallery, cross-validated: does ZCA/PCA/LDA/Mahalanobis's ranking
+# hold when the gallery is built from 5 pooled training images instead of one reference
+# image? Reuses `score_combo`/`split_fg_bg_patches_raw`/`best_param`/`mean_std_iou` unchanged
+# — only discovery, pooling, and fold/role assignment are new (see
+# `_shared/pooled_gallery_cv.py` for why folds use a fresh random shuffle rather than a fixed
+# image order, which was a real dataset-of-origin confound in `training_set_size_ablation.py`'s
+# first version). The existing 1-1 combos/results above are untouched by this section.
+PART_TYPES_53 = PART_TYPES
+discovery_53 = discover_all_instances(DATA_ROOT, "abc5", PART_TYPES_53)
+
+usable_instances_53: list = []
+for inst in tqdm(discovery_53.instances, desc="5-3: building close/mid crops"):
+    img = discovery_53.images[(inst.part_type, inst.image_number)]
+    crops: dict = {}
+    ok = True
+    for scale in SCALES:  # ["close", "mid"] — "global" is derived per-instance below
+        x0, y0, x1, y1 = scale_crop_box(inst.mask, scale, CROP_PADDING_FRACTION)
+        if x1 - x0 < MIN_CROP_SIZE or y1 - y0 < MIN_CROP_SIZE:
+            ok = False
+            break
+        crops[scale] = {
+            "img": img.crop((x0, y0, x1, y1)),
+            "mask_px": inst.mask[y0:y1, x0:x1],
+            "bg_exclude_mask_px": inst.bg_exclude_mask[y0:y1, x0:x1],
+        }
+    if not ok:
+        continue
+    inst.crops = crops
+    usable_instances_53.append(inst)
+log.info("5-3: usable instances %d/%d", len(usable_instances_53), len(discovery_53.instances))
+
+# Raw full-image encodings — reused both as each instance's own "global" fg/bg source (same
+# role as Part 3.6's ref_raw_encodings) and as every image's query/eval tokens (Part 3's role).
+image_raw_encodings_53: dict[tuple[str, int], tuple[torch.Tensor, int, int]] = {}
+for key in tqdm(sorted(discovery_53.images), desc="5-3: encoding images (raw)"):
+    out = encoder(discovery_53.images[key], layers=[LAYER_IDX], debias=True)
+    patches = out.patches[:, 0]
+    h, w = patches.shape[1], patches.shape[2]
+    image_raw_encodings_53[key] = (patches[0].reshape(h * w, -1).float(), h, w)
+
+gt_patch_masks_53: dict[tuple[str, str, int], np.ndarray] = {}
+for (part_type, group, n), pixel_mask in discovery_53.gt_masks.items():
+    _, h, w = image_raw_encodings_53[(part_type, n)]
+    gt_patch_masks_53[(part_type, group, n)] = pixel_mask_to_patch_mask(
+        pixel_mask, h, w, IMG_SIZE, MASK_PATCH_THRESHOLD
+    )
+
+# Encode close/mid crops (raw) + derive each instance's own "global" fg/bg from its own
+# image's full raw encoding — same per-instance/scale bank pattern as Part 4, generalized off
+# combos onto every discovered instance.
+fg_by_inst_scale_53: dict[tuple[int, str], torch.Tensor] = {}
+bg_by_inst_scale_53: dict[tuple[int, str], torch.Tensor] = {}
+
+clean_items_53: list[tuple] = []
+for i, inst in enumerate(usable_instances_53):
+    for scale, crop in inst.crops.items():
+        clean_items_53.append((i, scale, crop["img"], crop["mask_px"], crop["bg_exclude_mask_px"]))
+
+for i in tqdm(range(0, len(clean_items_53), chunk_size), desc="5-3: encoding crops (raw)"):
+    chunk = clean_items_53[i : i + chunk_size]
+    out = encoder([c[2] for c in chunk], layers=[LAYER_IDX], debias=True)
+    chunk_patches = out.patches[:, 0]
+    grid_h, grid_w = chunk_patches.shape[1], chunk_patches.shape[2]
+    for (idx, scale, _, mask_px, bg_exclude_mask_px), patch_tokens in zip(chunk, chunk_patches):
+        inst = usable_instances_53[idx]
+        fg, bg = split_fg_bg_patches_raw(
+            patch_tokens,
+            mask_px,
+            grid_h,
+            grid_w,
+            f"5-3/{inst.part_type}/{inst.group}/img#{inst.image_number}/"
+            f"inst{inst.instance_id}/{scale}",
+            bg_exclude_mask_px=bg_exclude_mask_px,
+        )
+        fg_by_inst_scale_53[(idx, scale)] = fg.cpu()
+        bg_by_inst_scale_53[(idx, scale)] = bg.cpu()
+
+for i, inst in enumerate(usable_instances_53):
+    r_tokens, r_h, r_w = image_raw_encodings_53[(inst.part_type, inst.image_number)]
+    fg_patch_mask = pixel_mask_to_patch_mask(inst.mask, r_h, r_w, IMG_SIZE, MASK_PATCH_THRESHOLD)
+    fg_flat = torch.from_numpy(fg_patch_mask.reshape(-1)).to(r_tokens.device)
+    global_fg = r_tokens[fg_flat]
+    if global_fg.shape[0] == 0:
+        global_fg = r_tokens
+    fg_by_inst_scale_53[(i, "global")] = global_fg.cpu()
+
+    exclude_patch_mask = pixel_mask_to_patch_mask(
+        inst.bg_exclude_mask, r_h, r_w, IMG_SIZE, MASK_PATCH_THRESHOLD
+    )
+    exclude_flat = torch.from_numpy(exclude_patch_mask.reshape(-1)).to(r_tokens.device)
+    global_bg = r_tokens[~exclude_flat]
+    if global_bg.shape[0] == 0:
+        global_bg = r_tokens
+    bg_by_inst_scale_53[(i, "global")] = global_bg.cpu()
+
+instances_by_pg_53: dict[tuple[str, str], list[int]] = defaultdict(list)
+for i, inst in enumerate(usable_instances_53):
+    instances_by_pg_53[(inst.part_type, inst.group)].append(i)
+groups_by_pt_53: dict[str, list[str]] = defaultdict(list)
+for pt, g in instances_by_pg_53:
+    groups_by_pt_53[pt].append(g)
+log.info(
+    "5-3: built raw fg/bg banks for %d instances across %d (part_type, group) pairs",
+    len(usable_instances_53),
+    len(instances_by_pg_53),
+)
+
+# Sweep: for each fold x part_type x group, pool the fold's training instances into one
+# gallery, score with the same score_combo() every real combo uses. Restricted to this
+# file's own report-headline scale combo (global+mid — bg_zca's 0.848) rather than
+# re-sweeping all 3 SCALE_COMBOS: with pooled galleries already ~5x a single-image
+# gallery's size, sweeping every scale combo here would triple an already-expensive stage
+# for a question (which scale combo wins) this section isn't asking — see MAX_BANK_SIZE_TRANSFORM_53
+# below for the other half of keeping this section's cost bounded.
+HEADLINE_SCALE_COMBO_53 = "global+mid"
+fold_splits_53 = make_fold_role_splits(PART_TYPES_53, seed=SEED)
+iou_lookup_53 = new_iou_lookup()
+n_pooled_samples_53 = 0
+
+n_units_53 = N_FOLDS_53 * len(PART_TYPES_53)
+with tqdm(total=n_units_53, desc="5-3: cross-validated fit + score") as pbar:
+    for fold_idx, split in enumerate(fold_splits_53):
+        for part_type in PART_TYPES_53:
+            train_numbers, eval_numbers = split[part_type]
+            for group in groups_by_pt_53.get(part_type, []):
+                idxs = instances_by_pg_53[(part_type, group)]
+                pool_idxs = [
+                    i for i in idxs if usable_instances_53[i].image_number in train_numbers
+                ]
+                if not pool_idxs:
+                    continue
+                bg_raw_53 = cap_bank_size(
+                    torch.cat(
+                        [
+                            bg_by_inst_scale_53[(i, s)]
+                            for i in pool_idxs
+                            for s in (*SCALES, "global")
+                        ],
+                        dim=0,
+                    ),
+                    MAX_BANK_SIZE_TRANSFORM_53,
+                    SEED,
+                )
+                fg_raw_53 = cap_bank_size(
+                    torch.cat(
+                        [
+                            fg_by_inst_scale_53[(i, s)]
+                            for i in pool_idxs
+                            for s in SCALE_COMBOS[HEADLINE_SCALE_COMBO_53]
+                        ],
+                        dim=0,
+                    ),
+                    MAX_BANK_SIZE_TRANSFORM_53,
+                    SEED,
+                )
+                if fg_raw_53.shape[0] == 0 or bg_raw_53.shape[0] == 0:
+                    continue
+                for eval_number in eval_numbers:
+                    key = (part_type, group, eval_number)
+                    if key not in gt_patch_masks_53:
+                        continue
+                    q_raw, q_h, q_w = image_raw_encodings_53[(part_type, eval_number)]
+                    gt = gt_patch_masks_53[key]
+                    pseudo_ck = (f"fold{fold_idx}", part_type, group, eval_number)
+                    score_combo(
+                        pseudo_ck,
+                        fg_raw_53.to(q_raw.device),
+                        bg_raw_53.to(q_raw.device),
+                        q_raw,
+                        q_h,
+                        q_w,
+                        gt,
+                        iou_lookup_53,
+                    )
+                    n_pooled_samples_53 += 1
+            pbar.update(1)
+
+log.info("5-3: scoring complete, %d pooled-gallery samples scored", n_pooled_samples_53)
+
+# Headline comparison: 1-1 (existing combos) vs 5-3 (pooled), per pipeline/method, at
+# HEADLINE_SCALE_COMBO_53.
+comparison_53_rows = []
+for pipeline in PIPELINES:
+    for method in METHODS_BY_PIPELINE[pipeline]:
+        param_11 = best_param(iou_lookup_by_combo[HEADLINE_SCALE_COMBO_53], pipeline, method)
+        mean_11, std_11, n_11 = mean_std_iou(
+            iou_lookup_by_combo[HEADLINE_SCALE_COMBO_53], pipeline, param_11, method
+        )
+        param_53 = best_param(iou_lookup_53, pipeline, method)
+        mean_53, std_53, n_53 = mean_std_iou(iou_lookup_53, pipeline, param_53, method)
+        delta = mean_53 - mean_11 if not (np.isnan(mean_11) or np.isnan(mean_53)) else float("nan")
+        comparison_53_rows.append(
+            {
+                "pipeline": pipeline,
+                "method": method,
+                "iou_1_1": mean_11,
+                "std_1_1": std_11,
+                "n_1_1": n_11,
+                "param_1_1": param_11,
+                "iou_5_3": mean_53,
+                "std_5_3": std_53,
+                "n_5_3": n_53,
+                "param_5_3": param_53,
+                "delta": delta,
+            }
+        )
+comparison_53_df = pd.DataFrame(comparison_53_rows)
+_comparison_53_csv = OUTPUT_DIR / f"comparison_1_1_vs_5_3__{HEADLINE_SCALE_COMBO_53}.csv"
+comparison_53_df.to_csv(_comparison_53_csv, index=False)
+log.info("1-1 vs 5-3 comparison (fg scales=%s):", HEADLINE_SCALE_COMBO_53)
+for _, row in comparison_53_df.iterrows():
+    log.info(
+        "  %-16s %-14s 1-1=%.3f+/-%.3f (n=%d)  5-3=%.3f+/-%.3f (n=%d)  delta=%+.3f",
+        row.pipeline,
+        row.method,
+        row.iou_1_1,
+        row.std_1_1,
+        row.n_1_1,
+        row.iou_5_3,
+        row.std_5_3,
+        row.n_5_3,
+        row.delta,
+    )
+
+fig, ax = plt.subplots(figsize=(14, 6))
+x = np.arange(len(comparison_53_df))
+width = 0.35
+ax.bar(
+    x - width / 2,
+    comparison_53_df["iou_1_1"],
+    width,
+    yerr=comparison_53_df["std_1_1"],
+    capsize=3,
+    label="1-1 (existing)",
+    color="#7f8c8d",
+)
+ax.bar(
+    x + width / 2,
+    comparison_53_df["iou_5_3"],
+    width,
+    yerr=comparison_53_df["std_5_3"],
+    capsize=3,
+    label="5-3 (pooled, 2-fold CV)",
+    color="#2ecc71",
+)
+ax.set_xticks(
+    x,
+    [f"{p}\n({m})" for p, m in zip(comparison_53_df["pipeline"], comparison_53_df["method"])],
+    rotation=30,
+    ha="right",
+    fontsize=8,
+)
+ax.set_ylabel("oracle IoU (mean +/- std)")
+ax.set_title(f"1-1 vs. 5-3 pooled gallery, fg scales={HEADLINE_SCALE_COMBO_53}")
+ax.set_ylim(0, 1.0)
+ax.legend(fontsize=9)
+ax.grid(alpha=0.3, axis="y")
+fig.tight_layout()
+_comparison_53_png = OUTPUT_DIR / f"comparison_1_1_vs_5_3__{HEADLINE_SCALE_COMBO_53}.png"
+fig.savefig(_comparison_53_png, dpi=150, bbox_inches="tight")
+plt.close(fig)
+log.info("Saved %s and %s", _comparison_53_csv, _comparison_53_png)
 
 # %% [markdown]
 # ## Reading the results

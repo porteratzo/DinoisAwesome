@@ -358,7 +358,9 @@ q_img = qr["image"]
 q_w, q_h = q_img.size
 
 match_map = {m["label"]: m["point"] for m in qr["matches"]}
-valid_kps = [kp for n, kp in enumerate(KEYPOINTS) if kp["label"] in match_map and n not in discard_points]
+valid_kps = [
+    kp for n, kp in enumerate(KEYPOINTS) if kp["label"] in match_map and n not in discard_points
+]
 src_pts = np.array([[kp["x"], kp["y"]] for kp in valid_kps], dtype=np.float32)
 dst_pts = np.array([match_map[kp["label"]] for kp in valid_kps], dtype=np.float32)
 valid_labels = [kp["label"] for kp in valid_kps]
@@ -368,7 +370,7 @@ if len(src_pts) < 4:
     H_mat, inlier_mask = None, None
 else:
     H_mat, inlier_mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, ransacReprojThreshold=2.0)
-    M = cv2.getAffineTransform(src_pts[[0,2,4]], dst_pts[[0,2,4]])
+    M = cv2.getAffineTransform(src_pts[[0, 2, 4]], dst_pts[[0, 2, 4]])
     n_inliers = int(inlier_mask.sum()) if inlier_mask is not None else 0
     log.info(
         "Query: %r | correspondences=%d | RANSAC inliers=%d",
@@ -378,7 +380,7 @@ else:
     )
     log.info("Homography matrix:\n%s", np.array2string(H_mat, precision=4, suppress_small=True))
     log.info("Affine matrix:\n%s", np.array2string(M, precision=4, suppress_small=True))
-#%%
+# %%
 ref_np = np.array(ref_img)
 q_np = np.array(q_img)
 canvas_w = orig_w + q_w

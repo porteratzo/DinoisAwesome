@@ -7,7 +7,7 @@
 # midpoint between `close` (t=1) and `global` (t=0). This experiment generalizes that fixed
 # 3-point sweep into `N_SCALE_STEPS + 1` evenly-spaced crop scales (t = 0, 1/n, 2/n, ..., 1 —
 # same linear interpolation `scale_crop_similarity.py` already uses for its single-instance case
-# study, applied here across the whole abc3 dataset for real fg/bg IoU) and asks two questions:
+# study, applied here across the whole abc5 dataset for real fg/bg IoU) and asks two questions:
 #
 #   1. **Per-scale**: how does oracle IoU (best patch-mask IoU any single threshold on the raw
 #      score map achieves against GT, `_shared.thresholding.oracle_iou`) for `single_proto` and
@@ -63,12 +63,20 @@ from PIL import Image
 from tqdm import tqdm
 
 from dinoisawesome import DinoEncoder, EncoderWithCache, compute_exemplar_features, load_annotations
-from dinoisawesome.abc3 import INSTANCE_TYPE_GROUPS, PART_TYPES, available_instance_groups
+from dinoisawesome.abc3 import INSTANCE_TYPE_GROUPS, available_instance_groups
 from dinoisawesome.instance_detection import extract_patch_tokens
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from _shared.abc3_combos import combo_key  # noqa: E402
+from _shared.dataset_pairs import REF_QUERY_PAIRS, RefQueryPair  # noqa: E402
 from _shared.mask_geometry import pixel_mask_to_patch_mask, scale_crop_box  # noqa: E402
+from _shared.pooled_gallery_cv import (  # noqa: E402
+    MAX_BANK_SIZE_KNN_53,
+    N_FOLDS_53,
+    cap_bank_size,
+    discover_all_instances,
+    make_fold_role_splits,
+)
 from _shared.prototype_ops import knn_score_heatmap, score_heatmap  # noqa: E402
 from _shared.thresholding import oracle_iou  # noqa: E402
 
@@ -76,23 +84,21 @@ from _shared.thresholding import oracle_iou  # noqa: E402
 _REPO_ROOT = Path(__file__).parent.parent.parent
 load_dotenv(_REPO_ROOT / ".env")
 
-data_dir = _REPO_ROOT / "data" / "abc3"
+DATA_ROOT = _REPO_ROOT / "data"
 
-REF_NUMBER = 1
-QUERY_NUMBER = 2
-
-# Same knob as the sibling fundamental scripts — narrow for fast iteration, e.g. ["LHa"].
-RUN_PART_TYPES: list[str] = PART_TYPES
+# abc5 has four ref/query pairs per part type — (1,2)/(3,4)/(5,6)/(7,8) (see
+# _shared/dataset_pairs.py) — narrow for fast iteration, e.g. REF_QUERY_PAIRS[:1].
+RUN_PAIRS: list[RefQueryPair] = REF_QUERY_PAIRS
 
 # Same focus combo as the sibling fundamental scripts, for direct comparability of figures.
-FOCUS_PART_TYPE = "LHa"
+FOCUS_UNIT = "LHa_1-2"
 FOCUS_CLASS = "donut foam single"
 FOCUS_INSTANCE_ID = 1
 
 DINO_VERSION = "v3"
-DINO_SIZE = "large"
+DINO_SIZE = "base"
 IMG_SIZE = 768
-LAYER_IDX = 23
+LAYER_IDX = 11  # last block of ViT-B/16 (depth 12)
 DINO_WEIGHTS_DIR: str | None = os.environ.get("DINO_WEIGHTS_DIR")
 DINO_ENCODING_CACHE_DIR: str | None = os.environ.get("DINO_ENCODING_CACHE_DIR")
 
@@ -113,15 +119,13 @@ METHOD_COLOR: dict[str, str] = {"single_proto": "#7f8c8d", "knn_fgbg": "#2ecc71"
 SEED = 0
 torch.manual_seed(SEED)
 
-OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental" / "scale_composition_oracle_iou"
+OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental_abc5" / "scale_composition_oracle_iou"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 log.info(
-    "RUN_PART_TYPES=%s ref_number=%d query_number=%d  |  DINO%s-%s img_size=%d layer=%d  |  "
-    "n_scale_steps=%d",
-    RUN_PART_TYPES,
-    REF_NUMBER,
-    QUERY_NUMBER,
+    "RUN_PAIRS=%d units (%s)  |  DINO%s-%s img_size=%d layer=%d  |  n_scale_steps=%d",
+    len(RUN_PAIRS),
+    [p.unit for p in RUN_PAIRS],
     DINO_VERSION,
     DINO_SIZE,
     IMG_SIZE,
@@ -267,40 +271,44 @@ group_ref_masks: dict[tuple[str, str], np.ndarray] = {}
 ref_images: dict[str, Image.Image] = {}
 query_images: dict[str, Image.Image] = {}
 
-for part_type in tqdm(RUN_PART_TYPES, desc="Discovering combos"):
-    ref_stem = f"{part_type}_{REF_NUMBER}"
-    query_stem = f"{part_type}_{QUERY_NUMBER}"
-    ref_ann_path = data_dir / "annotations" / ref_stem
-    query_ann_path = data_dir / "annotations" / query_stem
+for pair in tqdm(RUN_PAIRS, desc="Discovering combos"):
+    unit = pair.unit
+    pair_data_dir = DATA_ROOT / pair.dataset
+    ref_stem = f"{pair.part_type}_{pair.ref}"
+    query_stem = f"{pair.part_type}_{pair.query}"
+    ref_ann_path = pair_data_dir / "annotations" / ref_stem
+    query_ann_path = pair_data_dir / "annotations" / query_stem
 
     groups = available_instance_groups(ref_ann_path)
     if not groups:
-        log.warning("part_type=%s: no instance-type groups annotated — skipping", part_type)
+        log.warning("unit=%s: no instance-type groups annotated — skipping", unit)
         continue
 
     ref_anns = load_annotations(ref_ann_path)
     query_anns = load_annotations(query_ann_path)
-    ref_images[part_type] = Image.open(data_dir / f"{ref_stem}.jpg").convert("RGB")
-    query_images[part_type] = Image.open(data_dir / f"{query_stem}.jpg").convert("RGB")
+    ref_images[unit] = Image.open(pair_data_dir / f"{ref_stem}.jpg").convert("RGB")
+    query_images[unit] = Image.open(pair_data_dir / f"{query_stem}.jpg").convert("RGB")
 
     for group in groups:
         classes = INSTANCE_TYPE_GROUPS[group]
         ref_group_anns = [a for a in ref_anns if a["class"] in classes]
         query_group_anns = [a for a in query_anns if a["class"] in classes]
         if not query_group_anns:
-            log.warning("part_type=%s group=%s: no query GT instances — skipping", part_type, group)
+            log.warning("unit=%s group=%s: no query GT instances — skipping", unit, group)
             continue
-        group_query_masks[(part_type, group)] = np.stack([a["mask"] for a in query_group_anns]).any(
+        group_query_masks[(unit, group)] = np.stack([a["mask"] for a in query_group_anns]).any(
             axis=0
         )
         if ref_group_anns:
-            group_ref_masks[(part_type, group)] = np.stack([a["mask"] for a in ref_group_anns]).any(
+            group_ref_masks[(unit, group)] = np.stack([a["mask"] for a in ref_group_anns]).any(
                 axis=0
             )
         for ref_ann in ref_group_anns:
             combos.append(
                 {
-                    "part_type": part_type,
+                    "unit": unit,
+                    "dataset": pair.dataset,
+                    "part_type": pair.part_type,
                     "group": group,
                     "class": ref_ann["class"],
                     "instance_id": ref_ann["instance_id"],
@@ -310,12 +318,13 @@ for part_type in tqdm(RUN_PART_TYPES, desc="Discovering combos"):
 
 if not combos:
     raise RuntimeError(
-        f"No combos discovered for RUN_PART_TYPES={RUN_PART_TYPES} — every part type was "
+        f"No combos discovered for RUN_PAIRS={[p.unit for p in RUN_PAIRS]} — every pair was "
         "skipped (no annotated instance-type groups or no query GT)."
     )
 log.info(
-    "Discovered %d (part_type, group, instance) combos across %d part types",
+    "Discovered %d (unit, group, instance) combos across %d units (%d part types)",
     len(combos),
+    len({c["unit"] for c in combos}),
     len({c["part_type"] for c in combos}),
 )
 
@@ -325,8 +334,8 @@ log.info(
 # is skipped entirely, no partial scale availability to special-case downstream.
 usable_combo_keys: set[tuple] = set()
 for combo in tqdm(combos, desc="Building scale-step crops"):
-    ref_img = ref_images[combo["part_type"]]
-    group_mask = group_ref_masks.get((combo["part_type"], combo["group"]), combo["ref_mask"])
+    ref_img = ref_images[combo["unit"]]
+    group_mask = group_ref_masks.get((combo["unit"], combo["group"]), combo["ref_mask"])
     boxes = scale_step_boxes(combo["ref_mask"], T_VALUES, CROP_PADDING_FRACTION)
     close_box = boxes[-1]
     if close_box[2] - close_box[0] < MIN_CROP_SIZE or close_box[3] - close_box[1] < MIN_CROP_SIZE:
@@ -364,16 +373,14 @@ encoder = EncoderWithCache(encoder, cache_dir=DINO_ENCODING_CACHE_DIR)
 chunk_size = encoder.max_batch_size
 
 query_encodings: dict[str, tuple[torch.Tensor, int, int]] = {}
-for part_type in tqdm(sorted(query_images), desc="Encoding query images"):
-    tokens, q_h, q_w = extract_patch_tokens(
-        encoder, query_images[part_type], LAYER_IDX, debias=True
-    )
-    query_encodings[part_type] = (tokens, q_h, q_w)
+for unit in tqdm(sorted(query_images), desc="Encoding query images"):
+    tokens, q_h, q_w = extract_patch_tokens(encoder, query_images[unit], LAYER_IDX, debias=True)
+    query_encodings[unit] = (tokens, q_h, q_w)
 
 gt_patch_masks: dict[tuple[str, str], np.ndarray] = {}
-for (part_type, group), pixel_mask in group_query_masks.items():
-    _, q_h, q_w = query_encodings[part_type]
-    gt_patch_masks[(part_type, group)] = pixel_mask_to_patch_mask(
+for (unit, group), pixel_mask in group_query_masks.items():
+    _, q_h, q_w = query_encodings[unit]
+    gt_patch_masks[(unit, group)] = pixel_mask_to_patch_mask(
         pixel_mask, q_h, q_w, IMG_SIZE, MASK_PATCH_THRESHOLD
     )
 
@@ -403,8 +410,11 @@ for i in tqdm(range(0, len(clean_items), chunk_size), desc="Encoding scale-step 
             f"{ck} scale={name}",
             bg_exclude_mask_px=bg_exclude_mask_px,
         )
-        fg_by_scale[(ck, name)] = fg
-        bg_by_scale[(ck, name)] = bg
+        # Kept on CPU: with REF_QUERY_PAIRS spanning 16 ref/query pairs, every combo's every-scale
+        # fg/bg bank held on GPU simultaneously no longer fits (abc3-only fit in ~12GB, the
+        # combined pool doesn't) — moved back to the query's device per combo in Part 5/9 instead.
+        fg_by_scale[(ck, name)] = fg.cpu()
+        bg_by_scale[(ck, name)] = bg.cpu()
 
 # Background is scale-composition-invariant: every combo's every composition, single-scale or
 # multi-scale, is scored against the SAME pooled bg gallery spanning every scale step (mirrors
@@ -423,15 +433,17 @@ for combo in tqdm(combos, desc="Part 5: scoring compositions"):
     ck = combo_key(combo)
     if ck not in usable_combo_keys:
         continue
-    part_type, group = ck[0], ck[1]
-    gt = gt_patch_masks.get((part_type, group))
+    unit, group = ck[0], ck[1]
+    gt = gt_patch_masks.get((unit, group))
     if gt is None:
         continue
-    q_tokens, q_h, q_w = query_encodings[part_type]
-    bg_bank = bg_all_lookup[ck]
+    q_tokens, q_h, q_w = query_encodings[unit]
+    bg_bank = bg_all_lookup[ck].to(q_tokens.device)
 
     for composition_name, members in COMPOSITION_COMBOS.items():
-        fg_bank = torch.cat([fg_by_scale[(ck, name)] for name in members], dim=0)
+        fg_bank = torch.cat([fg_by_scale[(ck, name)] for name in members], dim=0).to(
+            q_tokens.device
+        )
 
         proto = compute_exemplar_features(fg_bank, mode="mean")
         raw_proto = score_heatmap(q_tokens, proto, q_h, q_w)
@@ -681,7 +693,7 @@ focus_combo = next(
     (
         c
         for c in combos
-        if c["part_type"] == FOCUS_PART_TYPE
+        if c["unit"] == FOCUS_UNIT
         and c["class"] == FOCUS_CLASS
         and c["instance_id"] == FOCUS_INSTANCE_ID
     ),
@@ -691,12 +703,12 @@ focus_ck = combo_key(focus_combo)
 if focus_ck not in usable_combo_keys:
     log.warning("Focus combo %s has no usable scale steps — skipping qualitative figure", focus_ck)
 else:
-    focus_part_type, focus_group = focus_ck[0], focus_ck[1]
-    focus_gt = gt_patch_masks[(focus_part_type, focus_group)]
-    focus_q_tokens, focus_q_h, focus_q_w = query_encodings[focus_part_type]
-    focus_bg = bg_all_lookup[focus_ck]
+    focus_unit, focus_group = focus_ck[0], focus_ck[1]
+    focus_gt = gt_patch_masks[(focus_unit, focus_group)]
+    focus_q_tokens, focus_q_h, focus_q_w = query_encodings[focus_unit]
+    focus_bg = bg_all_lookup[focus_ck].to(focus_q_tokens.device)
 
-    query_img = query_images[focus_part_type]
+    query_img = query_images[focus_unit]
     n_panels = 1 + 2 * len(SCALE_NAMES)
     n_cols = len(SCALE_NAMES)
     fig, axes = plt.subplots(3, n_cols, figsize=(2.6 * n_cols, 8.4))
@@ -713,7 +725,7 @@ else:
         axes[0, col].set_yticks([])
 
     for col, name in enumerate(SCALE_NAMES):
-        fg_bank = fg_by_scale[(focus_ck, name)]
+        fg_bank = fg_by_scale[(focus_ck, name)].to(focus_q_tokens.device)
         proto = compute_exemplar_features(fg_bank, mode="mean")
         raw_proto = score_heatmap(focus_q_tokens, proto, focus_q_h, focus_q_w)
         axes[1, col].imshow(raw_proto, cmap="magma")
@@ -733,6 +745,192 @@ else:
     fig.savefig(_focus_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     log.info("Saved qualitative focus-combo grid to %s", _focus_path)
+
+# %% Part 10 — 5-3 pooled gallery, cross-validated: does "both methods peak mid-sweep, not
+# at either extreme" (Part 6's finding) hold when the gallery is pooled from 5 training
+# images instead of one? Reuses `split_fg_bg_patches`/`score_heatmap`/`knn_score_heatmap`/
+# `oracle_iou` unchanged — only discovery, per-instance crop-building, and fold/role
+# assignment are new (see `_shared/pooled_gallery_cv.py`). Scoped to the classic 3-point
+# global/mid/close (not the full N_SCALE_STEPS=6 fine sweep) — every sibling script in the
+# suite already uses this as its own baseline, and re-sweeping all 7 points here for a
+# pooled gallery would multiply this section's cost for resolution the headline finding
+# ("peaks mid-sweep, not at either extreme") doesn't need.
+PART_TYPES_53 = sorted({c["part_type"] for c in combos})
+discovery_53 = discover_all_instances(DATA_ROOT, "abc5", PART_TYPES_53)
+POOL_SCALES_53 = ["global", "mid", "close"]
+
+usable_instances_53: list[dict] = []
+for inst in tqdm(discovery_53.instances, desc="5-3: building global/mid/close crops"):
+    img = discovery_53.images[(inst.part_type, inst.image_number)]
+    close_box = scale_crop_box(inst.mask, "close", CROP_PADDING_FRACTION)
+    if close_box[2] - close_box[0] < MIN_CROP_SIZE or close_box[3] - close_box[1] < MIN_CROP_SIZE:
+        continue
+    crops: dict = {}
+    for scale in POOL_SCALES_53:
+        x0, y0, x1, y1 = scale_crop_box(inst.mask, scale, CROP_PADDING_FRACTION)
+        crops[scale] = {
+            "img": img.crop((x0, y0, x1, y1)),
+            "mask_px": inst.mask[y0:y1, x0:x1],
+            "bg_exclude_mask_px": inst.bg_exclude_mask[y0:y1, x0:x1],
+        }
+    usable_instances_53.append(
+        {
+            "part_type": inst.part_type,
+            "group": inst.group,
+            "image_number": inst.image_number,
+            "crops": crops,
+        }
+    )
+log.info("5-3: usable instances %d/%d", len(usable_instances_53), len(discovery_53.instances))
+
+image_encodings_53: dict[tuple[str, int], dict] = {}
+for key in tqdm(sorted(discovery_53.images), desc="5-3: encoding images"):
+    tokens, h, w = extract_patch_tokens(encoder, discovery_53.images[key], LAYER_IDX, debias=True)
+    image_encodings_53[key] = {"tokens": tokens, "h": h, "w": w}
+
+gt_patch_masks_53: dict[tuple[str, str, int], np.ndarray] = {}
+for (part_type, group, n), pixel_mask in discovery_53.gt_masks.items():
+    q = image_encodings_53[(part_type, n)]
+    gt_patch_masks_53[(part_type, group, n)] = pixel_mask_to_patch_mask(
+        pixel_mask, q["h"], q["w"], IMG_SIZE, MASK_PATCH_THRESHOLD
+    )
+
+fg_by_inst_scale_53: dict[tuple[int, str], torch.Tensor] = {}
+bg_by_inst_scale_53: dict[tuple[int, str], torch.Tensor] = {}
+clean_items_53: list[tuple] = []
+for i, inst in enumerate(usable_instances_53):
+    for scale, crop in inst["crops"].items():
+        clean_items_53.append((i, scale, crop["img"], crop["mask_px"], crop["bg_exclude_mask_px"]))
+
+for i in tqdm(range(0, len(clean_items_53), chunk_size), desc="5-3: encoding crops"):
+    chunk = clean_items_53[i : i + chunk_size]
+    out = encoder([c[2] for c in chunk], layers=[LAYER_IDX], debias=True)
+    chunk_patches = out.patches[:, 0]
+    grid_h, grid_w = chunk_patches.shape[1], chunk_patches.shape[2]
+    for (idx, scale, _, mask_px, bg_exclude_mask_px), patch_tokens in zip(chunk, chunk_patches):
+        fg, bg = split_fg_bg_patches(
+            patch_tokens,
+            mask_px,
+            grid_h,
+            grid_w,
+            f"5-3 inst{idx} scale={scale}",
+            bg_exclude_mask_px=bg_exclude_mask_px,
+        )
+        fg_by_inst_scale_53[(idx, scale)] = fg.cpu()
+        bg_by_inst_scale_53[(idx, scale)] = bg.cpu()
+
+instances_by_pg_53: dict[tuple[str, str], list[int]] = defaultdict(list)
+for i, inst in enumerate(usable_instances_53):
+    instances_by_pg_53[(inst["part_type"], inst["group"])].append(i)
+groups_by_pt_53: dict[str, list[str]] = defaultdict(list)
+for pt, g in instances_by_pg_53:
+    groups_by_pt_53[pt].append(g)
+log.info(
+    "5-3: built per-scale fg/bg banks for %d instances across %d (part_type, group) pairs",
+    len(usable_instances_53),
+    len(instances_by_pg_53),
+)
+
+# Sweep: for each fold x part_type x group x scale, pool the fold's training instances' fg at
+# that one scale (bg always pooled across every POOL_SCALES_53 entry, matching this file's
+# own "bg is scale-composition-invariant" convention), score against every eval image.
+fold_splits_53 = make_fold_role_splits(PART_TYPES_53, seed=SEED)
+results_53: list[dict] = []
+n_units_53 = N_FOLDS_53 * len(PART_TYPES_53)
+
+with tqdm(total=n_units_53, desc="5-3: cross-validated fit + score") as pbar:
+    for fold_idx, split in enumerate(fold_splits_53):
+        for part_type in PART_TYPES_53:
+            train_numbers, eval_numbers = split[part_type]
+            for group in groups_by_pt_53.get(part_type, []):
+                idxs = instances_by_pg_53[(part_type, group)]
+                pool_idxs = [
+                    i for i in idxs if usable_instances_53[i]["image_number"] in train_numbers
+                ]
+                if not pool_idxs:
+                    continue
+                bg_bank = cap_bank_size(
+                    torch.cat(
+                        [bg_by_inst_scale_53[(i, s)] for i in pool_idxs for s in POOL_SCALES_53],
+                        dim=0,
+                    ),
+                    MAX_BANK_SIZE_KNN_53,
+                    SEED,
+                )
+                if bg_bank.shape[0] == 0:
+                    continue
+                for eval_number in eval_numbers:
+                    key = (part_type, group, eval_number)
+                    if key not in gt_patch_masks_53:
+                        continue
+                    q = image_encodings_53[(part_type, eval_number)]
+                    gt = gt_patch_masks_53[key]
+                    bg_dev = bg_bank.to(q["tokens"].device)
+                    for scale in POOL_SCALES_53:
+                        fg_bank = cap_bank_size(
+                            torch.cat([fg_by_inst_scale_53[(i, scale)] for i in pool_idxs], dim=0),
+                            MAX_BANK_SIZE_KNN_53,
+                            SEED,
+                        ).to(q["tokens"].device)
+                        if fg_bank.shape[0] == 0:
+                            continue
+                        proto = compute_exemplar_features(fg_bank, mode="mean")
+                        raw_proto = score_heatmap(q["tokens"], proto, q["h"], q["w"])
+                        results_53.append(
+                            {
+                                "scale": scale,
+                                "method": "single_proto",
+                                "oracle_iou": oracle_iou(raw_proto, gt, ORACLE_THRESHOLD_STEPS),
+                            }
+                        )
+                        raw_knn = knn_score_heatmap(
+                            q["tokens"], fg_bank, bg_dev, KNN_FGBG_NUM_NEIGHBOURS, q["h"], q["w"]
+                        )
+                        results_53.append(
+                            {
+                                "scale": scale,
+                                "method": "knn_fgbg",
+                                "oracle_iou": oracle_iou(raw_knn, gt, ORACLE_THRESHOLD_STEPS),
+                            }
+                        )
+            pbar.update(1)
+
+results_53_df = pd.DataFrame(results_53)
+summary_53_rows = []
+for scale in POOL_SCALES_53:
+    for method in METHODS:
+        vals = results_53_df.loc[
+            (results_53_df.scale == scale) & (results_53_df.method == method), "oracle_iou"
+        ]
+        row_11 = per_scale_df[(per_scale_df.scale == scale) & (per_scale_df.method == method)].iloc[
+            0
+        ]
+        summary_53_rows.append(
+            {
+                "scale": scale,
+                "method": method,
+                "mean_iou_1_1": row_11.mean_iou,
+                "std_iou_1_1": row_11.std_iou,
+                "mean_iou_5_3": float(vals.mean()) if len(vals) else float("nan"),
+                "std_iou_5_3": float(vals.std()) if len(vals) else float("nan"),
+                "n_samples_5_3": len(vals),
+            }
+        )
+summary_53_df = pd.DataFrame(summary_53_rows)
+summary_53_df.to_csv(OUTPUT_DIR / "comparison_1_1_vs_5_3.csv", index=False)
+log.info("1-1 vs 5-3 comparison (global/mid/close):")
+for _, row in summary_53_df.iterrows():
+    log.info(
+        "  scale=%-6s %-13s 1-1=%.3f+/-%.3f  5-3=%.3f+/-%.3f (n=%d)",
+        row.scale,
+        row.method,
+        row.mean_iou_1_1,
+        row.std_iou_1_1,
+        row.mean_iou_5_3,
+        row.std_iou_5_3,
+        row.n_samples_5_3,
+    )
+log.info("Wrote %s", OUTPUT_DIR / "comparison_1_1_vs_5_3.csv")
 
 # %% [markdown]
 # ## Reading the results

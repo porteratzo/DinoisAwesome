@@ -165,6 +165,13 @@ class ClusterCrop:
     # already positive "keep this patch" masks — callers never invert bg_select_mask.
     fg_select_mask: np.ndarray | None = None
     bg_select_mask: np.ndarray | None = None
+    # RAW (pre-L2-normalise) patch tokens for this crop — None unless build_all_scale_
+    # prototypes was called with keep_raw=True. Needed by feature-space transforms (e.g. ZCA
+    # whitening) fit from a covariance that a plain L2-normalise would already have destroyed
+    # (see _shared/feature_transforms.py) — kept as a separate opt-in field rather than always
+    # populated, since it doubles this crop's token memory footprint for callers that never
+    # use it.
+    raw_tokens: torch.Tensor | None = None
 
 
 @dataclass
@@ -189,6 +196,10 @@ class ScalePrototype:
     # > 0; only ever populated for "mid"/"close" — "global" has no well-defined "elsewhere" to
     # sample from.
     extra_bg_crops: list[ExtraBgCrop] | None = None
+    # Same opt-in raw-token mirror as ClusterCrop.raw_tokens, for this scale's own
+    # representative crop (the global crop for "global"; the representative cluster's crop
+    # for "mid"/"close" — see build_all_scale_prototypes). None unless keep_raw=True.
+    raw_tokens: torch.Tensor | None = None
 
 
 def _sample_bg_enrichment(
@@ -237,6 +248,7 @@ def build_all_scale_prototypes(
     ref_img: Image.Image,
     instance_masks: list[np.ndarray],
     crop_cfg: CropConfig,
+    keep_raw: bool = False,
 ) -> tuple[dict[str, ScalePrototype], torch.Tensor]:
     """Build one exemplar prototype per scale (mean-collapsed) plus every cluster's own
     tokens/masks, encoding all kept crops in one batch.
@@ -246,6 +258,11 @@ def build_all_scale_prototypes(
     ``cluster_crops``' raw tokens straight off the returned :class:`ScalePrototype` and
     re-aggregate themselves (see ``methods.py``), so this function only needs to run once
     per (image, crop_cfg) regardless of which methods are being compared.
+
+    *keep_raw* (default False, fully backward compatible) additionally populates every
+    :class:`ClusterCrop`/:class:`ScalePrototype`'s ``raw_tokens`` — see those fields' own
+    docstrings for why a feature-space transform needs them instead of the normal
+    L2-normalised ``tokens``.
     """
     union_mask = np.stack(instance_masks).any(axis=0)
     H, W = union_mask.shape
@@ -290,12 +307,21 @@ def build_all_scale_prototypes(
             )
 
     tokens_batch = extract_patch_tokens_batch_with_cls(
-        encoder, [p["crop_img"] for p in pending], crop_cfg.layer_idx, crop_cfg.debias
+        encoder,
+        [p["crop_img"] for p in pending],
+        crop_cfg.layer_idx,
+        crop_cfg.debias,
+        return_raw=keep_raw,
     )
 
     global_crop: ClusterCrop | None = None
     clusters_by_scale: dict[str, list[ClusterCrop]] = {"mid": [], "close": []}
-    for entry, (tokens, cls, grid_h, grid_w) in zip(pending, tokens_batch):
+    for entry, token_result in zip(pending, tokens_batch):
+        if keep_raw:
+            tokens, cls, grid_h, grid_w, raw_tokens = token_result
+        else:
+            tokens, cls, grid_h, grid_w = token_result
+            raw_tokens = None
         # own_frac/excl_frac (continuous, pre-threshold) feed cleaning.py's "step1" spatial
         # filter; patch_mask/exclude_patch_mask (the single crop_cfg.mask_patch_threshold cut)
         # keep their original meaning everywhere else (GT extent, visualisation).
@@ -316,6 +342,7 @@ def build_all_scale_prototypes(
             excl_frac=excl_frac,
             own_mask_px=entry["mask_crop"],
             cls=cls,
+            raw_tokens=raw_tokens,
         )
         if entry["scale"] == "global":
             global_crop = cc
@@ -343,6 +370,7 @@ def build_all_scale_prototypes(
         _masked_mean(global_crop, want_fg=True),
         _masked_mean(global_crop, want_fg=False),
         cluster_crops=None,
+        raw_tokens=global_crop.raw_tokens,
     )
 
     extra_bg_by_scale = _sample_bg_enrichment(
@@ -390,6 +418,7 @@ def build_all_scale_prototypes(
             cluster_crops=clusters,
             target_size_frac=target_size_frac,
             extra_bg_crops=extras or None,
+            raw_tokens=rep.raw_tokens,
         )
 
     all_instance_protos = clusters_by_scale["mid"] + clusters_by_scale["close"]

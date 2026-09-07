@@ -44,11 +44,12 @@ from scipy.stats import pearsonr, spearmanr
 from tqdm import tqdm
 
 from dinoisawesome import DinoEncoder, EncoderWithCache, compute_exemplar_features, load_annotations
-from dinoisawesome.abc3 import INSTANCE_TYPE_GROUPS, PART_TYPES, available_instance_groups
+from dinoisawesome.abc3 import INSTANCE_TYPE_GROUPS, available_instance_groups
 from dinoisawesome.instance_detection import extract_patch_tokens
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from _shared.abc3_combos import combo_key  # noqa: E402
+from _shared.dataset_pairs import REF_QUERY_PAIRS, RefQueryPair  # noqa: E402
 from _shared.mask_geometry import pixel_mask_to_patch_mask, scale_crop_box  # noqa: E402
 from _shared.prototype_ops import knn_score_heatmap, score_heatmap  # noqa: E402
 from _shared.thresholding import oracle_iou  # noqa: E402
@@ -57,17 +58,16 @@ from _shared.thresholding import oracle_iou  # noqa: E402
 _REPO_ROOT = Path(__file__).parent.parent.parent
 load_dotenv(_REPO_ROOT / ".env")
 
-data_dir = _REPO_ROOT / "data" / "abc3"
+DATA_ROOT = _REPO_ROOT / "data"
 
-REF_NUMBER = 1
-QUERY_NUMBER = 2
-
-RUN_PART_TYPES: list[str] = PART_TYPES
+# abc5 has four ref/query pairs per part type — (1,2)/(3,4)/(5,6)/(7,8) (see
+# _shared/dataset_pairs.py) — narrow for fast iteration, e.g. REF_QUERY_PAIRS[:1].
+RUN_PAIRS: list[RefQueryPair] = REF_QUERY_PAIRS
 
 DINO_VERSION = "v3"
-DINO_SIZE = "large"
+DINO_SIZE = "base"
 IMG_SIZE = 768
-LAYER_IDX = 23
+LAYER_IDX = 11  # last block of ViT-B/16 (depth 12)
 DINO_WEIGHTS_DIR: str | None = os.environ.get("DINO_WEIGHTS_DIR")
 DINO_ENCODING_CACHE_DIR: str | None = os.environ.get("DINO_ENCODING_CACHE_DIR")
 
@@ -86,15 +86,13 @@ METHOD_COLOR: dict[str, str] = {"single_proto": "#7f8c8d", "knn_fgbg": "#2ecc71"
 SEED = 0
 torch.manual_seed(SEED)
 
-OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental" / "scale_composition_adaptive_oracle"
+OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental_abc5" / "scale_composition_adaptive_oracle"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 log.info(
-    "RUN_PART_TYPES=%s ref_number=%d query_number=%d  |  DINO%s-%s img_size=%d layer=%d  |  "
-    "n_scale_steps=%d",
-    RUN_PART_TYPES,
-    REF_NUMBER,
-    QUERY_NUMBER,
+    "RUN_PAIRS=%d units (%s)  |  DINO%s-%s img_size=%d layer=%d  |  n_scale_steps=%d",
+    len(RUN_PAIRS),
+    [p.unit for p in RUN_PAIRS],
     DINO_VERSION,
     DINO_SIZE,
     IMG_SIZE,
@@ -172,40 +170,44 @@ group_ref_masks: dict[tuple[str, str], np.ndarray] = {}
 ref_images: dict[str, Image.Image] = {}
 query_images: dict[str, Image.Image] = {}
 
-for part_type in tqdm(RUN_PART_TYPES, desc="Discovering combos"):
-    ref_stem = f"{part_type}_{REF_NUMBER}"
-    query_stem = f"{part_type}_{QUERY_NUMBER}"
-    ref_ann_path = data_dir / "annotations" / ref_stem
-    query_ann_path = data_dir / "annotations" / query_stem
+for pair in tqdm(RUN_PAIRS, desc="Discovering combos"):
+    unit = pair.unit
+    pair_data_dir = DATA_ROOT / pair.dataset
+    ref_stem = f"{pair.part_type}_{pair.ref}"
+    query_stem = f"{pair.part_type}_{pair.query}"
+    ref_ann_path = pair_data_dir / "annotations" / ref_stem
+    query_ann_path = pair_data_dir / "annotations" / query_stem
 
     groups = available_instance_groups(ref_ann_path)
     if not groups:
-        log.warning("part_type=%s: no instance-type groups annotated — skipping", part_type)
+        log.warning("unit=%s: no instance-type groups annotated — skipping", unit)
         continue
 
     ref_anns = load_annotations(ref_ann_path)
     query_anns = load_annotations(query_ann_path)
-    ref_images[part_type] = Image.open(data_dir / f"{ref_stem}.jpg").convert("RGB")
-    query_images[part_type] = Image.open(data_dir / f"{query_stem}.jpg").convert("RGB")
+    ref_images[unit] = Image.open(pair_data_dir / f"{ref_stem}.jpg").convert("RGB")
+    query_images[unit] = Image.open(pair_data_dir / f"{query_stem}.jpg").convert("RGB")
 
     for group in groups:
         classes = INSTANCE_TYPE_GROUPS[group]
         ref_group_anns = [a for a in ref_anns if a["class"] in classes]
         query_group_anns = [a for a in query_anns if a["class"] in classes]
         if not query_group_anns:
-            log.warning("part_type=%s group=%s: no query GT instances — skipping", part_type, group)
+            log.warning("unit=%s group=%s: no query GT instances — skipping", unit, group)
             continue
-        group_query_masks[(part_type, group)] = np.stack([a["mask"] for a in query_group_anns]).any(
+        group_query_masks[(unit, group)] = np.stack([a["mask"] for a in query_group_anns]).any(
             axis=0
         )
         if ref_group_anns:
-            group_ref_masks[(part_type, group)] = np.stack([a["mask"] for a in ref_group_anns]).any(
+            group_ref_masks[(unit, group)] = np.stack([a["mask"] for a in ref_group_anns]).any(
                 axis=0
             )
         for ref_ann in ref_group_anns:
             combos.append(
                 {
-                    "part_type": part_type,
+                    "unit": unit,
+                    "dataset": pair.dataset,
+                    "part_type": pair.part_type,
                     "group": group,
                     "class": ref_ann["class"],
                     "instance_id": ref_ann["instance_id"],
@@ -215,12 +217,13 @@ for part_type in tqdm(RUN_PART_TYPES, desc="Discovering combos"):
 
 if not combos:
     raise RuntimeError(
-        f"No combos discovered for RUN_PART_TYPES={RUN_PART_TYPES} — every part type was "
+        f"No combos discovered for RUN_PAIRS={[p.unit for p in RUN_PAIRS]} — every pair was "
         "skipped (no annotated instance-type groups or no query GT)."
     )
 log.info(
-    "Discovered %d (part_type, group, instance) combos across %d part types",
+    "Discovered %d (unit, group, instance) combos across %d units (%d part types)",
     len(combos),
+    len({c["unit"] for c in combos}),
     len({c["part_type"] for c in combos}),
 )
 
@@ -229,8 +232,8 @@ log.info(
 usable_combo_keys: set[tuple] = set()
 instance_size_fraction: dict[tuple, float] = {}
 for combo in tqdm(combos, desc="Building scale-step crops"):
-    ref_img = ref_images[combo["part_type"]]
-    group_mask = group_ref_masks.get((combo["part_type"], combo["group"]), combo["ref_mask"])
+    ref_img = ref_images[combo["unit"]]
+    group_mask = group_ref_masks.get((combo["unit"], combo["group"]), combo["ref_mask"])
     boxes = scale_step_boxes(combo["ref_mask"], T_VALUES, CROP_PADDING_FRACTION)
     close_box = boxes[-1]
     if close_box[2] - close_box[0] < MIN_CROP_SIZE or close_box[3] - close_box[1] < MIN_CROP_SIZE:
@@ -257,6 +260,9 @@ for combo in tqdm(combos, desc="Building scale-step crops"):
     instance_size_fraction[ck] = float(combo["ref_mask"].sum()) / float(H * W)
 
 log.info("Combos with every scale step usable: %d/%d", len(usable_combo_keys), len(combos))
+combo_by_key: dict[tuple, dict] = {
+    combo_key(c): c for c in combos if combo_key(c) in usable_combo_keys
+}
 
 # %% Part 3 — encoder + query-image patch tokens + GT patch masks
 encoder = DinoEncoder(
@@ -271,16 +277,14 @@ encoder = EncoderWithCache(encoder, cache_dir=DINO_ENCODING_CACHE_DIR)
 chunk_size = encoder.max_batch_size
 
 query_encodings: dict[str, tuple[torch.Tensor, int, int]] = {}
-for part_type in tqdm(sorted(query_images), desc="Encoding query images"):
-    tokens, q_h, q_w = extract_patch_tokens(
-        encoder, query_images[part_type], LAYER_IDX, debias=True
-    )
-    query_encodings[part_type] = (tokens, q_h, q_w)
+for unit in tqdm(sorted(query_images), desc="Encoding query images"):
+    tokens, q_h, q_w = extract_patch_tokens(encoder, query_images[unit], LAYER_IDX, debias=True)
+    query_encodings[unit] = (tokens, q_h, q_w)
 
 gt_patch_masks: dict[tuple[str, str], np.ndarray] = {}
-for (part_type, group), pixel_mask in group_query_masks.items():
-    _, q_h, q_w = query_encodings[part_type]
-    gt_patch_masks[(part_type, group)] = pixel_mask_to_patch_mask(
+for (unit, group), pixel_mask in group_query_masks.items():
+    _, q_h, q_w = query_encodings[unit]
+    gt_patch_masks[(unit, group)] = pixel_mask_to_patch_mask(
         pixel_mask, q_h, q_w, IMG_SIZE, MASK_PATCH_THRESHOLD
     )
 
@@ -310,8 +314,11 @@ for i in tqdm(range(0, len(clean_items), chunk_size), desc="Encoding scale-step 
             f"{ck} scale={name}",
             bg_exclude_mask_px=bg_exclude_mask_px,
         )
-        fg_by_scale[(ck, name)] = fg
-        bg_by_scale[(ck, name)] = bg
+        # Kept on CPU: with REF_QUERY_PAIRS spanning 16 ref/query pairs, every combo's every-scale
+        # fg/bg bank held on GPU simultaneously no longer fits (abc3-only fit in ~12GB, the
+        # combined pool doesn't) — moved back to the query's device per combo in Part 5.
+        fg_by_scale[(ck, name)] = fg.cpu()
+        bg_by_scale[(ck, name)] = bg.cpu()
 
 bg_all_lookup: dict[tuple, torch.Tensor] = {
     ck: torch.cat([bg_by_scale[(ck, name)] for name in SCALE_NAMES], dim=0)
@@ -331,15 +338,15 @@ for combo in tqdm(combos, desc="Part 5: scoring per scale"):
     ck = combo_key(combo)
     if ck not in usable_combo_keys:
         continue
-    part_type, group = ck[0], ck[1]
-    gt = gt_patch_masks.get((part_type, group))
+    unit, group = ck[0], ck[1]
+    gt = gt_patch_masks.get((unit, group))
     if gt is None:
         continue
-    q_tokens, q_h, q_w = query_encodings[part_type]
-    bg_bank = bg_all_lookup[ck]
+    q_tokens, q_h, q_w = query_encodings[unit]
+    bg_bank = bg_all_lookup[ck].to(q_tokens.device)
 
     for name in SCALE_NAMES:
-        fg_bank = fg_by_scale[(ck, name)]
+        fg_bank = fg_by_scale[(ck, name)].to(q_tokens.device)
 
         proto = compute_exemplar_features(fg_bank, mode="mean")
         raw_proto = score_heatmap(q_tokens, proto, q_h, q_w)
@@ -361,7 +368,9 @@ log.info(
 per_instance_rows = []
 for ck in sorted(usable_combo_keys):
     row = {
-        "part_type": ck[0],
+        "unit": ck[0],
+        "dataset": combo_by_key[ck]["dataset"],
+        "part_type": combo_by_key[ck]["part_type"],
         "group": ck[1],
         "class": ck[2],
         "instance_id": ck[3],
