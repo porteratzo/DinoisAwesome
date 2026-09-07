@@ -15,6 +15,16 @@ from PIL import Image
 
 from .encoder import _MODEL_NAMES, DinoEncoder, ExtractorOutput
 
+# Storage dtype for gallery embeddings: half of float32's disk/RAM footprint.
+# These are inference-only similarity features (nearest-neighbor / cosine
+# retrieval), never used for training, so the added rounding is immaterial —
+# see the equivalent note in encoder_cache.py.
+_STORAGE_DTYPE = np.float16
+
+# Sentinel file touched on every Gallery load; its mtime is the "last used"
+# signal scripts/prune_cache.py reads for this cache unit.
+_LAST_USED_MARKER = ".last_used"
+
 
 @dataclass
 class GalleryConfig:
@@ -28,7 +38,11 @@ class GalleryConfig:
     block_indices: list[int]  # transformer block numbers stored, in L-axis order
     embed_dim: int  # embedding dimension D
     created_at: str  # ISO-8601 UTC timestamp
-    schema_version: str = "1.0"
+    # "2.0": embeddings stored as float16 (was float32 under "1.0"). Not used to
+    # gate cache directories the way EncoderFingerprint.digest is — an existing
+    # gallery keeps its on-disk dtype regardless of this field — but documents
+    # which format a given gallery_config.json was written under.
+    schema_version: str = "2.0"
 
     def layer_idx(self, block_idx: int) -> int:
         """Return the 0-based position of *block_idx* in the stored layer axis.
@@ -106,8 +120,12 @@ class Gallery:
             gallery_config.json
             patches.parquet        # one row per (image_id, row, col)
             cls_tokens.parquet     # one row per image_id; row i == cls_tokens.npy[i]
-            cls_tokens.npy         # float32 (N, L, D) — all CLS embeddings
-            embeddings/<id>.npy    # float32 (L, H, W, D) — patch embeddings per image
+            cls_tokens.npy         # float16 (N, L, D) — all CLS embeddings
+            embeddings/<id>.npy    # float16 (L, H, W, D) — patch embeddings per image
+            .last_used             # empty sentinel; mtime = last time this gallery was loaded
+
+    Galleries built before the float16 storage switch are still float32 on
+    disk and load unchanged — dtype is read back from the file, never assumed.
 
     patches.parquet columns:
         image_id  str       unique image identifier
@@ -156,6 +174,13 @@ class Gallery:
         self.patches = pd.read_parquet(self.root / self._PATCHES_FILE)
         self.cls_tokens = pd.read_parquet(self.root / self._CLS_META)
         self._cls_array = np.load(self.root / self._CLS_NPY, mmap_mode="r")  # (N, L, D)
+        # Read back whatever dtype is actually on disk (float16 for galleries
+        # built after the float16 storage switch, float32 for older ones still
+        # in use) rather than assuming one — see load_embeddings().
+        self._dtype = self._cls_array.dtype
+        # Mark this gallery as just-used for scripts/prune_cache.py's day-based
+        # eviction; loading it is the "used" event for a precomputed gallery.
+        (self.root / _LAST_USED_MARKER).touch()
 
     @classmethod
     def build(
@@ -208,8 +233,8 @@ class Gallery:
             ]
 
             out: ExtractorOutput = encoder(loaded)
-            patches_np = out.patches.cpu().float().numpy()
-            cls_np = out.cls.cpu().float().numpy()
+            patches_np = out.patches.cpu().half().numpy()
+            cls_np = out.cls.cpu().half().numpy()
             # Single-layer output squeezes the L axis: (B, H, W, D) and (B, D).
             # Normalise to (B, L, H, W, D) and (B, L, D) so the on-disk layout
             # is always the same regardless of how many layers the encoder stored.
@@ -297,7 +322,8 @@ class Gallery:
                        stored block.
 
         Returns:
-            float32 array of shape ``(H, W, D)``.
+            Array of shape ``(H, W, D)`` — float16, or float32 for a gallery
+            built before the float16 storage switch.
         """
         if block_idx is None:
             block_idx = self.config.block_indices[-1]
@@ -306,7 +332,7 @@ class Gallery:
         return np.asarray(npy[layer_idx])  # (H, W, D)
 
     def load_embeddings(self, df: pd.DataFrame, block_idx: int | None = None) -> np.ndarray:
-        """Load patch embeddings for the rows in *df* as a float32 array of shape ``(N, D)``.
+        """Load patch embeddings for the rows in *df* as an array of shape ``(N, D)``.
 
         Opens each image's ``.npy`` file once via mmap and performs a vectorised
         spatial lookup — only the requested patches are copied into memory.
@@ -318,12 +344,13 @@ class Gallery:
                        Defaults to the last stored block.
 
         Returns:
-            float32 array of shape ``(N, D)`` where N is ``len(df)``.
+            Array of shape ``(N, D)`` where N is ``len(df)`` — float16, or
+            float32 for a gallery built before the float16 storage switch.
         """
         if block_idx is None:
             block_idx = self.config.block_indices[-1]
 
-        result = np.empty((len(df), self.config.embed_dim), dtype=np.float32)
+        result = np.empty((len(df), self.config.embed_dim), dtype=self._dtype)
         pos_map = {idx: i for i, idx in enumerate(df.index)}
 
         for img_id, group in df.groupby("image_id"):
@@ -348,7 +375,8 @@ class Gallery:
 
         Returns:
             A tuple ``(ids, embs)`` where *ids* is a list of image ID strings and
-            *embs* is a float32 array of shape ``(N, D)``.
+            *embs* is an array of shape ``(N, D)`` (float16, or float32 for a
+            gallery built before the float16 storage switch).
         """
         df = self.cls_tokens
         if image_ids is not None:
@@ -565,7 +593,8 @@ class Gallery:
             block_idx: Transformer block to extract.  Defaults to the last stored block.
 
         Returns:
-            float32 array of shape ``(N, D)``.
+            Array of shape ``(N, D)`` — float16, or float32 for a gallery
+            built before the float16 storage switch.
         """
         if block_idx is None:
             block_idx = self.config.block_indices[-1]
@@ -585,7 +614,8 @@ def _cosine_topk(embs: np.ndarray, query: np.ndarray, k: int) -> tuple[np.ndarra
     top-*k* slice, so it is efficient even for large galleries.
 
     Args:
-        embs:  float32 array of shape ``(N, D)`` — the gallery embeddings.
+        embs:  Array of shape ``(N, D)`` — the gallery embeddings (float16, or
+               float32 for a gallery built before the float16 storage switch).
         query: 1-D float array of length D — the query vector.
         k:     Number of results to return (clamped to ``len(embs)``).
 

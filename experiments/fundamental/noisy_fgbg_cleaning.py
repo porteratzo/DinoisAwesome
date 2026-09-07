@@ -41,7 +41,10 @@
 #     "residual boundary leakage" this step is meant to catch. Tokens are L2-normalised
 #     throughout, so plain Euclidean distance (`sklearn.cluster.HDBSCAN`'s default metric) is
 #     already a monotonic transform of cosine similarity (`||a-b||^2 = 2 - 2*cos_sim` for unit
-#     vectors) — no custom metric needed.
+#     vectors) — no custom metric needed. **Off by default** (`ENABLE_STEP3=False`) — it
+#     never reliably beat `raw` in this file's own results, and its per-fold cost in the 5-3
+#     section below (O(N^2), uncached) dominates this file's runtime; flip it on to
+#     re-validate rather than to get a faster run.
 #
 # **This is an ablation, not a pipeline** — each step is applied directly to the same `raw`
 # gallery, not to the previous step's output. `step2_cls`/`step2_center` cross-check `raw`'s
@@ -194,6 +197,13 @@ CENTER_CORE_PERCENTILE = 70.0
 
 # Step 3 — HDBSCAN + kNN consensus, run once per instance-type group (pooling every part
 # type's instances of that group at once).
+# This file's own ablation (Parts 7-8) and the 5-3 extension below never showed Step 3
+# reliably beating `raw` — gallery cleaning via clustering is a dead end on this dataset —
+# while its per-fold HDBSCAN + kNN consensus pass (O(N^2) up to MAX_BANK_SIZE_DENOISE_53
+# points) is by far the most expensive part of the 5-3 section: unlike DINO encoding, it
+# re-clusters from scratch every fold (n_units_53 = N_FOLDS_53 * (part_type, group) pairs),
+# so nothing here is cache-eligible. Off by default; flip to True to re-validate.
+ENABLE_STEP3: bool = False
 HDBSCAN_MIN_CLUSTER_SIZE = 8
 HDBSCAN_MIN_SAMPLES = 3
 KNN_CONSENSUS_K = 10
@@ -205,7 +215,9 @@ KNN_FGBG_NUM_NEIGHBOURS = 10
 
 ORACLE_THRESHOLD_STEPS = 25
 
-STAGES: list[str] = ["raw", "step1", "step2_cls", "step2_center", "step3"]
+STAGES: list[str] = ["raw", "step1", "step2_cls", "step2_center"] + (
+    ["step3"] if ENABLE_STEP3 else []
+)
 STAGE_LABELS: dict[str, str] = {
     "raw": "raw (0.3 threshold)",
     "step1": "step1 (spatial filter)",
@@ -792,50 +804,56 @@ for combo in tqdm(combos, desc="Part 5: spatial filter + attention check"):
 # a *single* focus instance's Step-3 behaviour (see step3_feature_clean.png/
 # pipeline_summary.png) is not a reliable stand-in for what Step 3 does dataset-wide.
 group_diagnostics: dict[str, dict | None] = {}
-for group, group_combos in tqdm(combos_by_group.items(), desc="Part 6: HDBSCAN + kNN consensus"):
-    result, diag = pool_and_clean_group(group_combos, combo_galleries, "raw", capture=True)
-    group_diagnostics[group] = diag
-    for combo in group_combos:
-        ck = combo_key(combo)
-        if ck in result:
-            fg = result[ck]
-        else:
-            log.warning(
-                "%s: absent from group=%s pooled result (empty raw fg gallery) "
-                "— step3 falls back to raw fg unfiltered",
-                ck,
-                group,
-            )
-            fg = combo_galleries[ck]["raw"]["fg"]
-        combo_galleries[ck]["step3"] = {
-            "fg": fg,
-            "bg": combo_galleries[ck]["raw"]["bg"],
-        }
-step3_diagnostics_by_focus: dict[tuple, dict | None] = {
-    combo_key(c): group_diagnostics.get(c["group"]) for c in focus_combos
-}
+if ENABLE_STEP3:
+    for group, group_combos in tqdm(
+        combos_by_group.items(), desc="Part 6: HDBSCAN + kNN consensus"
+    ):
+        result, diag = pool_and_clean_group(group_combos, combo_galleries, "raw", capture=True)
+        group_diagnostics[group] = diag
+        for combo in group_combos:
+            ck = combo_key(combo)
+            if ck in result:
+                fg = result[ck]
+            else:
+                log.warning(
+                    "%s: absent from group=%s pooled result (empty raw fg gallery) "
+                    "— step3 falls back to raw fg unfiltered",
+                    ck,
+                    group,
+                )
+                fg = combo_galleries[ck]["raw"]["fg"]
+            combo_galleries[ck]["step3"] = {
+                "fg": fg,
+                "bg": combo_galleries[ck]["raw"]["bg"],
+            }
+    step3_diagnostics_by_focus: dict[tuple, dict | None] = {
+        combo_key(c): group_diagnostics.get(c["group"]) for c in focus_combos
+    }
 
-log.info("Step 3 complete for %d instance-type groups", len(combos_by_group))
+    log.info("Step 3 complete for %d instance-type groups", len(combos_by_group))
 
-# Per-scale Step-3 survival, aggregated across *every* combo (not just the focus one) — see
-# the module docstring's "Reading the results" section for why this matters: the focus
-# combo can (and here, for one specific instance, does) look like Step 3 wipes out an
-# entire scale, when the dataset-wide picture is much less dramatic.
-_scale_totals: dict[str, list[int]] = {s: [0, 0] for s in SCALES}
-for group, diag in group_diagnostics.items():
-    if diag is None:
-        continue
-    for ck, start, end in diag["slices"]:
-        keep_this_combo = diag["keep"][start:end]
-        offset = 0
-        for s, n in combo_galleries[ck]["raw_sizes"]:
-            _scale_totals[s][0] += int(keep_this_combo[offset : offset + n].sum())
-            _scale_totals[s][1] += n
-            offset += n
-log.info("Step 3 survival by scale, aggregated across every combo:")
-for s in SCALES:
-    k, n = _scale_totals[s]
-    log.info("  scale=%-6s kept=%d/%d (%.1f%%)", s, k, n, 100 * k / n if n else float("nan"))
+    # Per-scale Step-3 survival, aggregated across *every* combo (not just the focus one) —
+    # see the module docstring's "Reading the results" section for why this matters: the
+    # focus combo can (and here, for one specific instance, does) look like Step 3 wipes out
+    # an entire scale, when the dataset-wide picture is much less dramatic.
+    _scale_totals: dict[str, list[int]] = {s: [0, 0] for s in SCALES}
+    for group, diag in group_diagnostics.items():
+        if diag is None:
+            continue
+        for ck, start, end in diag["slices"]:
+            keep_this_combo = diag["keep"][start:end]
+            offset = 0
+            for s, n in combo_galleries[ck]["raw_sizes"]:
+                _scale_totals[s][0] += int(keep_this_combo[offset : offset + n].sum())
+                _scale_totals[s][1] += n
+                offset += n
+    log.info("Step 3 survival by scale, aggregated across every combo:")
+    for s in SCALES:
+        k, n = _scale_totals[s]
+        log.info("  scale=%-6s kept=%d/%d (%.1f%%)", s, k, n, 100 * k / n if n else float("nan"))
+else:
+    step3_diagnostics_by_focus = {combo_key(c): None for c in focus_combos}
+    log.info("Step 3 (HDBSCAN + kNN consensus) disabled — ENABLE_STEP3=False, skipping")
 
 # %% Part 7 — score every combo x every stage x every method (oracle IoU)
 iou_lookup: dict[str, dict[str, dict[tuple, float]]] = {m: {s: {} for s in STAGES} for m in METHODS}
@@ -973,8 +991,9 @@ log.info("Wrote %s", OUTPUT_DIR / "oracle_iou_by_stage.csv")
 _aggregate_chart_path = OUTPUT_DIR / "oracle_iou_by_stage.png"
 plot_oracle_iou_bar_chart(
     summary_df,
-    f"Noisy fg/bg cleaning — oracle IoU per stage, global+mid+close/all scale combo "
-    f"({len(combos)} combos across {len(RUN_PAIRS)} ref/query units)",
+    f"Noisy fg/bg cleaning — 1-1 (single ref/query pair) — oracle IoU per stage, "
+    f"global+mid+close/all scale combo ({len(combos)} combos across {len(RUN_PAIRS)} "
+    f"ref/query units)",
     _aggregate_chart_path,
 )
 log.info("Saved oracle-IoU bar chart to %s", _aggregate_chart_path)
@@ -1002,8 +1021,8 @@ for _group in sorted(combos_by_group):
     _group_chart_path = OUTPUT_DIR / f"oracle_iou_by_stage__{_group.replace(' ', '_')}.png"
     plot_oracle_iou_bar_chart(
         _group_summary_df,
-        f"Noisy fg/bg cleaning — oracle IoU per stage, group={_group!r} "
-        f"({len(_group_keys)} combos)",
+        f"Noisy fg/bg cleaning — 1-1 (single ref/query pair) — oracle IoU per stage, "
+        f"group={_group!r} ({len(_group_keys)} combos)",
         _group_chart_path,
     )
     log.info("Saved oracle-IoU bar chart for group=%r to %s", _group, _group_chart_path)
@@ -1216,65 +1235,72 @@ def render_focus_qualitative_figures(
     # directly to each scale's own `raw` fg patches (not step 1/2's output — see the file
     # header), plus a group-level PCA scatter showing where the focus combo's own raw fg
     # patches sit relative to the rest of its instance-type group's pooled cloud.
-    fig, axes = plt.subplots(1, len(SCALES), figsize=(6 * len(SCALES), 5.5))
-    for ax, scale in zip(axes, SCALES):
-        diag = scale_diag[scale]
-        gh, gw = diag["grid_h"], diag["grid_w"]
-        base_idx = diag["raw_fg_idx"]
-        kept_idx = step3_kept_flat_idx(focus_key, scale_diag, step3_diag, scale)
-        dropped_idx = np.setdiff1d(base_idx, kept_idx)
-        ax.imshow(diag["img"])
-        w, h = diag["img"].size
-        # Rasterized RGBA overlay, not one Rectangle per patch — see `overlay_patches`.
-        rgba = np.zeros((gh, gw, 4), dtype=np.float32)
-        for idx_set, color in ((kept_idx, "#2ecc71"), (dropped_idx, "#e74c3c")):
-            grid = flat_idx_to_bool_grid(idx_set, gh, gw)
-            rgba[grid] = (*to_rgb(color), 0.45)
-        ax.imshow(rgba, extent=(0, w, h, 0), interpolation="nearest")
-        ax.axis("off")
-        ax.set_title(f"scale={scale}: kept={len(kept_idx)} dropped={len(dropped_idx)}")
-    fig.suptitle(
-        f"Step 3: HDBSCAN + kNN consensus on raw fg (green=kept, red=dropped) — focus combo "
-        f"{focus_key}"
-    )
-    fig.tight_layout(rect=(0, 0, 1, 0.93))
-    fig.savefig(out_path("step3_feature_clean"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
+    # Skipped entirely when ENABLE_STEP3=False — step3_diag is always None then, so these
+    # figures would just show "everything dropped" rather than anything meaningful.
+    if ENABLE_STEP3:
+        fig, axes = plt.subplots(1, len(SCALES), figsize=(6 * len(SCALES), 5.5))
+        for ax, scale in zip(axes, SCALES):
+            diag = scale_diag[scale]
+            gh, gw = diag["grid_h"], diag["grid_w"]
+            base_idx = diag["raw_fg_idx"]
+            kept_idx = step3_kept_flat_idx(focus_key, scale_diag, step3_diag, scale)
+            dropped_idx = np.setdiff1d(base_idx, kept_idx)
+            ax.imshow(diag["img"])
+            w, h = diag["img"].size
+            # Rasterized RGBA overlay, not one Rectangle per patch — see `overlay_patches`.
+            rgba = np.zeros((gh, gw, 4), dtype=np.float32)
+            for idx_set, color in ((kept_idx, "#2ecc71"), (dropped_idx, "#e74c3c")):
+                grid = flat_idx_to_bool_grid(idx_set, gh, gw)
+                rgba[grid] = (*to_rgb(color), 0.45)
+            ax.imshow(rgba, extent=(0, w, h, 0), interpolation="nearest")
+            ax.axis("off")
+            ax.set_title(f"scale={scale}: kept={len(kept_idx)} dropped={len(dropped_idx)}")
+        fig.suptitle(
+            f"Step 3: HDBSCAN + kNN consensus on raw fg (green=kept, red=dropped) — focus combo "
+            f"{focus_key}"
+        )
+        fig.tight_layout(rect=(0, 0, 1, 0.93))
+        fig.savefig(out_path("step3_feature_clean"), dpi=150, bbox_inches="tight")
+        plt.close(fig)
 
-    fig, ax = plt.subplots(figsize=(7, 6))
-    if step3_diag is None:
-        ax.set_title("no diagnostics captured")
-        ax.axis("off")
-    else:
-        pooled_2d = PCA(n_components=2, random_state=SEED).fit_transform(step3_diag["pooled"])
-        keep = step3_diag["keep"]
-        dropped_2d = subsample_rows(pooled_2d[~keep], MAX_PCA_SCATTER_POINTS, SEED)
-        kept_2d = subsample_rows(pooled_2d[keep], MAX_PCA_SCATTER_POINTS, SEED)
-        ax.scatter(
-            dropped_2d[:, 0],
-            dropped_2d[:, 1],
-            s=10,
-            alpha=0.4,
-            color="#e74c3c",
-            label="dropped",
-        )
-        ax.scatter(kept_2d[:, 0], kept_2d[:, 1], s=10, alpha=0.4, color="#2ecc71", label="kept")
-        ck_start, ck_end = next((s, e) for ck, s, e in step3_diag["slices"] if ck == focus_key)
-        ax.scatter(
-            pooled_2d[ck_start:ck_end, 0],
-            pooled_2d[ck_start:ck_end, 1],
-            s=60,
-            facecolors="none",
-            edgecolors="black",
-            linewidths=1.2,
-            label="focus combo",
-        )
-        ax.set_title(f"group={focus_combo['group']} pooled raw-fg tokens (PCA)")
-        ax.legend(fontsize=8)
-    fig.suptitle(f"Step 3: per-group pooled feature space — group={focus_combo['group']}")
-    fig.tight_layout()
-    fig.savefig(out_path("step3_group_pca"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
+        fig, ax = plt.subplots(figsize=(7, 6))
+        if step3_diag is None:
+            ax.set_title("no diagnostics captured")
+            ax.axis("off")
+        else:
+            pooled_2d = PCA(n_components=2, random_state=SEED).fit_transform(step3_diag["pooled"])
+            keep = step3_diag["keep"]
+            dropped_2d = subsample_rows(pooled_2d[~keep], MAX_PCA_SCATTER_POINTS, SEED)
+            kept_2d = subsample_rows(pooled_2d[keep], MAX_PCA_SCATTER_POINTS, SEED)
+            ax.scatter(
+                dropped_2d[:, 0],
+                dropped_2d[:, 1],
+                s=10,
+                alpha=0.4,
+                color="#e74c3c",
+                label="dropped",
+            )
+            ax.scatter(
+                kept_2d[:, 0], kept_2d[:, 1], s=10, alpha=0.4, color="#2ecc71", label="kept"
+            )
+            ck_start, ck_end = next(
+                (s, e) for ck, s, e in step3_diag["slices"] if ck == focus_key
+            )
+            ax.scatter(
+                pooled_2d[ck_start:ck_end, 0],
+                pooled_2d[ck_start:ck_end, 1],
+                s=60,
+                facecolors="none",
+                edgecolors="black",
+                linewidths=1.2,
+                label="focus combo",
+            )
+            ax.set_title(f"group={focus_combo['group']} pooled raw-fg tokens (PCA)")
+            ax.legend(fontsize=8)
+        fig.suptitle(f"Step 3: per-group pooled feature space — group={focus_combo['group']}")
+        fig.tight_layout()
+        fig.savefig(out_path("step3_group_pca"), dpi=150, bbox_inches="tight")
+        plt.close(fig)
 
     # Visualization 4 — pipeline summary: every stage, all three scales, one grid
     fig, axes = plt.subplots(
@@ -1520,21 +1546,26 @@ def build_cascade_fg(combo: dict, steps: list[str], branch: str) -> torch.Tensor
 # chart rather than picking one as "the" default.
 PIPELINE_STEP2_BRANCHES: list[str] = ["cls", "center"]
 
-PIPELINE_STEPS: list[str] = ["step1", "step2", "step3"]  # canonical order every variant
-# below respects (a variant only ever drops a step, never reorders the ones it keeps)
+# canonical order every variant below respects (a variant only ever drops a step, never
+# reorders the ones it keeps). step3 is excluded from every variant when ENABLE_STEP3=False
+# — "no_step3" would then be identical to "full", so it's dropped from the variant set
+# entirely rather than kept as a redundant duplicate.
+PIPELINE_STEPS: list[str] = ["step1", "step2"] + (["step3"] if ENABLE_STEP3 else [])
 PIPELINE_VARIANTS: dict[str, list[str]] = {
-    "full": ["step1", "step2", "step3"],
-    "no_step1": ["step2", "step3"],
-    "no_step2": ["step1", "step3"],
-    "no_step3": ["step1", "step2"],
+    "full": ["step1", "step2"] + (["step3"] if ENABLE_STEP3 else []),
+    "no_step1": ["step2"] + (["step3"] if ENABLE_STEP3 else []),
+    "no_step2": ["step1"] + (["step3"] if ENABLE_STEP3 else []),
+    **({"no_step3": ["step1", "step2"]} if ENABLE_STEP3 else {}),
 }
 PIPELINE_VARIANT_LABELS: dict[str, str] = {
-    "full": "full (1+2+3)",
-    "no_step1": "no step1 (2+3)",
-    "no_step2": "no step2 (1+3)",
+    "full": "full (1+2+3)" if ENABLE_STEP3 else "full (1+2)",
+    "no_step1": "no step1 (2+3)" if ENABLE_STEP3 else "no step1 (2)",
+    "no_step2": "no step2 (1+3)" if ENABLE_STEP3 else "no step2 (1)",
     "no_step3": "no step3 (1+2)",
 }
-CASCADE_CHART_ORDER: list[str] = ["raw", "full", "no_step1", "no_step2", "no_step3"]
+CASCADE_CHART_ORDER: list[str] = ["raw", "full", "no_step1", "no_step2"] + (
+    ["no_step3"] if ENABLE_STEP3 else []
+)
 CASCADE_CHART_LABELS: dict[str, str] = {"raw": "raw (no steps)", **PIPELINE_VARIANT_LABELS}
 
 
@@ -1812,9 +1843,9 @@ def run_composed_pipeline(branch: str) -> pd.DataFrame:
     )
     ax.set_ylabel("oracle IoU (mean +/- std across combos)")
     ax.set_title(
-        f"Composed pipeline — leave-one-out oracle IoU, global+mid+close/all scale combo "
-        f"({len(combos)} combos across {len(RUN_PAIRS)} ref/query units, step2 branch="
-        f"{branch!r})"
+        f"Composed pipeline — 1-1 (single ref/query pair) — leave-one-out oracle IoU, "
+        f"global+mid+close/all scale combo ({len(combos)} combos across {len(RUN_PAIRS)} "
+        f"ref/query units, step2 branch={branch!r})"
     )
     ax.legend(fontsize=9)
     ax.grid(alpha=0.3, axis="y")
@@ -2003,7 +2034,9 @@ log.info(
 # Cross-validated sweep: for each fold x part_type x group, pool the fold's training
 # instances' raw/step1/step2_* galleries, run Step 3's HDBSCAN + kNN consensus scoped to
 # just that pool, and score every stage against every eval image in the fold with GT.
-fold_splits_53 = make_fold_role_splits(sorted(groups_by_pt_53), seed=SEED)
+fold_splits_53 = make_fold_role_splits(
+    sorted(groups_by_pt_53)
+)  # truly randomized, not SEED-reproducible
 iou_lookup_53: dict[str, dict[str, list[float]]] = {m: {s: [] for s in STAGES} for m in METHODS}
 
 n_units_53 = N_FOLDS_53 * len(groups_by_pt_53)
@@ -2043,20 +2076,21 @@ with tqdm(total=n_units_53, desc="5-3: cross-validated fit + score") as pbar:
                         ),
                     }
 
-                raw_fg_pool = pooled["raw"]["fg"]
-                step3_fg = raw_fg_pool
-                if raw_fg_pool.shape[0] > 0:
-                    keep, _ = hdbscan_knn_consensus_keep(
-                        raw_fg_pool.cpu().numpy(),
-                        HDBSCAN_MIN_CLUSTER_SIZE,
-                        HDBSCAN_MIN_SAMPLES,
-                        KNN_CONSENSUS_K,
-                        KNN_CONSENSUS_MIN_AGREEMENT,
-                    )
-                    kept = raw_fg_pool[torch.from_numpy(keep)]
-                    if kept.shape[0] > 0:
-                        step3_fg = kept
-                pooled["step3"] = {"fg": step3_fg, "bg": pooled["raw"]["bg"]}
+                if ENABLE_STEP3:
+                    raw_fg_pool = pooled["raw"]["fg"]
+                    step3_fg = raw_fg_pool
+                    if raw_fg_pool.shape[0] > 0:
+                        keep, _ = hdbscan_knn_consensus_keep(
+                            raw_fg_pool.cpu().numpy(),
+                            HDBSCAN_MIN_CLUSTER_SIZE,
+                            HDBSCAN_MIN_SAMPLES,
+                            KNN_CONSENSUS_K,
+                            KNN_CONSENSUS_MIN_AGREEMENT,
+                        )
+                        kept = raw_fg_pool[torch.from_numpy(keep)]
+                        if kept.shape[0] > 0:
+                            step3_fg = kept
+                    pooled["step3"] = {"fg": step3_fg, "bg": pooled["raw"]["bg"]}
 
                 for eval_number in eval_numbers:
                     key = (part_type, group, eval_number)
@@ -2156,7 +2190,7 @@ for ax, method in zip(axes, METHODS):
         width,
         yerr=sub["std_5_3"],
         capsize=3,
-        label="5-3 (pooled, 2-fold CV)",
+        label=f"5-3 (pooled, {N_FOLDS_53}-fold CV)",
         color="#2ecc71",
     )
     ax.set_xticks(x, [STAGE_LABELS[s] for s in STAGES], rotation=20, ha="right")

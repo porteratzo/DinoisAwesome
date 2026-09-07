@@ -1,5 +1,11 @@
 # %% [markdown]
-# # Fundamental: Adaptive Method-Selection Logic for the Multi-Scale Ablation
+# # Pipeline: Adaptive Method-Selection Logic for the Multi-Scale Ablation
+#
+# Moved out of `fundamental/` into its own `pipeline/` directory: unlike its former
+# siblings, this script isn't probing a basic representational property of DINOv3 — it's
+# an actual decision-making pipeline (replacing `object_detection/multiscale_ablation/`'s
+# manual "read the table, pick a config" step with adaptive selection logic), so it doesn't
+# belong in the fundamental-properties series and shouldn't run alongside it.
 #
 # `experiments/object_detection/multiscale_ablation/` currently picks scale, method,
 # single-vs-two-stage, and denoising **manually**: `run_experiments.py` computes every
@@ -160,7 +166,7 @@ DINO_WEIGHTS_DIR: str | None = os.environ.get("DINO_WEIGHTS_DIR")
 # %% Parameters
 _REPO_ROOT = _EXPERIMENTS_ROOT.parent
 ABC5_DATA_DIR = _REPO_ROOT / "data" / "abc5"
-OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental_abc5" / "adaptive_method_selection"
+OUTPUT_DIR = _REPO_ROOT / "outputs" / "pipeline_abc5" / "adaptive_method_selection"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Runnable on one combo or every combo — see main() at the bottom.
@@ -1910,7 +1916,13 @@ def run_pair(
 
 # %% Main
 def main() -> None:
-    crop_cfg = DEFAULT_CROP_CONFIG
+    # Local override, not a change to DEFAULT_CROP_CONFIG: that default is shared with
+    # experiments/object_detection/multiscale_ablation/'s own scripts, which stay on
+    # DINOv3-large. layer_idx=None re-resolves via last_block_idx() for the new dino_size,
+    # so this doesn't need its own hardcoded block index (see CropConfig.__post_init__).
+    crop_cfg = dataclasses.replace(
+        DEFAULT_CROP_CONFIG, dino_size="base", img_size=768, layer_idx=None
+    )
     scoring_cfg = DEFAULT_SCORING_CONFIG
 
     encoder = DinoEncoder(
@@ -1962,13 +1974,13 @@ if __name__ == "__main__":
 # %% [markdown]
 # ## Reading the results
 #
-# `outputs/fundamental_abc5/adaptive_method_selection/adaptive_selection_summary.csv` has
+# `outputs/pipeline_abc5/adaptive_method_selection/adaptive_selection_summary.csv` has
 # one row per (pair, branch): the chosen scale/method/transform (+eps)/stage/denoising/
 # augmentation and the resulting cross-validated test P/R/F1/mIoU — each already a mean
 # across every held-out test image, then averaged again across `NUM_CV_FOLDS` train/val
 # folds.
 # `summary_f1_by_pair.png` plots GT-calibrated vs. GT-free test F1 side by side per pair.
-# Per-pair figures under `outputs/fundamental_abc5/adaptive_method_selection/<pair_label>/`
+# Per-pair figures under `outputs/pipeline_abc5/adaptive_method_selection/<pair_label>/`
 # show the diagnostic behind each decision for that pair's first CV fold's first val image:
 # which scale/method scored best and why (heatmaps + scores, averaged across the fold's
 # whole val set even though only one image is drawn), what drove the single-vs-two-stage

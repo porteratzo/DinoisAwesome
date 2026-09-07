@@ -80,6 +80,20 @@ cell-based, need `data/abc3`, and save figures under
    file of the three (1333 lines) — it reuses the same augmentation families as #2 and
    the same oracle-IoU search `object_detection/multiscale_crop_ablation.py` uses.
 
+Two later additions in the same directory depart from the fixed-pair paradigm above by
+cross-validating instead (data `abc5`, save under `outputs/fundamental_abc5/<script_name>/`):
+
+- **`training_set_size_ablation.py`** — does pooling more training images into the
+  gallery (N=1..5) improve oracle IoU on held-out eval images? 2-fold CV, fresh random
+  shuffle per fold — its own docstring explains why this replaced an earlier
+  uncross-validated version that showed a spurious effect.
+- **`resolution_ablation.py`** — applies that same script's 1-1-vs-5-3 two-endpoint CV
+  check to DINOv3 input resolution instead of training-set size: at every resolution in
+  `RESOLUTION_SWEEP` (256/512/768/1024/1536px), runs both the 1-train/1-eval and
+  5-train/3-eval regimes (2-fold CV each), to tell a real resolution trend from
+  fold-to-fold noise and check it against `object_detection/resolution_ablation/`'s
+  own fixed-pair (uncross-validated) resolution sweep.
+
 ## `object_detection/` — training-free instance detection (actively maintained)
 
 - **`instance_detection.py`** — the baseline pipeline: one exemplar + its instance

@@ -4,6 +4,14 @@ and cross-scale similarity experiments — the encoding/scoring half of
 ``multiscale_crop_ablation.py``'s pipeline, split out so it can be cached and so new
 methods (see ``methods.py``) never require touching this file.
 
+The encoder itself is wrapped in ``EncoderWithCache`` (``DINO_ENCODING_CACHE_DIR``,
+same content-addressed disk cache ``bg_gallery_enrichment.py``/``multiscale_crop_
+ablation.py``/every ``fundamental/*.py`` script uses), so a raw per-crop DINO pass
+is shared across scripts whenever the exact same crop pixels recur — not just
+within this script's own runs. The two-tier cache below sits on top of that and
+caches this script's own *derived* aggregation (multi-scale prototypes, scored/
+clustered/matched results), which the shared encoder cache alone can't skip:
+
 Two-tier cache (see ``common.py``'s module docstring):
     cache/crops/<crop_hash>/<pair>/tokens.pt
         DINO tokens for every scale's exemplar crops + the query image. Shared by
@@ -95,11 +103,17 @@ from engine import (
 from methods import all_method_names, build_method_states
 from PIL import Image
 
-from dinoisawesome import DinoEncoder
+from dinoisawesome import DinoEncoder, EncoderWithCache
 from dinoisawesome.abc3 import load_instance_pixel_mask, load_instance_pixel_masks
 from dinoisawesome.instance_detection import extract_patch_tokens
 
 DINO_WEIGHTS_DIR: str | None = os.environ.get("DINO_WEIGHTS_DIR")
+# Same content-addressed disk cache every other object_detection/fundamental script uses
+# (see dinoisawesome/encoder_cache.py) — wrapping the encoder with it means the raw
+# per-crop DINO passes this script does are shared with bg_gallery_enrichment.py and
+# multiscale_crop_ablation.py (which already re-encode many of the same reference/query
+# images) instead of only ever benefiting this script's own cache/crops/ tier below.
+DINO_ENCODING_CACHE_DIR: str | None = os.environ.get("DINO_ENCODING_CACHE_DIR")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -244,6 +258,7 @@ def _get_or_build_crop_cache(
     cache_path = crop_cache_path(pair, crop_cfg)
     if cache_path.exists() and not force:
         log.info("[%s] crop cache hit: %s", pair.slug, cache_path)
+        cache_path.touch()  # mark as just-used for scripts/prune_cache.py
         return torch.load(cache_path, weights_only=False)
 
     scale_protos, mean_patch_prototype = build_all_scale_prototypes(
@@ -420,7 +435,11 @@ def _write_method_cache(
 def _method_cache_exists(
     pair: PairKey, crop_cfg: CropConfig, scoring_cfg: ScoringConfig, method_name: str
 ) -> bool:
-    return method_cache_path(pair, crop_cfg, scoring_cfg, method_name).exists()
+    path = method_cache_path(pair, crop_cfg, scoring_cfg, method_name)
+    exists = path.exists()
+    if exists:
+        path.touch()  # mark as just-used for scripts/prune_cache.py
+    return exists
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +461,7 @@ def _get_or_build_blobs(
 ) -> tuple[list[dict], np.ndarray]:
     cache_path = blob_cache_path(pair, crop_cfg, scoring_cfg, roi_source)
     if cache_path.exists() and not force:
+        cache_path.touch()  # mark as just-used for scripts/prune_cache.py
         payload = torch.load(cache_path, weights_only=False)
         return payload["blobs"], payload["roi_mask"]
 
@@ -682,6 +702,7 @@ def main() -> None:
         weights_dir=DINO_WEIGHTS_DIR,
         amp=True,
     )
+    encoder = EncoderWithCache(encoder, cache_dir=DINO_ENCODING_CACHE_DIR)
     patch_size = encoder.patch_size
     log.info(
         "DINOv%s-%s | patch_size=%d | grid=%dx%d | crop_hash=%s | scoring_hash=%s",

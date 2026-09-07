@@ -1,13 +1,18 @@
 """Shared 5-3 pooled-gallery cross-validation for `fundamental/*.py` scripts.
 
 Generalizes `_shared/dataset_pairs.py`'s single ref/query pair (a 1-train/1-eval split) into
-a "5 training images pooled into one gallery, scored against 3 held-out eval images, 2-fold
+a "5 training images pooled into one gallery, scored against 3 held-out eval images, 5-fold
 cross-validated" companion mode any script can add without touching its own existing 1-1
 pipeline. See `training_set_size_ablation.py` for where this pattern — and its methodological
 pitfall — was first worked out: a *fixed* image order (e.g. always images 1-5 for training,
 6-8 for eval) is a dataset-of-origin confound, since abc5's image 1 is abc3's original
 capture and images 3-8 are abc4's (see `scripts/build_abc5_dataset.py`). Every fold here uses
 a fresh random shuffle instead, for exactly that reason.
+
+Fold role assignment is genuinely randomized, not just reshuffled from a fixed seed:
+`make_fold_role_splits` seeds its RNG from OS entropy by default (`seed=None`), so every run
+draws a fresh set of folds rather than replaying the same permutations every time — pass an
+explicit `seed` only when you specifically need one run's folds to be reproducible.
 
 Discovery and fold/role assignment are generic across scripts (same "abc5's 8 images per
 part type" data model, same annotation format); each calling script keeps its own crop
@@ -30,7 +35,7 @@ from dinoisawesome.abc3 import INSTANCE_TYPE_GROUPS, available_instance_groups
 ALL_IMAGE_NUMBERS: list[int] = [1, 2, 3, 4, 5, 6, 7, 8]
 N_TRAIN_53: int = 5
 N_EVAL_53: int = 3
-N_FOLDS_53: int = 2
+N_FOLDS_53: int = 5
 
 # A gallery pooled from 5 images has far more patches than a single reference image's, and
 # three different downstream costs scale with pool size — but only some of them have a real
@@ -139,7 +144,7 @@ def discover_all_instances(data_root: Path, dataset: str, part_types: list[str])
 
 def make_fold_role_splits(
     part_types: list[str],
-    seed: int,
+    seed: int | None = None,
     n_train: int = N_TRAIN_53,
     n_eval: int = N_EVAL_53,
     n_folds: int = N_FOLDS_53,
@@ -150,6 +155,12 @@ def make_fold_role_splits(
     Each fold freshly shuffles that part type's 8 images — folds are independent resamples
     (their eval sets can and do overlap across folds), not a non-overlapping k-fold
     partition; that's deliberate, see the module docstring.
+
+    *seed* defaults to `None`, which seeds `np.random.default_rng` from OS entropy — every
+    call draws genuinely new folds. Pass an explicit int only when you need this specific
+    run's folds to be reproducible (e.g. debugging one failing fold); don't wire it to a
+    module-level `SEED` constant shared with unrelated things like augmentation RNGs, or
+    every run will silently replay the exact same folds forever.
     """
     rng = np.random.default_rng(seed)
     folds: list[dict[str, tuple[set[int], list[int]]]] = []

@@ -60,9 +60,12 @@ from common import DEFAULT_CROP_CONFIG, DEFAULT_SCORING_CONFIG, all_pairs  # noq
 from methods import all_method_names  # noqa: E402
 from run_experiments import run_pair  # noqa: E402
 
-from dinoisawesome import DinoEncoder  # noqa: E402
+from dinoisawesome import DinoEncoder, EncoderWithCache  # noqa: E402
 
 DINO_WEIGHTS_DIR: str | None = os.environ.get("DINO_WEIGHTS_DIR")
+# Same shared content-addressed cache multiscale_ablation/run_experiments.py now wraps
+# its encoder with — see that module's docstring.
+DINO_ENCODING_CACHE_DIR: str | None = os.environ.get("DINO_ENCODING_CACHE_DIR")
 DEFAULT_RESOLUTIONS = (256, 512, 768, 1024, 1536)
 DEFAULT_SIZES = ("small", "base", "large")
 
@@ -148,6 +151,7 @@ def run_sweep_point(
         weights_dir=DINO_WEIGHTS_DIR,
         amp=True,
     )
+    encoder = EncoderWithCache(encoder, cache_dir=DINO_ENCODING_CACHE_DIR)
     patch_size = encoder.patch_size
     # See module docstring: layer_idx is architecture- (not resolution-) dependent, so
     # it's derived live from the actual loaded backbone rather than guessed per size.

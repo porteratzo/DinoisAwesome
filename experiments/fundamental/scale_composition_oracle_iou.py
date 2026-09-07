@@ -536,8 +536,8 @@ ax.set_xlabel("crop tightness t (0 = global, 1 = close)")
 ax.set_ylabel("oracle IoU (mean +/- std across combos)")
 ax.set_ylim(0, 1.0)
 ax.set_title(
-    f"Per-scale oracle IoU, n={N_SCALE_STEPS} steps ({len(usable_combo_keys)} combos)\n"
-    "dashed line = average IoU across all scale steps"
+    f"1-1 (single ref/query pair) — Per-scale oracle IoU, n={N_SCALE_STEPS} steps "
+    f"({len(usable_combo_keys)} combos)\ndashed line = average IoU across all scale steps"
 )
 ax.legend(fontsize=8)
 ax.grid(alpha=0.3)
@@ -621,7 +621,8 @@ ax2.set_title(
 axes[0].set_ylabel("oracle IoU (mean +/- std across combos)")
 axes[0].legend(fontsize=8)
 fig.suptitle(
-    f"Scale composition growth curves, n={N_SCALE_STEPS} steps ({len(usable_combo_keys)} combos)"
+    f"1-1 (single ref/query pair) — Scale composition growth curves, n={N_SCALE_STEPS} "
+    f"steps ({len(usable_combo_keys)} combos)"
 )
 fig.tight_layout()
 fig.savefig(OUTPUT_DIR / "composition_growth.png", dpi=150, bbox_inches="tight")
@@ -678,7 +679,10 @@ for group, cks in combos_by_group.items():
     ax.set_xlabel("crop tightness t (0 = global, 1 = close)")
     ax.set_ylabel("oracle IoU")
     ax.set_ylim(0, 1.0)
-    ax.set_title(f"Per-scale oracle IoU, group={group} (n={len(cks)} combos)")
+    ax.set_title(
+        f"1-1 (single ref/query pair) — Per-scale oracle IoU, group={group} "
+        f"(n={len(cks)} combos)"
+    )
     ax.legend(fontsize=8)
     ax.grid(alpha=0.3)
     fig.tight_layout()
@@ -834,7 +838,7 @@ log.info(
 # Sweep: for each fold x part_type x group x scale, pool the fold's training instances' fg at
 # that one scale (bg always pooled across every POOL_SCALES_53 entry, matching this file's
 # own "bg is scale-composition-invariant" convention), score against every eval image.
-fold_splits_53 = make_fold_role_splits(PART_TYPES_53, seed=SEED)
+fold_splits_53 = make_fold_role_splits(PART_TYPES_53)  # truly randomized, not SEED-reproducible
 results_53: list[dict] = []
 n_units_53 = N_FOLDS_53 * len(PART_TYPES_53)
 

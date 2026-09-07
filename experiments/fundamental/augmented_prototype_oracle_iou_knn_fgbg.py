@@ -1128,7 +1128,8 @@ for method in METHOD_LABELS:
     plot_severity_curves(
         curves,
         baseline_oracle_iou[method],
-        f"[{METHOD_TITLES[method]}] Oracle-IoU vs. severity — {len(combos)} combos",
+        f"[{METHOD_TITLES[method]}] 1-1 (single ref/query pair) — Oracle-IoU vs. severity "
+        f"— {len(combos)} combos",
         OUTPUT_DIR / f"oracle_iou_curves__{method}.png",
         "oracle IoU (mean across combos)",
     )
@@ -1171,7 +1172,10 @@ for scale in focus_crop_grid:
         for col in range(len(spec["values"]), n_cols):
             axes[row, col].axis("off")
         axes[row, 0].set_ylabel(family, fontsize=9)
-    fig.suptitle(f"Augmented '{scale}' prototype crops — focus combo {focus_key}")
+    fig.suptitle(
+        f"1-1 (single ref/query pair) — Augmented '{scale}' prototype crops — "
+        f"focus combo {focus_key}"
+    )
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(OUTPUT_DIR / f"augmented_crops_{scale}.png", dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -1219,7 +1223,8 @@ for scale in focus_heatmaps:
         plt.colorbar(im2, ax=axes[row, 2], shrink=0.75, pad=0.02)
 
     fig.suptitle(
-        f"scale={scale} — baseline vs. best-severity heatmap, all methods — focus combo {focus_key}"
+        f"1-1 (single ref/query pair) — scale={scale} — baseline vs. best-severity heatmap, "
+        f"all methods — focus combo {focus_key}"
     )
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(OUTPUT_DIR / f"baseline_vs_best_heatmap_{scale}.png", dpi=150, bbox_inches="tight")
@@ -1234,8 +1239,8 @@ for method in METHOD_LABELS:
         composed_iou_lookup[method],
         baseline_oracle_iou[method],
         N_SEVERITY_LEVELS,
-        f"[{METHOD_TITLES[method]}] Composed-prototype oracle-IoU vs. severities averaged "
-        f"— {len(combos)} combos",
+        f"[{METHOD_TITLES[method]}] 1-1 (single ref/query pair) — Composed-prototype "
+        f"oracle-IoU vs. severities averaged — {len(combos)} combos",
         OUTPUT_DIR / f"composed_oracle_iou_curves__{method}.png",
         "oracle IoU (composed, mean across combos)",
     )
@@ -1267,16 +1272,16 @@ leaveoneout_endpoint_rows: dict[str, list[dict]] = {}
 for method in METHOD_LABELS:
     plot_leaveoneout_curves(
         all_aug_composed_iou_lookup[method],
-        f"[{METHOD_TITLES[method]}] All-augmentations composed, leave-one-out "
-        f"— {len(combos)} combos",
+        f"[{METHOD_TITLES[method]}] 1-1 (single ref/query pair) — All-augmentations "
+        f"composed, leave-one-out — {len(combos)} combos",
         OUTPUT_DIR / f"all_augmentations_composed_curves__{method}.png",
         "oracle IoU (all-augmentations composed, mean across combos)",
     )
     plot_leaveoneout_bar(
         all_aug_composed_iou_lookup[method],
         baseline_oracle_iou[method],
-        f"[{METHOD_TITLES[method]}] All-augmentations composed, leave-one-out, "
-        f"k={N_SEVERITY_LEVELS} endpoint (dashed = baseline)",
+        f"[{METHOD_TITLES[method]}] 1-1 (single ref/query pair) — All-augmentations "
+        f"composed, leave-one-out, k={N_SEVERITY_LEVELS} endpoint (dashed = baseline)",
         OUTPUT_DIR / f"all_augmentations_composed_vs_baseline__{method}.png",
     )
     # Reuse aggregate_k_endpoint by aliasing held_out labels as "family" — the row shape
@@ -1478,7 +1483,7 @@ log.info(
 # instances' clean galleries, then for every (family, severity) pool that severity's
 # augmented fg patches in too and score all three methods — same pairing logic as Layer 1's
 # per-combo sweep above, just operating on pooled multi-instance banks.
-fold_splits_53 = make_fold_role_splits(PART_TYPES_53, seed=SEED)
+fold_splits_53 = make_fold_role_splits(PART_TYPES_53)  # truly randomized, not SEED-reproducible
 iou_lookup_53: dict[str, dict[tuple, float]] = {m: {} for m in METHOD_LABELS}
 n_units_53 = N_FOLDS_53 * len(PART_TYPES_53)
 

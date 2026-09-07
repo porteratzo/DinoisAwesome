@@ -551,7 +551,8 @@ for ax, method in zip(axes, METHODS):
     ax.grid(alpha=0.3)
 axes[0].set_ylabel("oracle IoU (mean +/- std across combos)")
 fig.suptitle(
-    f"Concat- vs. max-pooled composition, n={N_SCALE_STEPS} steps ({len(usable_combo_keys)} combos)"
+    f"1-1 (single ref/query pair) — Concat- vs. max-pooled composition, n={N_SCALE_STEPS} "
+    f"steps ({len(usable_combo_keys)} combos)"
 )
 fig.tight_layout()
 fig.savefig(OUTPUT_DIR / "pooling_growth_comparison.png", dpi=150, bbox_inches="tight")
@@ -642,7 +643,7 @@ log.info(
     len(instances_by_pg_53),
 )
 
-fold_splits_53 = make_fold_role_splits(PART_TYPES_53, seed=SEED)
+fold_splits_53 = make_fold_role_splits(PART_TYPES_53)  # truly randomized, not SEED-reproducible
 results_53: list[dict] = []
 n_units_53 = N_FOLDS_53 * len(PART_TYPES_53)
 
@@ -769,7 +770,7 @@ summary_53 = (
 )
 summary_53.to_csv(OUTPUT_DIR / "comparison_1_1_vs_5_3.csv", index=False)
 
-log.info("5-3 pooling comparison (global/mid/close, 2-fold CV):")
+log.info("5-3 pooling comparison (global/mid/close, %d-fold CV):", N_FOLDS_53)
 for method in METHODS:
     sub = summary_53[summary_53.method == method]
     best_single_row = (

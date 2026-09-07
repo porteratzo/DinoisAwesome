@@ -733,8 +733,8 @@ for scale_combo_name, lookup in iou_lookup_by_combo.items():
     _headline_path = OUTPUT_DIR / f"oracle_iou_by_pipeline__{scale_combo_name}.png"
     plot_pipeline_bar_chart(
         summary_df,
-        f"Feature-space transforms — oracle IoU by pipeline, fg scales={scale_combo_name} "
-        f"({len(RUN_PAIRS)} part types)",
+        f"Feature-space transforms — 1-1 (single ref/query pair) — oracle IoU by pipeline, "
+        f"fg scales={scale_combo_name} ({len(RUN_PAIRS)} part types)",
         _headline_path,
     )
     log.info("Saved headline bar chart to %s", _headline_path)
@@ -814,7 +814,8 @@ def plot_scale_combo_comparison(combined_df: pd.DataFrame, title: str, out_path:
 _comparison_path = OUTPUT_DIR / "oracle_iou_by_scale_combo_comparison.png"
 plot_scale_combo_comparison(
     combined_summary_df,
-    f"Feature-space transforms — fg scale combo comparison ({len(RUN_PAIRS)} part types)",
+    f"Feature-space transforms — 1-1 (single ref/query pair) — fg scale combo comparison "
+    f"({len(RUN_PAIRS)} part types)",
     _comparison_path,
 )
 log.info("Saved scale-combo comparison chart to %s", _comparison_path)
@@ -869,7 +870,8 @@ for scale_combo_name, lookup in iou_lookup_by_combo.items():
     ax.set_xlabel("epsilon (ZCA regularization)")
     ax.set_ylabel("oracle IoU (mean across combos)")
     ax.set_title(
-        f"Epsilon sweep — global/bg ZCA whitening and Mahalanobis, fg scales={scale_combo_name}"
+        f"Epsilon sweep — 1-1 (single ref/query pair) — global/bg ZCA whitening and "
+        f"Mahalanobis, fg scales={scale_combo_name}"
     )
     ax.legend(fontsize=8)
     ax.grid(alpha=0.3)
@@ -905,7 +907,10 @@ for scale_combo_name, lookup in iou_lookup_by_combo.items():
         ax.plot(PCA_K_SWEEP, means, marker="o", label=method)
     ax.set_xlabel("k (retained principal components, of C=1024)")
     ax.set_ylabel("oracle IoU (mean across combos)")
-    ax.set_title(f"PCA truncation — dimensionality sweep, fg scales={scale_combo_name}")
+    ax.set_title(
+        f"PCA truncation — 1-1 (single ref/query pair) — dimensionality sweep, "
+        f"fg scales={scale_combo_name}"
+    )
     ax.legend(fontsize=8)
     ax.grid(alpha=0.3)
     fig.tight_layout()
@@ -934,8 +939,8 @@ for scale_combo_name, lookup in iou_lookup_by_combo.items():
         _group_path = OUTPUT_DIR / f"oracle_iou_by_pipeline__{_group_slug}__{scale_combo_name}.png"
         plot_pipeline_bar_chart(
             group_df,
-            f"Feature-space transforms — oracle IoU, group={group}, fg scales={scale_combo_name} "
-            f"(n={len(cks)} combos)",
+            f"Feature-space transforms — 1-1 (single ref/query pair) — oracle IoU, "
+            f"group={group}, fg scales={scale_combo_name} (n={len(cks)} combos)",
             _group_path,
         )
 pd.concat(group_summary_frames, ignore_index=True).to_csv(
@@ -1036,7 +1041,8 @@ else:
             axes_flat[j].axis("off")
 
         fig.suptitle(
-            f"Feature-transform score maps — focus combo {focus_ck}, fg scales={scale_combo_name}"
+            f"Feature-transform score maps — 1-1 (single ref/query pair) — focus combo "
+            f"{focus_ck}, fg scales={scale_combo_name}"
         )
         fig.tight_layout()
         _focus_path = OUTPUT_DIR / f"focus_combo_pipeline_grid__{scale_combo_name}.png"
@@ -1159,7 +1165,7 @@ log.info(
 # for a question (which scale combo wins) this section isn't asking — see MAX_BANK_SIZE_TRANSFORM_53
 # below for the other half of keeping this section's cost bounded.
 HEADLINE_SCALE_COMBO_53 = "global+mid"
-fold_splits_53 = make_fold_role_splits(PART_TYPES_53, seed=SEED)
+fold_splits_53 = make_fold_role_splits(PART_TYPES_53)  # truly randomized, not SEED-reproducible
 iou_lookup_53 = new_iou_lookup()
 n_pooled_samples_53 = 0
 
@@ -1286,7 +1292,7 @@ ax.bar(
     width,
     yerr=comparison_53_df["std_5_3"],
     capsize=3,
-    label="5-3 (pooled, 2-fold CV)",
+    label=f"5-3 (pooled, {N_FOLDS_53}-fold CV)",
     color="#2ecc71",
 )
 ax.set_xticks(

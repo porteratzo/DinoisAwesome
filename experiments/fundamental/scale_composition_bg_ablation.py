@@ -538,8 +538,8 @@ ax.set_xlabel("foreground scale (fixed, single scale only)")
 ax.set_ylabel("oracle IoU (mean across combos)")
 ax.set_ylim(0, 1.0)
 ax.set_title(
-    f"Background-composition strategies per fixed fg scale, n={N_SCALE_STEPS} steps "
-    f"({len(usable_combo_keys)} combos)"
+    f"1-1 (single ref/query pair) — Background-composition strategies per fixed fg scale, "
+    f"n={N_SCALE_STEPS} steps ({len(usable_combo_keys)} combos)"
 )
 ax.legend(fontsize=8, loc="lower right")
 ax.grid(alpha=0.3, axis="y")
@@ -608,7 +608,10 @@ for fg_scale in SCALE_NAMES:
 
     axes[0].set_ylabel("knn_fgbg oracle IoU (mean +/- std across combos)")
     axes[0].legend(fontsize=8)
-    fig.suptitle(f"Background-composition growth curves, fg fixed at '{fg_scale}'")
+    fig.suptitle(
+        f"1-1 (single ref/query pair) — Background-composition growth curves, "
+        f"fg fixed at '{fg_scale}'"
+    )
     fig.tight_layout()
     _safe_name = fg_scale.replace("/", "-")
     fig.savefig(OUTPUT_DIR / f"bg_growth__fg_{_safe_name}.png", dpi=150, bbox_inches="tight")
@@ -699,7 +702,7 @@ log.info(
     len(instances_by_pg_53),
 )
 
-fold_splits_53 = make_fold_role_splits(PART_TYPES_53, seed=SEED)
+fold_splits_53 = make_fold_role_splits(PART_TYPES_53)  # truly randomized, not SEED-reproducible
 results_53: list[dict] = []
 n_units_53 = N_FOLDS_53 * len(PART_TYPES_53)
 

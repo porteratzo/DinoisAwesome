@@ -11,18 +11,24 @@ Storage follows the same convention as `gallery.py`: a pandas/parquet index plus
 one numpy file per cached item, under `<cache_dir>/<fingerprint digest>/`.
 
 Caveats:
-    - Cached tensors are always returned as float32, even when the wrapped
-      encoder's own `amp`/`model_dtype` would otherwise produce bfloat16/float16.
-      This is necessary because numpy has no native bfloat16 storage, and it
-      keeps cache-hit and cache-miss entries consistently stackable within the
-      same batch.
+    - Cached tensors are always stored and returned as float16, even when the
+      wrapped encoder's own `amp`/`model_dtype` would otherwise produce
+      float32/bfloat16. This is necessary because numpy has no native bfloat16
+      storage, it keeps cache-hit and cache-miss entries consistently
+      stackable within the same batch, and it roughly halves on-disk size for
+      what are inference-only similarity features (never used for training).
     - bfloat16/autocast matmuls are not guaranteed bit-exact across runs or
       hardware, so a cache hit reuses one earlier numeric realization rather
-      than guaranteeing what a fresh run would produce bit-for-bit.
+      than guaranteeing what a fresh run would produce bit-for-bit; storing at
+      float16 adds a bounded, one-time rounding on top of that, well below the
+      run-to-run numeric noise callers already tolerate.
     - Only PIL Image / (H, W, 3) numpy array inputs (single, or a list/batch of
       them) are cached per-item. A pre-processed `torch.Tensor` batch is passed
       straight through to the wrapped encoder, uncached, since `DinoEncoder` has
       no supported way to reassemble a list of raw per-item tensors.
+    - Every cache-hit touches the `.npz` file's mtime so it reads as "just
+      used" for `scripts/prune_cache.py`'s day-based eviction; a fresh miss's
+      mtime is already current from the write.
 """
 
 from __future__ import annotations
@@ -74,7 +80,10 @@ class EncoderFingerprint:
     model_dtype: str  # str(torch.dtype) or "None"
     svd_components: int
     weights_signature: str  # resolved weights path+mtime, or "hub:<model_name>"
-    schema_version: str = "1.0"
+    # "2.0": embeddings stored as float16 (was float32 under "1.0"). Bumping this
+    # gives float16 caches a fresh digest/subdirectory instead of colliding with
+    # (or being silently misread against) old float32 entries.
+    schema_version: str = "2.0"
 
     @property
     def digest(self) -> str:
@@ -223,6 +232,7 @@ class EncoderWithCache:
                 data = np.load(npz_path)
                 cls_list[i] = torch.from_numpy(data["cls"]).to(device=encoder.device)
                 patches_list[i] = torch.from_numpy(data["patches"]).to(device=encoder.device)
+                npz_path.touch()  # mark as just-used for day-based pruning
             else:
                 miss_positions.append(i)
 
@@ -240,8 +250,8 @@ class EncoderWithCache:
 
             new_rows = []
             for j, i in enumerate(miss_positions):
-                cls_i = out.cls[j].float()
-                patches_i = out.patches[j].float()
+                cls_i = out.cls[j].half()
+                patches_i = out.patches[j].half()
                 cls_list[i] = cls_i
                 patches_list[i] = patches_i
 

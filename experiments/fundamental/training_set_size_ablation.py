@@ -14,8 +14,8 @@
 #
 # This version restores the full growth curve (every step from 1 to 5 training images, not
 # just the two endpoints) while keeping the fix that mattered: **every point in the sweep uses
-# a fresh random shuffle of that part type's 8 images, 2-fold cross-validated, always against
-# 3 held-out eval images** — `N_TRAIN_SWEEP = [1, 2, 3, 4, 5]`, `N_EVAL = 3`, `N_FOLDS = 2`
+# a fresh random shuffle of that part type's 8 images, 5-fold cross-validated, always against
+# 3 held-out eval images** — `N_TRAIN_SWEEP = [1, 2, 3, 4, 5]`, `N_EVAL = 3`, `N_FOLDS = 5`
 # for every N (bounded deliberately — an exhaustive combinatorial sweep over every possible
 # image subset would multiply every downstream cost for marginal extra confidence). Holding
 # `n_eval` fixed at 3 for every N (rather than 1 eval image at N=1 like the two-endpoint
@@ -80,7 +80,7 @@ ALL_NUMBERS: list[int] = [1, 2, 3, 4, 5, 6, 7, 8]
 
 N_TRAIN_SWEEP: list[int] = [1, 2, 3, 4, 5]
 N_EVAL: int = 3
-N_FOLDS: int = 2
+N_FOLDS: int = 5
 
 # The classic 3-point baseline every sibling script defaults to — not the axis under test
 # here, so it's held fixed rather than swept (see scale_composition_oracle_iou.py for that).
@@ -104,10 +104,11 @@ METHODS: list[str] = ["single_proto", "knn_fgbg"]
 METHOD_COLOR: dict[str, str] = {"single_proto": "#7f8c8d", "knn_fgbg": "#2ecc71"}
 
 # Fold role-assignment RNG — one shared generator, advanced in a fixed (N_train, fold,
-# part_type) order, so the whole sweep is reproducible from this one seed.
+# part_type) order. Seeded from OS entropy (no fixed seed), not from SEED below: folds should
+# be genuinely randomized on every run, not the same replayed permutations forever.
 SEED = 0
 torch.manual_seed(SEED)
-fold_rng = np.random.default_rng(SEED)
+fold_rng = np.random.default_rng()
 
 OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental_abc5" / "training_set_size_ablation"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

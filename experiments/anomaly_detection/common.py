@@ -394,4 +394,12 @@ def gallery_dir(category: str, method: str) -> Path:
 
 
 def has_cache(category: str, method: str) -> bool:
-    return scores_path(category, method).exists() and anomaly_maps_path(category, method).exists()
+    """Return whether (category, method) has a complete cached result, touching
+    its files' mtimes so a hit reads as "just used" for scripts/prune_cache.py.
+    """
+    scores, maps = scores_path(category, method), anomaly_maps_path(category, method)
+    if not (scores.exists() and maps.exists()):
+        return False
+    scores.touch()
+    maps.touch()
+    return True
