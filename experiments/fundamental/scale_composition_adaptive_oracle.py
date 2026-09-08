@@ -37,7 +37,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from dotenv import load_dotenv
 from PIL import Image
 from scipy.stats import pearsonr, spearmanr
@@ -48,9 +47,14 @@ from dinoisawesome.abc3 import INSTANCE_TYPE_GROUPS, available_instance_groups
 from dinoisawesome.instance_detection import extract_patch_tokens
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _scale_composition_common import (  # noqa: E402
+    scale_step_boxes,
+    scale_step_name,
+    split_fg_bg_patches,
+)
 from _shared.abc3_combos import combo_key  # noqa: E402
 from _shared.dataset_pairs import REF_QUERY_PAIRS, RefQueryPair  # noqa: E402
-from _shared.mask_geometry import pixel_mask_to_patch_mask, scale_crop_box  # noqa: E402
+from _shared.mask_geometry import pixel_mask_to_patch_mask  # noqa: E402
 from _shared.prototype_ops import knn_score_heatmap, score_heatmap  # noqa: E402
 from _shared.thresholding import oracle_iou  # noqa: E402
 
@@ -103,64 +107,8 @@ log.info(
 # %% Scale-step naming + crop-box geometry (identical to scale_composition_oracle_iou.py)
 T_VALUES: np.ndarray = np.linspace(0.0, 1.0, N_SCALE_STEPS + 1)
 
-
-def scale_step_name(i: int, n: int) -> str:
-    if i == 0:
-        return "global"
-    if i == n:
-        return "close"
-    if n % 2 == 0 and i == n // 2:
-        return "mid"
-    return f"{i}/{n}"
-
-
 SCALE_NAMES: list[str] = [scale_step_name(i, N_SCALE_STEPS) for i in range(N_SCALE_STEPS + 1)]
 log.info("Scale steps (global -> close): %s", SCALE_NAMES)
-
-
-def scale_step_boxes(
-    pixel_mask: np.ndarray, t_values: np.ndarray, padding_frac: float
-) -> list[tuple[int, int, int, int]]:
-    H, W = pixel_mask.shape
-    close_box = scale_crop_box(pixel_mask, "close", padding_frac)
-    global_box = (0, 0, W, H)
-    return [
-        tuple(int(round(a + (b - a) * t)) for a, b in zip(global_box, close_box)) for t in t_values
-    ]
-
-
-def split_fg_bg_patches(
-    patch_tokens: torch.Tensor,
-    mask_px: np.ndarray,
-    grid_h: int,
-    grid_w: int,
-    label: str,
-    *,
-    bg_exclude_mask_px: np.ndarray | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if bg_exclude_mask_px is None:
-        bg_exclude_mask_px = mask_px
-    tokens = F.normalize(patch_tokens.reshape(grid_h * grid_w, -1), p=2, dim=-1)
-
-    fg_patch_mask = pixel_mask_to_patch_mask(
-        mask_px, grid_h, grid_w, IMG_SIZE, MASK_PATCH_THRESHOLD
-    )
-    fg_flat = torch.from_numpy(fg_patch_mask.reshape(-1)).to(tokens.device)
-    fg = tokens[fg_flat]
-    if fg.shape[0] == 0:
-        log.warning("%s: fg mask empty after patch-grid projection — using all patches", label)
-        fg = tokens
-
-    bg_exclude_patch_mask = pixel_mask_to_patch_mask(
-        bg_exclude_mask_px, grid_h, grid_w, IMG_SIZE, MASK_PATCH_THRESHOLD
-    )
-    bg_exclude_flat = torch.from_numpy(bg_exclude_patch_mask.reshape(-1)).to(tokens.device)
-    bg = tokens[~bg_exclude_flat]
-    if bg.shape[0] == 0:
-        log.warning("%s: bg mask empty after patch-grid projection — using all patches", label)
-        bg = tokens
-
-    return fg, bg
 
 
 # %% Part 1 — discover every (part_type, instance-type group, ref instance) combo
@@ -312,6 +260,8 @@ for i in tqdm(range(0, len(clean_items), chunk_size), desc="Encoding scale-step 
             grid_h,
             grid_w,
             f"{ck} scale={name}",
+            IMG_SIZE,
+            MASK_PATCH_THRESHOLD,
             bg_exclude_mask_px=bg_exclude_mask_px,
         )
         # Kept on CPU: with REF_QUERY_PAIRS spanning 16 ref/query pairs, every combo's every-scale
