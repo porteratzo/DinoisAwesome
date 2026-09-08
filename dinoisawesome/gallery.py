@@ -186,7 +186,7 @@ class Gallery:
     def build(
         cls,
         encoder: DinoEncoder,
-        images: list,
+        images: list[Image.Image | np.ndarray | str | Path],
         image_ids: list[str],
         out_dir: Path | str,
         split: str | list[str] = "train",
@@ -218,8 +218,8 @@ class Gallery:
         image_labels = image_labels or {}
         patch_labels = patch_labels or {}
 
-        patch_rows: list[dict] = []
-        cls_rows: list[dict] = []
+        patch_rows: list[dict[str, object]] = []
+        cls_rows: list[dict[str, object]] = []
         cls_arrays: list[np.ndarray] = []
 
         for start in range(0, len(images), batch_size):

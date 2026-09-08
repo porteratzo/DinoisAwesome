@@ -223,8 +223,15 @@ CMAP = plt.get_cmap("tab20")
 display_img = np.array(img.resize((IMG_SIZE, IMG_SIZE), Image.BICUBIC))
 
 
-def _labels_to_rgba_full(labels: np.ndarray) -> np.ndarray:
-    labels_2d = labels.reshape(H_GRID, W_GRID)
+def _labels_to_rgba(labels: np.ndarray, fg_mask: np.ndarray | None = None) -> np.ndarray:
+    """Colour each cluster id for overlay. `fg_mask`, if given, scatters `labels`
+    (foreground-only) into the full (H_GRID, W_GRID) grid; otherwise `labels`
+    already covers the full grid and is just reshaped."""
+    if fg_mask is None:
+        labels_2d = labels.reshape(H_GRID, W_GRID)
+    else:
+        labels_2d = np.zeros((H_GRID, W_GRID))
+        labels_2d[fg_mask] = labels
     unique_clusters = sorted(c for c in set(labels_2d.flat) if c != -1)
     rgba = np.zeros((H_GRID, W_GRID, 4), dtype=np.float32)
     for i, cid in enumerate(unique_clusters):
@@ -236,13 +243,19 @@ def _labels_to_rgba_full(labels: np.ndarray) -> np.ndarray:
     return rgba
 
 
-def _draw_result_full(ax: plt.Axes, labels: np.ndarray, title: str) -> None:
-    labels_2d = labels.reshape(H_GRID, W_GRID)
+def _draw_result(
+    ax: plt.Axes, labels: np.ndarray, title: str, fg_mask: np.ndarray | None = None
+) -> None:
+    if fg_mask is None:
+        labels_2d = labels.reshape(H_GRID, W_GRID)
+    else:
+        labels_2d = np.zeros((H_GRID, W_GRID))
+        labels_2d[fg_mask] = labels
     unique_clusters = sorted(c for c in set(labels_2d.flat) if c != -1)
     n_clusters = len(unique_clusters)
     n_noise = int((labels == -1).sum())
 
-    overlay_small = _labels_to_rgba_full(labels)
+    overlay_small = _labels_to_rgba(labels, fg_mask)
     overlay_pil = Image.fromarray((overlay_small * 255).astype(np.uint8), mode="RGBA")
     overlay_arr = np.array(overlay_pil.resize((IMG_SIZE, IMG_SIZE), Image.NEAREST)) / 255.0
 
@@ -276,7 +289,7 @@ axes[0].set_title("Original image", fontsize=11)
 axes[0].axis("off")
 
 for idx, (name, labels) in enumerate(cluster_results):
-    _draw_result_full(axes[NCOLS + idx], labels, name)
+    _draw_result(axes[NCOLS + idx], labels, name)
 
 for i in range(NCOLS + n_algos, len(axes)):
     axes[i].axis("off")
@@ -397,48 +410,6 @@ log.info("Wrote %s", OUTPUT_DIR / "cluster_summary_foreground.csv")
 fg_mask_2d = fg_result["foreground_mask_feature"]  # (H_GRID, W_GRID) bool
 
 
-def _labels_to_rgba_fg(labels: np.ndarray) -> np.ndarray:
-    labels_2d = np.zeros((H_GRID, W_GRID))
-    labels_2d[fg_mask_2d] = labels
-    unique_clusters = sorted(c for c in set(labels_2d.flat) if c != -1)
-    rgba = np.zeros((H_GRID, W_GRID, 4), dtype=np.float32)
-    for i, cid in enumerate(unique_clusters):
-        color = np.array(CMAP(i % 20), dtype=np.float32)
-        color[3] = OVERLAY_ALPHA
-        rgba[labels_2d == cid] = color
-    if -1 in labels_2d:
-        rgba[labels_2d == -1] = [0.05, 0.05, 0.05, OVERLAY_ALPHA]
-    return rgba
-
-
-def _draw_result_fg(ax: plt.Axes, labels: np.ndarray, title: str) -> None:
-    labels_2d = np.zeros((H_GRID, W_GRID))
-    labels_2d[fg_mask_2d] = labels
-    unique_clusters = sorted(c for c in set(labels_2d.flat) if c != -1)
-    n_clusters = len(unique_clusters)
-    n_noise = int((labels == -1).sum())
-
-    overlay_small = _labels_to_rgba_fg(labels)
-    overlay_pil = Image.fromarray((overlay_small * 255).astype(np.uint8), mode="RGBA")
-    overlay_arr = np.array(overlay_pil.resize((IMG_SIZE, IMG_SIZE), Image.NEAREST)) / 255.0
-
-    ax.imshow(display_img)
-    ax.imshow(overlay_arr, interpolation="nearest")
-
-    legend_handles = [
-        mpatches.Patch(color=CMAP(i % 20), label=f"cluster {cid}")
-        for i, cid in enumerate(unique_clusters)
-    ]
-    if n_noise:
-        legend_handles.append(
-            mpatches.Patch(facecolor=(0.05, 0.05, 0.05), label=f"noise ({n_noise})")
-        )
-    ax.legend(handles=legend_handles, loc="lower right", fontsize=6, framealpha=0.85)
-    suffix = f", {n_noise} noise" if n_noise else ""
-    ax.set_title(f"{title}\n{n_clusters} clusters{suffix}", fontsize=9)
-    ax.axis("off")
-
-
 NCOLS_FG = 3
 n_algos_fg = len(cluster_results_fg)
 n_algo_rows_fg = (n_algos_fg + NCOLS_FG - 1) // NCOLS_FG
@@ -452,7 +423,7 @@ axes[0].set_title("Original image", fontsize=11)
 axes[0].axis("off")
 
 for idx, (name, labels) in enumerate(cluster_results_fg):
-    _draw_result_fg(axes[NCOLS_FG + idx], labels, name)
+    _draw_result(axes[NCOLS_FG + idx], labels, name, fg_mask=fg_mask_2d)
 
 for i in range(NCOLS_FG + n_algos_fg, len(axes)):
     axes[i].axis("off")

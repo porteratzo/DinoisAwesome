@@ -7,7 +7,7 @@ import contextlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, TypeAlias
 
 import numpy as np
 import torch
@@ -18,6 +18,13 @@ from torchvision import transforms
 
 _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
+
+# A single unbatched image, a pre-processed (B, 3, H, W) tensor, or a batch of
+# unbatched images to encode together. Shared across DinoEncoder and
+# EncoderWithCache's forward()/__call__() signatures.
+ImageBatch: TypeAlias = (
+    torch.Tensor | Image.Image | np.ndarray | list[Image.Image | np.ndarray | torch.Tensor]
+)
 
 _PATCH_SIZES: dict[str, int] = {"v2": 14, "v3": 16}
 
@@ -107,7 +114,7 @@ def _resolve_device(device: str | torch.device | None) -> torch.device:
     return torch.device("cpu")
 
 
-class DinoEncoder(nn.Module):
+class DinoEncoder(nn.Module):  # type: ignore[misc]  # torch's Module stubs resolve to Any
     """Thin wrapper around a DINO ViT loaded from torch hub.
 
     Args:
@@ -226,16 +233,17 @@ class DinoEncoder(nn.Module):
             ]
         )
 
-    def _autocast_ctx(self) -> contextlib.AbstractContextManager:
+    def _autocast_ctx(self) -> contextlib.AbstractContextManager[Any]:
         """Return an autocast context manager using `self.model_dtype` when AMP is
         enabled, or a no-op. `__init__` guarantees `model_dtype` is set whenever amp=True."""
         if self.amp:
-            return torch.autocast(device_type=self.device.type, dtype=self.model_dtype)
+            ctx: contextlib.AbstractContextManager[Any] = torch.autocast(
+                device_type=self.device.type, dtype=self.model_dtype
+            )
+            return ctx
         return contextlib.nullcontext()
 
-    def _to_tensor_batch(
-        self, images: torch.Tensor | Image.Image | np.ndarray | list
-    ) -> torch.Tensor:
+    def _to_tensor_batch(self, images: ImageBatch) -> torch.Tensor:
         """Normalise varied image inputs to a ``(B, 3, H, W)`` float tensor on device.
 
         Accepts a pre-processed batch tensor, a single unbatched tensor/PIL/numpy
@@ -307,7 +315,7 @@ class DinoEncoder(nn.Module):
             self._positional_basis = self._build_positional_basis()
         return self._positional_basis
 
-    @torch.inference_mode()
+    @torch.inference_mode()  # type: ignore[untyped-decorator]  # untyped in torch's stubs
     def _build_positional_basis(self) -> torch.Tensor:
         """Estimate the positional subspace of the backbone via SVD on a blank image.
 
@@ -370,9 +378,9 @@ class DinoEncoder(nn.Module):
 
     def _split_into_chunks(
         self,
-        images: torch.Tensor | Image.Image | np.ndarray | list,
+        images: ImageBatch,
         chunk_size: int | None = None,
-    ) -> list:
+    ) -> list[Any]:
         """Split *images* into chunks of at most `chunk_size` items each.
 
         Mirrors `_to_tensor_batch`'s shape handling so slicing always happens along the
@@ -387,7 +395,7 @@ class DinoEncoder(nn.Module):
         """
         if chunk_size is None:
             chunk_size = self.max_batch_size
-        items: torch.Tensor | np.ndarray | list | tuple
+        items: torch.Tensor | np.ndarray | list[Any] | tuple[Any, ...]
         if isinstance(images, torch.Tensor):
             items = images.unsqueeze(0) if images.ndim == 3 else images
         elif isinstance(images, np.ndarray) and images.ndim == 4:
@@ -398,10 +406,10 @@ class DinoEncoder(nn.Module):
             items = [images]  # single PIL Image or (H, W, 3) ndarray
         return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
 
-    @torch.inference_mode()
+    @torch.inference_mode()  # type: ignore[untyped-decorator]  # untyped in torch's stubs
     def forward(
         self,
-        images: torch.Tensor | Image.Image | np.ndarray | list,
+        images: ImageBatch,
         layers: int | list[int] | None = None,
         debias: bool = False,
     ) -> ExtractorOutput:
@@ -437,7 +445,7 @@ class DinoEncoder(nn.Module):
 
     def _forward_single_batch(
         self,
-        images: torch.Tensor | Image.Image | np.ndarray | list,
+        images: ImageBatch,
         layers: int | list[int] | None,
         debias: bool,
     ) -> ExtractorOutput:

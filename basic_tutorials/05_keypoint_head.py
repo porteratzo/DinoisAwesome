@@ -25,8 +25,6 @@ import logging
 import tempfile
 from pathlib import Path
 
-import numpy as np
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s — %(message)s",
@@ -36,22 +34,12 @@ log = logging.getLogger(__name__)
 
 # isort: off
 from dinoisawesome import DinoEncoder, Gallery, KeypointHead  # noqa: E402
+from _common import make_disc_image_with_geometry as _make_image  # noqa: E402
 
 # isort: on
 
 # Keypoint names used throughout this tutorial
 _KP_LABELS = ["disc_centre", "disc_top", "disc_left"]
-
-
-def _make_image(h: int = 224, w: int = 224) -> np.ndarray:
-    """Synthetic uint8 RGB image: dark background with a bright green disc."""
-    img = np.full((h, w, 3), 30, dtype=np.uint8)
-    cy, cx = h // 2, w // 2
-    radius = min(h, w) // 3
-    ys, xs = np.ogrid[:h, :w]
-    disc = (ys - cy) ** 2 + (xs - cx) ** 2 <= radius**2
-    img[disc] = [50, 200, 50]
-    return img, (cx, cy, radius)  # type: ignore[return-value]
 
 
 def demo(encoder: DinoEncoder, gallery_dir: Path) -> None:

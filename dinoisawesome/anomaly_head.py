@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from ._image_utils import to_pil as _to_pil
 from .background_mask import compute_foreground_mask
 from .encoder import DinoEncoder
 from .gallery import Gallery
@@ -50,14 +51,6 @@ def _greedy_coreset(embeddings: torch.Tensor, n_samples: int) -> torch.Tensor:
         min_dists = torch.minimum(min_dists, new_dists)
         selected.append(int(min_dists.argmax().item()))
     return torch.tensor(selected, device=embeddings.device)
-
-
-def _to_pil(image: Image.Image | np.ndarray | str | Path) -> Image.Image:
-    if isinstance(image, Image.Image):
-        return image.convert("RGB")
-    if isinstance(image, np.ndarray):
-        return Image.fromarray(image).convert("RGB")
-    return Image.open(image).convert("RGB")
 
 
 class AnomalyHead:
@@ -132,7 +125,7 @@ class AnomalyHead:
     def build(
         cls,
         encoder: DinoEncoder,
-        images: list,
+        images: list[Image.Image | np.ndarray | str | Path],
         image_ids: list[str],
         gallery_dir: Path | str,
         split: str | list[str] = "train",
@@ -358,4 +351,4 @@ class AnomalyHead:
     @property
     def embed_dim(self) -> int:
         """Embedding dimension D."""
-        return self._memory_bank.shape[1]
+        return int(self._memory_bank.shape[1])

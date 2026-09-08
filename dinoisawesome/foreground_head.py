@@ -11,17 +11,10 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from ._image_utils import to_pil as _to_pil
 from .encoder import DinoEncoder
 
 logger = logging.getLogger(__name__)
-
-
-def _to_pil(image: Image.Image | np.ndarray | str | Path) -> Image.Image:
-    if isinstance(image, Image.Image):
-        return image.convert("RGB")
-    if isinstance(image, np.ndarray):
-        return Image.fromarray(image).convert("RGB")
-    return Image.open(image).convert("RGB")
 
 
 class ForegroundHead:

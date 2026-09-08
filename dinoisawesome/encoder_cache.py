@@ -40,14 +40,14 @@ import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
 
-from .encoder import _MODEL_NAMES, DinoEncoder, ExtractorOutput
+from .encoder import _MODEL_NAMES, DinoEncoder, ExtractorOutput, ImageBatch
 
 _log = logging.getLogger(__name__)
 
@@ -189,14 +189,14 @@ class EncoderWithCache:
             len(self._index),
         )
 
-    def __getattr__(self, name: str):
+    def __getattr__(self, name: str) -> Any:
         if name == "_encoder":
             raise AttributeError(name)
         return getattr(self._encoder, name)
 
     def __call__(
         self,
-        images: torch.Tensor | Image.Image | np.ndarray | list,
+        images: ImageBatch,
         layers: int | list[int] | None = None,
         debias: bool = False,
     ) -> ExtractorOutput:
@@ -204,7 +204,7 @@ class EncoderWithCache:
 
     def forward(
         self,
-        images: torch.Tensor | Image.Image | np.ndarray | list,
+        images: ImageBatch,
         layers: int | list[int] | None = None,
         debias: bool = False,
     ) -> ExtractorOutput:
@@ -212,7 +212,7 @@ class EncoderWithCache:
 
         if isinstance(images, torch.Tensor):
             _log.debug("EncoderWithCache: tensor input bypasses caching")
-            return encoder(images, layers=layers, debias=debias)
+            return cast(ExtractorOutput, encoder(images, layers=layers, debias=debias))
 
         n = layers if layers is not None else encoder.layers
         layers_key = _layers_key(n)

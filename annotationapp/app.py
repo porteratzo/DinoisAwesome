@@ -125,6 +125,18 @@ def _load_annotations(
     return metadata, masks
 
 
+def _find_annotation_idx(metadata: list[dict], class_name: str, instance_id: int) -> int | None:
+    """Index of the entry matching (class_name, instance_id) in metadata, or None."""
+    return next(
+        (
+            i
+            for i, a in enumerate(metadata)
+            if a.get("class") == class_name and a.get("instance_id") == instance_id
+        ),
+        None,
+    )
+
+
 def _save_annotations(
     image_path_str: str,
     metadata: list[dict],
@@ -357,14 +369,7 @@ def save_annotation():
     metadata, masks = _load_annotations(image_path_str)
 
     # Find existing entry for this (class, instance_id) — update in-place or append.
-    idx = next(
-        (
-            i
-            for i, a in enumerate(metadata)
-            if a.get("class") == class_name and a.get("instance_id") == instance_id
-        ),
-        None,
-    )
+    idx = _find_annotation_idx(metadata, class_name, instance_id)
 
     if idx is not None:
         metadata[idx] = annotation
@@ -401,14 +406,7 @@ def get_annotation_mask(filepath: str):
     if masks is None:
         abort(404)
 
-    idx = next(
-        (
-            i
-            for i, a in enumerate(metadata)
-            if a.get("class") == class_name and a.get("instance_id") == instance_id
-        ),
-        None,
-    )
+    idx = _find_annotation_idx(metadata, class_name, instance_id)
     if idx is None:
         abort(404)
 
@@ -429,14 +427,7 @@ def delete_annotation():
 
     metadata, masks = _load_annotations(image_path_str)
 
-    idx = next(
-        (
-            i
-            for i, a in enumerate(metadata)
-            if a.get("class") == class_name and a.get("instance_id") == instance_id
-        ),
-        None,
-    )
+    idx = _find_annotation_idx(metadata, class_name, instance_id)
     if idx is None:
         abort(404)
 

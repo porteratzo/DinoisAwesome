@@ -10,18 +10,11 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from ._image_utils import to_pil as _to_pil
 from .encoder import DinoEncoder
 from .gallery import Gallery
 
 logger = logging.getLogger(__name__)
-
-
-def _to_pil(image: Image.Image | np.ndarray | str | Path) -> Image.Image:
-    if isinstance(image, Image.Image):
-        return image.convert("RGB")
-    if isinstance(image, np.ndarray):
-        return Image.fromarray(image).convert("RGB")
-    return Image.open(image).convert("RGB")
 
 
 class KeypointHead:
@@ -175,7 +168,7 @@ class KeypointHead:
         image: Image.Image | np.ndarray | str | Path,
         labels: list[str] | None = None,
         debias: bool = False,
-    ) -> list[dict]:
+    ) -> list[dict[str, object]]:
         """Locate registered keypoints in *image* via nearest-patch cosine similarity.
 
         A single encoder forward pass is made for the query image; all requested
@@ -221,7 +214,7 @@ class KeypointHead:
             D = flat.shape[-1]
             P_perp = torch.eye(D, device=flat.device, dtype=flat.dtype) - basis @ basis.T
 
-        results: list[dict] = []
+        results: list[dict[str, object]] = []
         for lbl, ref_emb in ref_embs.items():
             ref_emb = ref_emb.to(flat.device, dtype=flat.dtype)
             if debias:

@@ -57,3 +57,9 @@ select = ["E", "F", "I", "UP"]
 [tool.mypy]
 python_version = "3.10"
 ignore_missing_imports = true
+
+# The installed package is held to mypy --strict; experiments/scripts/notebooks
+# are exploratory and not held to the same bar (see CLAUDE.md).
+[[tool.mypy.overrides]]
+module = "dinoisawesome.*"
+strict = true

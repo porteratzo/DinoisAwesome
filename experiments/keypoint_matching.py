@@ -506,7 +506,7 @@ def verify_transform(H_mat, M, src_pts, dst_pts):
     src_h = np.hstack([src_pts, np.ones((len(src_pts), 1))])  # (N, 3)
     proj = (H_mat @ src_h.T).T  # (N, 3)
     proj_pts = proj[:, :2] / proj[:, 2:3]  # dehomogenize
-    print("source pts:\n", src_pts, "\ndst pts:\n", dst_pts, "\nprojected pts:\n", proj_pts)
+    log.info("source pts:\n%s\ndst pts:\n%s\nprojected pts:\n%s", src_pts, dst_pts, proj_pts)
     persp_err = np.linalg.norm(proj_pts - dst_pts, axis=1)
 
     # Affine
@@ -515,9 +515,9 @@ def verify_transform(H_mat, M, src_pts, dst_pts):
     aff_err = np.linalg.norm(aff_pts - dst_pts, axis=1)
 
     for i, (pe, ae) in enumerate(zip(persp_err, aff_err)):
-        print(f"  pt{i}: perspective err={pe:.1f}px  affine err={ae:.1f}px")
-    print(f"  mean perspective err: {persp_err.mean():.1f}px")
-    print(f"  mean affine err:      {aff_err.mean():.1f}px")
+        log.info("  pt%d: perspective err=%.1fpx  affine err=%.1fpx", i, pe, ae)
+    log.info("  mean perspective err: %.1fpx", persp_err.mean())
+    log.info("  mean affine err:      %.1fpx", aff_err.mean())
 
 
 verify_transform(H_mat, M, src_pts, dst_pts)
