@@ -78,7 +78,7 @@ cell-based, need `data/abc3`, and save figures under
    before pooling it into a matching prototype, does scoring a different query image
    with that prototype localize the object better or worse (oracle IoU)? The biggest
    file of the three (1333 lines) — it reuses the same augmentation families as #2 and
-   the same oracle-IoU search `object_detection/multiscale_crop_ablation.py` uses.
+   the same oracle-IoU search `object_detection/multiscale_ablation/engine.py` uses.
 
 Two later additions in the same directory depart from the fixed-pair paradigm above by
 cross-validating instead (data `abc5`, save under `outputs/fundamental_abc5/<script_name>/`):
@@ -104,12 +104,16 @@ cross-validating instead (data `abc5`, save under `outputs/fundamental_abc5/<scr
   map (mean / k-means / k-NN memory bank / PCA-whitening / MLP classifier), each run
   through a full threshold → HDBSCAN clustering → IoU-match evaluation across 4
   exemplar/query pairs (`LHa`/`LHb`/`RHa`/`RHb`). Cell-based, interactive only.
-- **`multiscale_crop_ablation.py`** — the most complete script in this directory
-  (2730 lines). Builds `global`/`mid`/`close` prototypes from one instance, ablates
-  every scale combination (single- and multi-scale max-similarity) against GT IoU,
-  then runs a cross-scale similarity study (does a global prototype still score a
-  close-up crop well, and vice versa?). Mirrors and extends
-  `../../scripts/multiscale_detection.py`. Cell-based, interactive only.
+- **`multiscale_ablation/`** — the actively maintained successor to this directory's
+  original `multiscale_crop_ablation.py` notebook script (retired): a proper package
+  (`common.py` configs + cache paths, `engine.py` domain logic, `methods.py` method
+  registry, `run_experiments.py` argparse CLI + per-pair driver, `visualize_results.py`,
+  `diagnostics.py` for the one-stage DBSCAN clustering deep-dive). Builds
+  `global`/`mid`/`close` prototypes from one instance, ablates every scale combination
+  (single- and multi-scale max-similarity) against GT IoU, then runs a cross-scale
+  similarity study (does a global prototype still score a close-up crop well, and vice
+  versa?). Mirrors and extends `../../scripts/multiscale_detection.py`. Batch/CLI,
+  results cached and figures saved to disk.
 - **`eval_custom_slim.py`** — **runs differently from its siblings.** It imports
   directly from `../../scripts/eval_sam_dino.py` via `sys.path.insert(0, repo_root /
   "scripts")`, so that import only resolves if `scripts/eval_sam_dino.py` still

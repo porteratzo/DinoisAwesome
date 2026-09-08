@@ -159,14 +159,24 @@ class ScoringConfig:
     # own raw (mask_patch_threshold) fg selection and further drop the least-similar tail vs.
     # an independent appearance reference (the close crop's own [CLS] token, or a masked-mean
     # over the mask's innermost "core" pixels) — bg is untouched, a foreground-only check.
+    # "step3" pools every mid/close cluster's raw fg tokens across every pair sharing an
+    # instance-type group and runs one HDBSCAN + kNN-consensus pass over the pool (see
+    # cleaning.py) — bg is untouched here too, same as step2.
     # Only mid/close are cleaned; "global" is unaffected (see cleaning.py's module docstring).
     # A ScoringConfig field, not CropConfig: it only re-filters already-cached crop tokens, no
     # new encoder pass needed, so flipping it never invalidates the crop cache.
-    fg_clean_stage: Literal["raw", "step1", "step2_cls", "step2_center"] = "raw"
+    fg_clean_stage: Literal["raw", "step1", "step2_cls", "step2_center", "step3"] = "raw"
     fg_clean_high: float = 0.85
     fg_clean_low: float = 0.15
     fg_clean_attention_keep_fraction: float = 0.75
     fg_clean_center_core_percentile: float = 70.0
+    # step3's HDBSCAN + kNN-consensus pooling knobs, values ported unchanged from
+    # noisy_fgbg_cleaning.py's module-level HDBSCAN_MIN_CLUSTER_SIZE/HDBSCAN_MIN_SAMPLES/
+    # KNN_CONSENSUS_K/KNN_CONSENSUS_MIN_AGREEMENT constants.
+    fg_clean_step3_hdbscan_min_cluster_size: int = 8
+    fg_clean_step3_hdbscan_min_samples: int = 3
+    fg_clean_step3_knn_k: int = 10
+    fg_clean_step3_min_agreement: float = 0.6
 
     # Added to the tuned per-method pixel-selection threshold (raw > thr) before it's
     # applied — lets an ablation sweep stricter/looser thresholding without re-tuning.
@@ -249,6 +259,16 @@ def blob_cache_path(
 ) -> Path:
     safe_name = roi_source.replace("/", "-")
     return blob_cache_dir(pair, crop_cfg, scoring_cfg) / f"{safe_name}.pt"
+
+
+def group_cache_dir(instance_type: str, crop_cfg: CropConfig, scoring_cfg: ScoringConfig) -> Path:
+    d = CACHE_ROOT / "groups" / f"{crop_cfg.hash()}__{scoring_cfg.hash()}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def group_cache_path(instance_type: str, crop_cfg: CropConfig, scoring_cfg: ScoringConfig) -> Path:
+    return group_cache_dir(instance_type, crop_cfg, scoring_cfg) / f"{instance_type}.pkl"
 
 
 # ---------------------------------------------------------------------------
