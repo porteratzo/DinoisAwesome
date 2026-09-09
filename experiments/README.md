@@ -62,6 +62,51 @@ MVTec AD categories. Run stage 1 before stage 2.
   python analyze_results.py --categories bottle carpet
   ```
 
+Four ablation/analysis scripts extend this benchmark with the cross-validated-ablation
+rigor `fundamental/` established (resolution/size/layer/training-set-size sweeps, oracle
+bounds) but this harness never applied to anomaly detection specifically. Each writes to its
+own `outputs/anomaly_detection/results/<name>/` and, where it fits new normal images, its own
+synthetic-category-namespaced Gallery cache under `outputs/anomaly_detection/cache/` (e.g.
+`bottle__ts10`, `bottle__r512_small`) so it never collides with `run_experiments.py`'s own
+per-category cache.
+
+- **`layer_ablation.py`** — which DINOv3 transformer block gives the best AUROC/AUPRO, and is
+  it the same block across categories? `AnomalyHead`/`PrototypeAnomalyHead` both take a
+  `block_idx` (every method in `methods.py` hardcodes "last block" and never sweeps it). Builds
+  one Gallery per category with every block stored, so training images are encoded once
+  regardless of how many blocks are swept; query images are still re-encoded once per block per
+  test image, so keep `--limit` modest for a first pass.
+  ```bash
+  python layer_ablation.py --categories bottle carpet --limit 20
+  python layer_ablation.py --method dinov3_proto --size base --stride 2
+  ```
+- **`resolution_size_ablation.py`** — sweeps DINOv3 `img_size` x backbone `size` for
+  `anomalydino_v3`/`dinov3_proto_*` (hardcoded to 256px/small everywhere else in this
+  directory). Every point re-encodes the full train set from scratch (unlike the layer
+  ablation, there's no shared encoding to reuse across resolutions/sizes) and is wrapped in its
+  own CUDA-OOM guard; `base`/`large` and >512px are opt-in.
+  ```bash
+  python resolution_size_ablation.py --categories bottle carpet --resolutions 256 512
+  python resolution_size_ablation.py --sizes small base --methods anomalydino_v3
+  ```
+- **`train_size_ablation.py`** — learning curve of AUROC vs. normal-image count, for any
+  method in `common.ALL_METHODS` (`build_method(...).fit()` is reused unmodified). Subsamples
+  one fixed random shuffle's *prefix* per category (not an independent resample per size) so
+  smaller sizes are proper subsets of larger ones.
+  ```bash
+  python train_size_ablation.py --categories bottle carpet --limit 40
+  python train_size_ablation.py --methods patchcore anomalydino_v3 --train-sizes 5 10 25 all
+  ```
+- **`localization_analysis.py`** — reads `run_experiments.py`'s existing cache (no
+  re-fitting); adds the oracle-IoU / Otsu-IoU bounds `_shared/thresholding.py` already
+  provides but this directory never used, plus an aggregate error breakdown by defect-size and
+  -contrast tercile (image AUROC per bucket) in place of `analyze_results.py`'s 3-image
+  best/worst eyeball check. Run `run_experiments.py` first for whatever pairs you want analyzed.
+  ```bash
+  python localization_analysis.py
+  python localization_analysis.py --categories bottle carpet --methods patchcore anomalydino_v3
+  ```
+
 ## `fundamental/` — DINOv3's basic representational properties (actively maintained)
 
 A three-part progressive series, **meant to be read/run in that order** — each
