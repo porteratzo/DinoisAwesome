@@ -211,8 +211,12 @@ class _AnomalyDINOv3Method(AnomalyMethod):
 
 
 class AnomalyDINOv3Method(_AnomalyDINOv3Method):
-    def __init__(self, category: str, masking: bool = False) -> None:
-        super().__init__(category=category, smoothing=False, masking=masking)
+    def __init__(
+        self, category: str, masking: bool = False, img_size: int = 256, size: str = "small"
+    ) -> None:
+        super().__init__(
+            category=category, smoothing=False, masking=masking, img_size=img_size, size=size
+        )
 
 
 class AnomalyDINOv3SmoothMethod(_AnomalyDINOv3Method):
