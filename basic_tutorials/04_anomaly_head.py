@@ -39,18 +39,9 @@ log = logging.getLogger(__name__)
 
 # isort: off
 from dinoisawesome import AnomalyHead, DinoEncoder, Gallery  # noqa: E402
+from _common import make_disc_image as _make_normal  # noqa: E402
 
 # isort: on
-
-
-def _make_normal(h: int = 224, w: int = 224) -> np.ndarray:
-    """Synthetic 'normal' image: dark background with a bright green disc."""
-    img = np.full((h, w, 3), 30, dtype=np.uint8)
-    cy, cx = h // 2, w // 2
-    ys, xs = np.ogrid[:h, :w]
-    disc = (ys - cy) ** 2 + (xs - cx) ** 2 <= (min(h, w) // 3) ** 2
-    img[disc] = [50, 200, 50]
-    return img
 
 
 def _make_anomalous(normal: np.ndarray) -> np.ndarray:

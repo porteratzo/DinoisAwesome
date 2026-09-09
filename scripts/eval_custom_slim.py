@@ -1011,34 +1011,37 @@ def main(argv: list[str] | None = None) -> None:
     out_json.write_text(json.dumps(summary, indent=2))
     log.info("Metrics summary → %s", out_json)
 
-    # Print table to stdout.
-    print("\n── Metrics Summary ──────────────────────────────────────────────")
-    print(f"  Exemplar          : {exemplar_sample.stem}")
-    print(f"  Inference images  : {len(inference_samples)}")
-    print(f"  Total candidates  : {len(all_records)}")
+    # Log the summary table.
+    lines = [
+        "── Metrics Summary ──────────────────────────────────────────────",
+        f"  Exemplar          : {exemplar_sample.stem}",
+        f"  Inference images  : {len(inference_samples)}",
+        f"  Total candidates  : {len(all_records)}",
+    ]
     iou_vals = [r.iou_gt for r in all_records]
-    print(f"  IoU  mean/median  : {np.mean(iou_vals):.3f} / {np.median(iou_vals):.3f}")
-    print(
+    lines.append(f"  IoU  mean/median  : {np.mean(iou_vals):.3f} / {np.median(iou_vals):.3f}")
+    lines.append(
         f"  IoU > {args.iou_threshold:.2f} fraction  : "
         f"{np.mean([v >= args.iou_threshold for v in iou_vals]):.3f}"
     )
-    print()
-    print(
+    lines.append("")
+    lines.append(
         f"  {'Method':<18}  {'AP':>6}  {'AUC-ROC':>8}  {'TP':>4}  {'FP':>4}  {'FN':>4}  "
         f"{'TPR':>6}  {'Prec':>6}"
     )
-    print("  " + "-" * 68)
+    lines.append("  " + "-" * 68)
     for attr, label, _ in _METHODS:
         if label not in summary["methods"]:
             continue
         m = summary["methods"][label]
         ist = m["instance_stats_at_score_threshold"]
-        print(
+        lines.append(
             f"  {label:<18}  {m['AP']:>6.3f}  {m['AUC_ROC']:>8.3f}  "
             f"{ist['TP']:>4}  {ist['FP']:>4}  {ist['FN']:>4}  "
             f"{ist['TPR']:>6.3f}  {ist['Precision']:>6.3f}"
         )
-    print("─────────────────────────────────────────────────────────────────\n")
+    lines.append("─────────────────────────────────────────────────────────────────")
+    log.info("%s", "\n".join(lines))
 
 
 if __name__ == "__main__":

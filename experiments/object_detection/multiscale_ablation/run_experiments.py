@@ -174,12 +174,15 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--fg-clean",
-        choices=["raw", "step1", "step2_cls", "step2_center"],
+        choices=["raw", "step1", "step2_cls", "step2_center", "step3"],
         default=None,
         help=(
             "Fg/bg gallery cleaning stage, Phase 2 noise cleaning (default: "
-            f"{DEFAULT_SCORING_CONFIG.fg_clean_stage!r}, i.e. off) — see cleaning.py. Cheap "
-            "to flip: reuses the existing crop cache, no new encoder pass."
+            f"{DEFAULT_SCORING_CONFIG.fg_clean_stage!r}, i.e. off) — see cleaning.py. "
+            "step1/step2_cls/step2_center are cheap to flip (reuse the existing crop cache, no "
+            "new encoder pass); step3 (HDBSCAN + kNN consensus, pooled across every pair "
+            "sharing an instance-type group) also reuses the crop cache but needs its own "
+            "cross-pair pass, cached separately under cache/groups/."
         ),
     )
     parser.add_argument(
@@ -511,7 +514,7 @@ def run_pair(
     # run. Everything downstream (pair_meta, method states, ref-crop tuning, two-stage) reads
     # the cleaned scale_protos uniformly; patch_mask/exclude_patch_mask (the true GT extent)
     # are untouched by cleaning, so pair_meta's cluster_boxes are unaffected either way.
-    scale_protos = apply_fg_cleaning(scale_protos, crop_cfg, scoring_cfg)
+    scale_protos = apply_fg_cleaning(pair, scale_protos, crop_cfg, scoring_cfg, encoder, force)
 
     pair_meta = _compute_pair_meta(
         pair, crop_cfg, scoring_cfg, scale_protos, q_h, q_w, ref_pixel_mask, q_pixel_mask

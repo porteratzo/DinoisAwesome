@@ -1,15 +1,19 @@
-"""Foreground/background gallery cleaning (Phase 2): mixed-patch rejection ("step1") and an
-independent-appearance attention check ("step2"), ported from ``experiments/fundamental/
-noisy_fgbg_cleaning.py`` (see that file's module docstring for the full ablation and its
-rationale) into a form that plugs into ``engine.build_all_scale_prototypes``'s output, gated
-by ``ScoringConfig.fg_clean_stage``.
+"""Foreground/background gallery cleaning (Phase 2): mixed-patch rejection ("step1"), an
+independent-appearance attention check ("step2"), and cross-pair HDBSCAN + kNN-consensus
+voting ("step3"), ported from ``experiments/fundamental/noisy_fgbg_cleaning.py`` (see that
+file's module docstring for the full ablation and its rationale) into a form that plugs into
+``engine.build_all_scale_prototypes``'s output, gated by ``ScoringConfig.fg_clean_stage``.
+"step3" pools every mid/close cluster's raw foreground tokens across every ``PairKey`` sharing
+an instance-type group (e.g. every part type annotated with "donut foam"), runs one HDBSCAN +
+kNN-consensus pass over that pool (see :func:`hdbscan_knn_consensus_keep`), and caches the
+resulting per-cluster keep-masks under ``group_cache_path`` so every pair in the group reuses
+the same pass instead of recomputing it once per pair.
 
 Only mid/close scales are cleaned — "global"'s foreground gallery already spans the whole
 image, so boundary patches are a tiny fraction of its fg pool; the noise-cleaning problem
-``noisy_fgbg_cleaning.py`` targets is specific to the tight mid/close crops. ``step3``
-(HDBSCAN + kNN consensus, pooled across every part type sharing an instance-type group) isn't
-ported here — it needs cross-pair pooling that doesn't fit this pipeline's per-pair cache
-model; it's deferred pending a separate design pass.
+``noisy_fgbg_cleaning.py`` targets is specific to the tight mid/close crops. This applies to
+"step3" too: unlike the original (which pooled global + mid + close together), this port pools
+only mid/close, for the same reason.
 
 ``ClusterCrop.patch_mask``/``exclude_patch_mask`` (the true GT extent, used elsewhere for
 visualisation and GT diagnostics) are never modified — cleaning only ever produces
@@ -24,15 +28,20 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import pickle
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from common import CropConfig, ScoringConfig
+from common import CropConfig, PairKey, ScoringConfig, all_pairs, group_cache_path
 from engine import ClusterCrop, ScalePrototype
 from scipy import ndimage
+from sklearn.cluster import HDBSCAN
+from tqdm import tqdm
+
+from dinoisawesome import DinoEncoder
 
 # Self-sufficient rather than relying on import order elsewhere having already patched
 # sys.path (see bg_enrichment.py's identical comment) — cheap insurance either way, since
@@ -161,13 +170,181 @@ def _masked_mean_select(tokens: torch.Tensor, select: np.ndarray) -> torch.Tenso
     return F.normalize(sel.mean(dim=0, keepdim=True), p=2, dim=-1)
 
 
+# ---------------------------------------------------------------------------
+# Step 3 — HDBSCAN + kNN consensus voting, pooled across every pair sharing an
+# instance-type group
+# ---------------------------------------------------------------------------
+
+
+def hdbscan_knn_consensus_keep(
+    tokens: np.ndarray,
+    min_cluster_size: int,
+    min_samples: int,
+    knn_k: int,
+    min_agreement: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """HDBSCAN-cluster *tokens* (N, C), L2-normalised, then keep a point only if (a) HDBSCAN
+    placed it in a real cluster (label != -1) and (b) a majority (>= min_agreement) of its
+    knn_k nearest neighbours in this same set share that label — HDBSCAN's own noise flag
+    catches sparse outliers, the kNN vote catches points HDBSCAN happened to assign to a
+    cluster despite sitting on that cluster's own ragged boundary. Tokens are L2-normalised,
+    so plain Euclidean distance (HDBSCAN's default metric) is already a monotonic transform
+    of cosine similarity, hence no custom metric is needed for either step.
+
+    Returns (keep, hdbscan_labels). Too few points to cluster meaningfully (fewer than
+    max(min_cluster_size, knn_k + 1)) short-circuits to "keep everything" — there isn't
+    enough data for HDBSCAN's density estimate to mean anything.
+    """
+    n = tokens.shape[0]
+    if n < max(min_cluster_size, knn_k + 1):
+        return np.ones(n, dtype=bool), np.zeros(n, dtype=int)
+    labels = HDBSCAN(min_cluster_size=min_cluster_size, min_samples=min_samples).fit_predict(tokens)
+    sims = tokens @ tokens.T
+    np.fill_diagonal(sims, -np.inf)
+    k = min(knn_k, n - 1)
+    knn_idx = np.argpartition(-sims, kth=k - 1, axis=1)[:, :k]
+    keep = np.zeros(n, dtype=bool)
+    for i in range(n):
+        if labels[i] == -1:
+            continue
+        agreement = float(np.mean(labels[knn_idx[i]] == labels[i]))
+        keep[i] = agreement >= min_agreement
+    return keep, labels
+
+
+def _build_group_step3_masks(
+    instance_type: str,
+    crop_cfg: CropConfig,
+    scoring_cfg: ScoringConfig,
+    encoder: DinoEncoder,
+    force: bool,
+) -> dict[tuple[str, str, int], np.ndarray]:
+    """Pools every mid/close ``ClusterCrop``'s *raw* foreground tokens across every ``PairKey``
+    sharing *instance_type* (abc3's instance-type groups aren't per-part-type — see
+    ``common.all_pairs``/``dinoisawesome.abc3.INSTANCE_TYPE_GROUPS``), runs one
+    :func:`hdbscan_knn_consensus_keep` pass over the pool, and returns each surviving/rejected
+    cluster's own ``fg_select_mask`` keyed by ``(pair.slug, scale, cluster_idx)``.
+
+    Cached under ``group_cache_path`` (keyed by instance_type/crop_cfg/scoring_cfg) so every
+    pair in the group reuses the same pass rather than recomputing it once per pair.
+    """
+    cache_path = group_cache_path(instance_type, crop_cfg, scoring_cfg)
+    if cache_path.exists() and not force:
+        cache_path.touch()  # mark as just-used for scripts/prune_cache.py
+        return pickle.loads(cache_path.read_bytes())
+
+    # Local import to avoid a circular import: cleaning.py is imported by run_experiments.py
+    # (`from cleaning import apply_fg_cleaning`), so a top-level `from run_experiments import
+    # ...` here would fail at module load time. By the time this function is actually called,
+    # run_experiments is already fully imported, so the import resolves fine.
+    from run_experiments import _get_or_build_crop_cache, _load_pair_images_and_masks
+
+    group_pairs = [p for p in all_pairs() if p.instance_type == instance_type]
+
+    chunks: list[torch.Tensor] = []
+    # (pair_slug, scale, cluster_idx, idx, start, end) — idx is the flat-index array the
+    # segment's tokens were gathered from (np.flatnonzero(c.patch_mask.reshape(-1))), needed to
+    # scatter the kept subset back onto that cluster's own (grid_h, grid_w) grid.
+    segments: list[tuple[str, str, int, np.ndarray, int, int]] = []
+    shapes: dict[tuple[str, str, int], tuple[int, int]] = {}
+    pooled_pair_slugs: set[str] = set()
+    offset = 0
+
+    for pair in tqdm(group_pairs, desc=f"step3 pool[{instance_type}]"):
+        ref_img, query_img, ref_instance_masks, _ref_pixel_mask, _q_pixel_mask, _q_inst_masks = (
+            _load_pair_images_and_masks(pair)
+        )
+        if not ref_instance_masks:
+            log.warning("[%s] no exemplar instances — skipping in step3 group pool", pair.slug)
+            continue
+        # Reuses the same per-pair crop cache run_pair itself builds/reads (keyed only on
+        # pair/crop_cfg) — pooling a pair whose own run already populated it costs nothing extra.
+        crop_cache = _get_or_build_crop_cache(
+            pair, crop_cfg, encoder, ref_img, query_img, ref_instance_masks, force
+        )
+        scale_protos: dict[str, ScalePrototype] = crop_cache["scale_protos"]
+        for scale in ("mid", "close"):
+            proto = scale_protos.get(scale)
+            if proto is None or proto.cluster_crops is None:
+                continue
+            for c in proto.cluster_crops:
+                if c is None:
+                    continue
+                shapes[(pair.slug, scale, c.cluster_idx)] = (c.grid_h, c.grid_w)
+                idx = np.flatnonzero(c.patch_mask.reshape(-1))
+                if idx.size == 0:
+                    continue
+                fg_tokens = c.tokens[torch.from_numpy(idx).to(c.tokens.device)]
+                chunks.append(fg_tokens)
+                segments.append((pair.slug, scale, c.cluster_idx, idx, offset, offset + idx.size))
+                pooled_pair_slugs.add(pair.slug)
+                offset += idx.size
+
+    fg_masks: dict[tuple[str, str, int], np.ndarray] = {}
+    if not chunks:
+        cache_path.write_bytes(pickle.dumps(fg_masks))
+        log.info(
+            "[group=%s] step3 pool: 0 pairs, 0 clusters, 0 tokens -> cache written: %s",
+            instance_type,
+            cache_path,
+        )
+        return fg_masks
+
+    pooled = torch.cat(chunks, dim=0)
+    keep, _labels = hdbscan_knn_consensus_keep(
+        pooled.cpu().numpy(),
+        scoring_cfg.fg_clean_step3_hdbscan_min_cluster_size,
+        scoring_cfg.fg_clean_step3_hdbscan_min_samples,
+        scoring_cfg.fg_clean_step3_knn_k,
+        scoring_cfg.fg_clean_step3_min_agreement,
+    )
+
+    for pair_slug, scale, cluster_idx, idx, start, end in segments:
+        key = (pair_slug, scale, cluster_idx)
+        grid_h, grid_w = shapes[key]
+        local_keep = keep[start:end]
+        fg_select_mask = np.zeros((grid_h, grid_w), dtype=bool)
+        fg_select_mask.flat[idx[local_keep]] = True
+        if not fg_select_mask.any():
+            log.warning(
+                "%s scale=%s cluster=%d stage=step3: HDBSCAN + kNN consensus rejected every "
+                "patch — falling back to raw fg",
+                pair_slug,
+                scale,
+                cluster_idx,
+            )
+            fg_select_mask = np.zeros((grid_h, grid_w), dtype=bool)
+            fg_select_mask.flat[idx] = True
+        fg_masks[key] = fg_select_mask
+
+    cache_path.write_bytes(pickle.dumps(fg_masks))
+    log.info(
+        "[group=%s] step3 pool: %d pairs, %d clusters, %d tokens -> cache written: %s",
+        instance_type,
+        len(pooled_pair_slugs),
+        len(segments),
+        offset,
+        cache_path,
+    )
+    return fg_masks
+
+
 def apply_fg_cleaning(
-    scale_protos: dict[str, ScalePrototype], crop_cfg: CropConfig, scoring_cfg: ScoringConfig
+    pair: PairKey,
+    scale_protos: dict[str, ScalePrototype],
+    crop_cfg: CropConfig,
+    scoring_cfg: ScoringConfig,
+    encoder: DinoEncoder,
+    force: bool = False,
 ) -> dict[str, ScalePrototype]:
     """Rebuild each mid/close scale's fg/bg gallery selection per
     ``scoring_cfg.fg_clean_stage``. Identity (returns *scale_protos* unchanged, no cost) when
     the stage is "raw" — the default. "global" is never cleaned (see this module's
     docstring).
+
+    ``pair``/``encoder``/``force`` are only used by the "step3" branch (to pool raw fg tokens
+    across every pair sharing ``pair.instance_type`` — see :func:`_build_group_step3_masks`);
+    every other stage ignores them, so a plain run's cost is unaffected.
 
     Recomputes ``mean_prototype``/``bg_prototype`` from the cleaned selection, folding in any
     ``extra_bg_crops`` (Phase 1 background enrichment) unchanged so the two techniques compose
@@ -183,6 +360,12 @@ def apply_fg_cleaning(
             if c.cls is not None:
                 close_cls_by_cluster[c.cluster_idx] = c.cls
 
+    group_masks: dict[tuple[str, str, int], np.ndarray] | None = None
+    if scoring_cfg.fg_clean_stage == "step3":
+        group_masks = _build_group_step3_masks(
+            pair.instance_type, crop_cfg, scoring_cfg, encoder, force
+        )
+
     new_protos: dict[str, ScalePrototype] = dict(scale_protos)
     for scale in ("mid", "close"):
         proto = scale_protos.get(scale)
@@ -190,9 +373,27 @@ def apply_fg_cleaning(
             continue
         new_clusters = []
         for c in proto.cluster_crops:
-            fg_sel, bg_sel = _clean_cluster_masks(
-                c, crop_cfg, scoring_cfg, close_cls_by_cluster.get(c.cluster_idx)
-            )
+            if group_masks is not None:
+                key = (pair.slug, scale, c.cluster_idx)
+                fg_sel = group_masks.get(key)
+                if fg_sel is None:
+                    # Shouldn't happen — every mid/close cluster crop this pair builds should
+                    # have been pooled by _build_group_step3_masks too. Cheap insurance in case
+                    # the group cache was built under a different pair count (e.g. --limit-pairs
+                    # / --part-types narrowed one run but not the other).
+                    log.warning(
+                        "%s scale=%s cluster=%d stage=step3: missing from group pool — "
+                        "falling back to raw fg",
+                        pair.slug,
+                        scale,
+                        c.cluster_idx,
+                    )
+                    fg_sel = c.patch_mask
+                bg_sel = ~c.exclude_patch_mask
+            else:
+                fg_sel, bg_sel = _clean_cluster_masks(
+                    c, crop_cfg, scoring_cfg, close_cls_by_cluster.get(c.cluster_idx)
+                )
             new_clusters.append(
                 dataclasses.replace(c, fg_select_mask=fg_sel, bg_select_mask=bg_sel)
             )

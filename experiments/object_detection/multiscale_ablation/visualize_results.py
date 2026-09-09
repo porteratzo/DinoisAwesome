@@ -145,7 +145,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--fg-clean",
-        choices=["raw", "step1", "step2_cls", "step2_center"],
+        choices=["raw", "step1", "step2_cls", "step2_center", "step3"],
         default=None,
         help=(
             "Match a run_experiments.py run made with --fg-clean (default: "

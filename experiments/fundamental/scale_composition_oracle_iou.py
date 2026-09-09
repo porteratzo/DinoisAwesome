@@ -57,7 +57,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from dotenv import load_dotenv
 from PIL import Image
 from tqdm import tqdm
@@ -67,6 +66,12 @@ from dinoisawesome.abc3 import INSTANCE_TYPE_GROUPS, available_instance_groups
 from dinoisawesome.instance_detection import extract_patch_tokens
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _scale_composition_common import (  # noqa: E402
+    build_composition_combos,
+    scale_step_boxes,
+    scale_step_name,
+    split_fg_bg_patches,
+)
 from _shared.abc3_combos import combo_key  # noqa: E402
 from _shared.dataset_pairs import REF_QUERY_PAIRS, RefQueryPair  # noqa: E402
 from _shared.mask_geometry import pixel_mask_to_patch_mask, scale_crop_box  # noqa: E402
@@ -136,41 +141,11 @@ log.info(
 # %% Scale-step naming + crop-box geometry
 T_VALUES: np.ndarray = np.linspace(0.0, 1.0, N_SCALE_STEPS + 1)
 
-
-def scale_step_name(i: int, n: int) -> str:
-    """t=0 -> "global", t=1 -> "close", the exact halfway point -> "mid" (matches today's
-    naming when n is even), everything else -> its own fraction, e.g. "2/6"."""
-    if i == 0:
-        return "global"
-    if i == n:
-        return "close"
-    if n % 2 == 0 and i == n // 2:
-        return "mid"
-    return f"{i}/{n}"
-
-
 SCALE_NAMES: list[str] = [scale_step_name(i, N_SCALE_STEPS) for i in range(N_SCALE_STEPS + 1)]
 SCALE_COLOR: dict[str, str] = {
     name: plt.get_cmap("viridis")(t) for name, t in zip(SCALE_NAMES, T_VALUES)
 }
 log.info("Scale steps (global -> close): %s", SCALE_NAMES)
-
-
-def scale_step_boxes(
-    pixel_mask: np.ndarray, t_values: np.ndarray, padding_frac: float
-) -> list[tuple[int, int, int, int]]:
-    """PIL-style crop boxes linearly interpolated from the whole image (t=0) to `close`'s own
-    tight, padded bbox (t=1) — same interpolation scale_crop_similarity.py's own
-    `scale_crop_boxes` uses, generalizing `scale_crop_box`'s fixed global/mid/close named
-    points to arbitrary t. Boxes shrink monotonically as t grows, so `close` (t=1, the
-    smallest) meeting MIN_CROP_SIZE guarantees every other t does too."""
-    H, W = pixel_mask.shape
-    close_box = scale_crop_box(pixel_mask, "close", padding_frac)
-    global_box = (0, 0, W, H)
-    return [
-        tuple(int(round(a + (b - a) * t)) for a, b in zip(global_box, close_box)) for t in t_values
-    ]
-
 
 # %% Composition combo table — not the full power set (see module docstring), but more than
 # just the two open-ended growth sweeps: also the classic 3-point `global+mid+close` baseline
@@ -179,40 +154,9 @@ def scale_step_boxes(
 # "anchored_inward" adds middle scales moving away from global (mirrors PREFIX_NAMES but never
 # drops `close`), "anchored_outward" adds them moving away from close (mirrors SUFFIX_NAMES but
 # never drops `global`). ~4n+3 combos instead of 2^(n+1) - 1.
-COMPOSITION_COMBOS: dict[str, list[str]] = {}
-for _name in SCALE_NAMES:
-    COMPOSITION_COMBOS[_name] = [_name]  # every single scale, on its own
-PREFIX_NAMES: list[str] = []
-for _i in range(2, len(SCALE_NAMES) + 1):
-    _members = SCALE_NAMES[:_i]
-    _key = "+".join(_members)
-    COMPOSITION_COMBOS[_key] = _members
-    PREFIX_NAMES.append(_key)
-SUFFIX_NAMES: list[str] = []
-for _i in range(2, len(SCALE_NAMES) + 1):
-    _members = SCALE_NAMES[-_i:]
-    _key = "+".join(_members)
-    if _key not in COMPOSITION_COMBOS:  # i == len(SCALE_NAMES) duplicates the full prefix
-        COMPOSITION_COMBOS[_key] = _members
-    SUFFIX_NAMES.append(_key)
-
-if "mid" in SCALE_NAMES:
-    COMPOSITION_COMBOS["global+mid+close"] = ["global", "mid", "close"]
-
-_MIDDLE_NAMES = SCALE_NAMES[1:-1]  # every scale strictly between global and close
-ANCHORED_INWARD_NAMES: list[str] = []
-for _i in range(0, len(_MIDDLE_NAMES) + 1):
-    _members = ["global", *_MIDDLE_NAMES[:_i], "close"]
-    _key = "+".join(_members)
-    COMPOSITION_COMBOS[_key] = _members  # i=0 -> "global+close"; i=len(_MIDDLE_NAMES) -> full set
-    ANCHORED_INWARD_NAMES.append(_key)
-ANCHORED_OUTWARD_NAMES: list[str] = []
-for _i in range(0, len(_MIDDLE_NAMES) + 1):
-    _members = ["global", *_MIDDLE_NAMES[len(_MIDDLE_NAMES) - _i :], "close"]
-    _key = "+".join(_members)
-    if _key not in COMPOSITION_COMBOS:  # i=0 and i=len(_MIDDLE_NAMES) duplicate inward's ends
-        COMPOSITION_COMBOS[_key] = _members
-    ANCHORED_OUTWARD_NAMES.append(_key)
+COMPOSITION_COMBOS, PREFIX_NAMES, SUFFIX_NAMES, ANCHORED_INWARD_NAMES, ANCHORED_OUTWARD_NAMES = (
+    build_composition_combos(SCALE_NAMES)
+)
 
 log.info(
     "Composition combos: %d single-scale + %d prefix-from-global + %d suffix-from-close + "
@@ -224,45 +168,6 @@ log.info(
     len(ANCHORED_OUTWARD_NAMES),
     len(COMPOSITION_COMBOS),
 )
-
-# %% Helper: split one crop's patch tokens into (fg, bg), L2-normalised. Identical in spirit to
-# every sibling script's local `split_fg_bg_patches` — kept self-contained per-file rather than
-# shared, matching this directory's existing convention.
-
-
-def split_fg_bg_patches(
-    patch_tokens: torch.Tensor,
-    mask_px: np.ndarray,
-    grid_h: int,
-    grid_w: int,
-    label: str,
-    *,
-    bg_exclude_mask_px: np.ndarray | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if bg_exclude_mask_px is None:
-        bg_exclude_mask_px = mask_px
-    tokens = F.normalize(patch_tokens.reshape(grid_h * grid_w, -1), p=2, dim=-1)
-
-    fg_patch_mask = pixel_mask_to_patch_mask(
-        mask_px, grid_h, grid_w, IMG_SIZE, MASK_PATCH_THRESHOLD
-    )
-    fg_flat = torch.from_numpy(fg_patch_mask.reshape(-1)).to(tokens.device)
-    fg = tokens[fg_flat]
-    if fg.shape[0] == 0:
-        log.warning("%s: fg mask empty after patch-grid projection — using all patches", label)
-        fg = tokens
-
-    bg_exclude_patch_mask = pixel_mask_to_patch_mask(
-        bg_exclude_mask_px, grid_h, grid_w, IMG_SIZE, MASK_PATCH_THRESHOLD
-    )
-    bg_exclude_flat = torch.from_numpy(bg_exclude_patch_mask.reshape(-1)).to(tokens.device)
-    bg = tokens[~bg_exclude_flat]
-    if bg.shape[0] == 0:
-        log.warning("%s: bg mask empty after patch-grid projection — using all patches", label)
-        bg = tokens
-
-    return fg, bg
-
 
 # %% Part 1 — discover every (part_type, instance-type group, ref instance) combo
 combos: list[dict] = []
@@ -408,6 +313,8 @@ for i in tqdm(range(0, len(clean_items), chunk_size), desc="Encoding scale-step 
             grid_h,
             grid_w,
             f"{ck} scale={name}",
+            IMG_SIZE,
+            MASK_PATCH_THRESHOLD,
             bg_exclude_mask_px=bg_exclude_mask_px,
         )
         # Kept on CPU: with REF_QUERY_PAIRS spanning 16 ref/query pairs, every combo's every-scale
@@ -818,6 +725,8 @@ for i in tqdm(range(0, len(clean_items_53), chunk_size), desc="5-3: encoding cro
             grid_h,
             grid_w,
             f"5-3 inst{idx} scale={scale}",
+            IMG_SIZE,
+            MASK_PATCH_THRESHOLD,
             bg_exclude_mask_px=bg_exclude_mask_px,
         )
         fg_by_inst_scale_53[(idx, scale)] = fg.cpu()

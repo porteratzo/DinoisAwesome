@@ -42,7 +42,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from dotenv import load_dotenv
 from PIL import Image
 from tqdm import tqdm
@@ -52,6 +51,12 @@ from dinoisawesome.abc3 import INSTANCE_TYPE_GROUPS, available_instance_groups
 from dinoisawesome.instance_detection import extract_patch_tokens
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _scale_composition_common import (  # noqa: E402
+    build_composition_combos,
+    scale_step_boxes,
+    scale_step_name,
+    split_fg_bg_patches,
+)
 from _shared.abc3_combos import combo_key  # noqa: E402
 from _shared.dataset_pairs import REF_QUERY_PAIRS, RefQueryPair  # noqa: E402
 from _shared.mask_geometry import pixel_mask_to_patch_mask, scale_crop_box  # noqa: E402
@@ -115,105 +120,19 @@ log.info(
 # %% Scale-step naming + crop-box geometry (identical to scale_composition_oracle_iou.py)
 T_VALUES: np.ndarray = np.linspace(0.0, 1.0, N_SCALE_STEPS + 1)
 
-
-def scale_step_name(i: int, n: int) -> str:
-    if i == 0:
-        return "global"
-    if i == n:
-        return "close"
-    if n % 2 == 0 and i == n // 2:
-        return "mid"
-    return f"{i}/{n}"
-
-
 SCALE_NAMES: list[str] = [scale_step_name(i, N_SCALE_STEPS) for i in range(N_SCALE_STEPS + 1)]
 log.info("Scale steps (global -> close): %s", SCALE_NAMES)
-
-
-def scale_step_boxes(
-    pixel_mask: np.ndarray, t_values: np.ndarray, padding_frac: float
-) -> list[tuple[int, int, int, int]]:
-    H, W = pixel_mask.shape
-    close_box = scale_crop_box(pixel_mask, "close", padding_frac)
-    global_box = (0, 0, W, H)
-    return [
-        tuple(int(round(a + (b - a) * t)) for a, b in zip(global_box, close_box)) for t in t_values
-    ]
-
 
 # %% Composition combo table — identical construction to scale_composition_oracle_iou.py's
 # COMPOSITION_COMBOS (single scale, prefix-from-global, suffix-from-close, classic 3-point,
 # anchored-inward/outward). Reused verbatim (not imported — every fundamental script here is
 # self-contained), scored below under both pooling modes.
-COMPOSITION_COMBOS: dict[str, list[str]] = {}
-for _name in SCALE_NAMES:
-    COMPOSITION_COMBOS[_name] = [_name]
-PREFIX_NAMES: list[str] = []
-for _i in range(2, len(SCALE_NAMES) + 1):
-    _members = SCALE_NAMES[:_i]
-    _key = "+".join(_members)
-    COMPOSITION_COMBOS[_key] = _members
-    PREFIX_NAMES.append(_key)
-SUFFIX_NAMES: list[str] = []
-for _i in range(2, len(SCALE_NAMES) + 1):
-    _members = SCALE_NAMES[-_i:]
-    _key = "+".join(_members)
-    if _key not in COMPOSITION_COMBOS:
-        COMPOSITION_COMBOS[_key] = _members
-    SUFFIX_NAMES.append(_key)
-if "mid" in SCALE_NAMES:
-    COMPOSITION_COMBOS["global+mid+close"] = ["global", "mid", "close"]
-_MIDDLE_NAMES = SCALE_NAMES[1:-1]
-ANCHORED_INWARD_NAMES: list[str] = []
-for _i in range(0, len(_MIDDLE_NAMES) + 1):
-    _members = ["global", *_MIDDLE_NAMES[:_i], "close"]
-    _key = "+".join(_members)
-    COMPOSITION_COMBOS[_key] = _members
-    ANCHORED_INWARD_NAMES.append(_key)
-ANCHORED_OUTWARD_NAMES: list[str] = []
-for _i in range(0, len(_MIDDLE_NAMES) + 1):
-    _members = ["global", *_MIDDLE_NAMES[len(_MIDDLE_NAMES) - _i :], "close"]
-    _key = "+".join(_members)
-    if _key not in COMPOSITION_COMBOS:
-        COMPOSITION_COMBOS[_key] = _members
-    ANCHORED_OUTWARD_NAMES.append(_key)
+COMPOSITION_COMBOS, PREFIX_NAMES, SUFFIX_NAMES, ANCHORED_INWARD_NAMES, ANCHORED_OUTWARD_NAMES = (
+    build_composition_combos(SCALE_NAMES)
+)
 log.info(
     "Composition combos: %d unique (single/prefix/suffix/classic/anchored)", len(COMPOSITION_COMBOS)
 )
-
-
-def split_fg_bg_patches(
-    patch_tokens: torch.Tensor,
-    mask_px: np.ndarray,
-    grid_h: int,
-    grid_w: int,
-    label: str,
-    *,
-    bg_exclude_mask_px: np.ndarray | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if bg_exclude_mask_px is None:
-        bg_exclude_mask_px = mask_px
-    tokens = F.normalize(patch_tokens.reshape(grid_h * grid_w, -1), p=2, dim=-1)
-
-    fg_patch_mask = pixel_mask_to_patch_mask(
-        mask_px, grid_h, grid_w, IMG_SIZE, MASK_PATCH_THRESHOLD
-    )
-    fg_flat = torch.from_numpy(fg_patch_mask.reshape(-1)).to(tokens.device)
-    fg = tokens[fg_flat]
-    if fg.shape[0] == 0:
-        log.warning("%s: fg mask empty after patch-grid projection — using all patches", label)
-        fg = tokens
-
-    bg_exclude_patch_mask = pixel_mask_to_patch_mask(
-        bg_exclude_mask_px, grid_h, grid_w, IMG_SIZE, MASK_PATCH_THRESHOLD
-    )
-    bg_exclude_flat = torch.from_numpy(bg_exclude_patch_mask.reshape(-1)).to(tokens.device)
-    bg = tokens[~bg_exclude_flat]
-    if bg.shape[0] == 0:
-        log.warning("%s: bg mask empty after patch-grid projection — using all patches", label)
-        bg = tokens
-
-    return fg, bg
 
 
 # %% Part 1 — discover every (part_type, instance-type group, ref instance) combo
@@ -357,6 +276,8 @@ for i in tqdm(range(0, len(clean_items), chunk_size), desc="Encoding scale-step 
             grid_h,
             grid_w,
             f"{ck} scale={name}",
+            IMG_SIZE,
+            MASK_PATCH_THRESHOLD,
             bg_exclude_mask_px=bg_exclude_mask_px,
         )
         # Kept on CPU: with REF_QUERY_PAIRS spanning 16 ref/query pairs, every combo's every-scale
@@ -626,6 +547,8 @@ for i in tqdm(range(0, len(clean_items_53), chunk_size), desc="5-3: encoding cro
             grid_h,
             grid_w,
             f"5-3 inst{idx} scale={scale}",
+            IMG_SIZE,
+            MASK_PATCH_THRESHOLD,
             bg_exclude_mask_px=bg_exclude_mask_px,
         )
         fg_by_inst_scale_53[(idx, scale)] = fg.cpu()
