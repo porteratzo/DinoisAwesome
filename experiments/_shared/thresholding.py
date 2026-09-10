@@ -47,6 +47,28 @@ def oracle_iou(raw: np.ndarray, gt_mask: np.ndarray, steps: int) -> float:
     return float(ious.max())
 
 
+def achievable_iou(
+    ref_raw: np.ndarray,
+    ref_gt_mask: np.ndarray,
+    query_raw: np.ndarray,
+    query_gt_mask: np.ndarray,
+    steps: int,
+) -> float:
+    """Realistic (non-oracle) IoU: tune a threshold on *ref_raw*/*ref_gt_mask* only —
+    e.g. one of the gallery's own pooled training images, never the query — then apply
+    that fixed threshold to *query_raw* and score against *query_gt_mask*.
+
+    Unlike `oracle_iou`, this never looks at the query's own GT to pick a threshold: the
+    threshold is fit once on the reference and transferred as-is, mirroring the
+    ref-image-tunes-threshold convention `object_detection/multiscale_ablation` already
+    uses for its own pipeline (`iou_tuned_threshold(ref_raw, ref_gt_mask, ...)` there).
+    `oracle_iou` on the same query is always >= this value — the gap between the two is
+    the cost of not being able to see the query's own GT at deployment time.
+    """
+    thr = iou_tuned_threshold(ref_raw, ref_gt_mask, steps)
+    return mask_iou(query_raw > thr, query_gt_mask)
+
+
 def roi_binary_mask(
     raw: np.ndarray, method: str, single_threshold: float, percentile: float | None = None
 ) -> np.ndarray:

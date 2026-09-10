@@ -110,6 +110,7 @@ import torch
 import torch.nn.functional as F
 from dotenv import load_dotenv
 from PIL import Image
+from scipy.stats import pearsonr, spearmanr
 from tqdm import tqdm
 
 from dinoisawesome import DinoEncoder, EncoderWithCache, compute_exemplar_features, load_annotations
@@ -129,6 +130,7 @@ from _shared.augmentations import (  # noqa: E402
     pixel_only,
 )
 from _shared.dataset_pairs import REF_QUERY_PAIRS, RefQueryPair  # noqa: E402
+from _shared.latency import cuda_timer, images_per_sec  # noqa: E402
 from _shared.mask_geometry import pixel_mask_to_patch_mask, scale_crop_box  # noqa: E402
 from _shared.pooled_gallery_cv import (  # noqa: E402
     MAX_BANK_SIZE_KNN_53,
@@ -138,7 +140,9 @@ from _shared.pooled_gallery_cv import (  # noqa: E402
     make_fold_role_splits,
 )
 from _shared.prototype_ops import knn_score_heatmap, score_heatmap  # noqa: E402
-from _shared.thresholding import oracle_iou  # noqa: E402
+from _shared.qualitative_gallery import ScoredExample, save_score_gallery  # noqa: E402
+from _shared.stats import bootstrap_ci, bootstrap_prob_greater  # noqa: E402
+from _shared.thresholding import achievable_iou, oracle_iou  # noqa: E402
 
 # %% Parameters
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -186,6 +190,17 @@ METHOD_TITLES: dict[str, str] = {
     "knn_fg": "fg-bg-knn, raw galleries, augment fg only",
     "proto_fgbg": "fg-bg prototype, mean vectors, augment fg only",
 }
+METHOD_COLOR: dict[str, str] = {
+    "single_proto": "#7f8c8d",
+    "knn_fg": "#2ecc71",
+    "proto_fgbg": "#3498db",
+}
+
+# Bootstrap settings for the headline CI columns and the weakest-vs-strongest-severity
+# significance check (see Part 9 below).
+N_BOOTSTRAP = 2000
+BOOTSTRAP_SEED = 0
+
 SEED = 0
 torch.manual_seed(SEED)
 
@@ -271,10 +286,26 @@ def score_and_store(
     proto: torch.Tensor | None = None,
     fg_bank: torch.Tensor | None = None,
     bg_bank: torch.Tensor | None = None,
+    achievable_lookup: dict[str, dict[tuple, float]] | None = None,
+    ref_tokens: torch.Tensor | None = None,
+    ref_h: int | None = None,
+    ref_w: int | None = None,
+    ref_gt: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float]:
     """Score one (method, key) heatmap, compute its oracle IoU, store it in lookup[method],
     and return (raw, iou) so callers needing the heatmap for qualitative figures don't have
-    to rescore it."""
+    to rescore it.
+
+    When *achievable_lookup* and the *ref_* args are given, this also scores the exact same
+    gallery/prototype against the reference (exemplar) image itself — the one image this
+    gallery was built from, whose own GT (*ref_gt*) it never gets to see the query's version
+    of — fits an IoU-tuned threshold on that reference raw/GT pair only
+    (`_shared.thresholding.achievable_iou`), and applies it as-is to the query's own raw
+    score map. Unlike `oracle_iou` (which tunes its threshold against the query's own GT,
+    an upper bound), this is the realistic number a deployed pipeline without query-time
+    labels would actually see. One extra score_heatmap/knn_score_heatmap call per (method,
+    key) — the gallery here is rebuilt per severity/composition anyway, so there's no cheaper
+    place to reuse a cached reference raw."""
     if method == "single_proto":
         assert proto is not None
         raw = score_heatmap(query_tokens, proto, h, w)
@@ -283,6 +314,19 @@ def score_and_store(
         raw = knn_score_heatmap(query_tokens, fg_bank, bg_bank, KNN_FGBG_NUM_NEIGHBOURS, h, w)
     iou = oracle_iou(raw, gt, ORACLE_THRESHOLD_STEPS)
     lookup[method][key] = iou
+
+    if achievable_lookup is not None:
+        assert ref_tokens is not None and ref_h is not None and ref_w is not None
+        assert ref_gt is not None
+        if method == "single_proto":
+            ref_raw = score_heatmap(ref_tokens, proto, ref_h, ref_w)
+        else:
+            ref_raw = knn_score_heatmap(
+                ref_tokens, fg_bank, bg_bank, KNN_FGBG_NUM_NEIGHBOURS, ref_h, ref_w
+            )
+        achievable_lookup[method][key] = achievable_iou(
+            ref_raw, ref_gt, raw, gt, ORACLE_THRESHOLD_STEPS
+        )
     return raw, iou
 
 
@@ -412,23 +456,42 @@ encoder = DinoEncoder(
 encoder = EncoderWithCache(encoder, cache_dir=DINO_ENCODING_CACHE_DIR)
 chunk_size = encoder.max_batch_size
 
+latency_rows: list[dict] = []
+
 query_encodings: dict[str, dict] = {}
-for unit in tqdm(sorted(query_images), desc="Encoding query images"):
-    q_tokens, q_h, q_w = extract_patch_tokens(encoder, query_images[unit], LAYER_IDX, debias=True)
-    # Kept on the encoder's own device (GPU, when available), not moved to CPU: there are
-    # only as many entries here as ref/query units (a couple dozen), so the memory-safety
-    # concern that drives the combo-major restructuring elsewhere in this file doesn't
-    # apply — and every knn_fgbg_score call below multiplies this tensor against a
-    # gallery, so keeping it on GPU is what actually makes those matmuls fast instead of
-    # CPU-bound.
-    query_encodings[unit] = {"q_tokens": q_tokens, "q_h": q_h, "q_w": q_w}
+with cuda_timer() as t_query_encode:
+    for unit in tqdm(sorted(query_images), desc="Encoding query images"):
+        q_tokens, q_h, q_w = extract_patch_tokens(
+            encoder, query_images[unit], LAYER_IDX, debias=True
+        )
+        # Kept on the encoder's own device (GPU, when available), not moved to CPU: there are
+        # only as many entries here as ref/query units (a couple dozen), so the memory-safety
+        # concern that drives the combo-major restructuring elsewhere in this file doesn't
+        # apply — and every knn_fgbg_score call below multiplies this tensor against a
+        # gallery, so keeping it on GPU is what actually makes those matmuls fast instead of
+        # CPU-bound.
+        query_encodings[unit] = {"q_tokens": q_tokens, "q_h": q_h, "q_w": q_w}
+latency_rows.append(
+    {
+        "phase": "query_image_encode",
+        "elapsed_s": t_query_encode["elapsed_s"],
+        "n_units": len(query_images),
+        "units_per_sec": images_per_sec(len(query_images), t_query_encode["elapsed_s"]),
+    }
+)
 
 gt_patch_masks: dict[tuple[str, str], np.ndarray] = {}
+# gt_area_frac_by_group: the query GT's own patch-mask coverage per (unit, group) —
+# independent of scale/family/severity, so computed once here and joined onto every
+# per-sample result in Part 7's object-size correlation below.
+gt_area_frac_by_group: dict[tuple[str, str], float] = {}
 for (unit, group), pixel_mask in group_query_masks.items():
     q = query_encodings[unit]
-    gt_patch_masks[(unit, group)] = pixel_mask_to_patch_mask(
+    patch_mask = pixel_mask_to_patch_mask(
         pixel_mask, q["q_h"], q["q_w"], IMG_SIZE, MASK_PATCH_THRESHOLD
     )
+    gt_patch_masks[(unit, group)] = patch_mask
+    gt_area_frac_by_group[(unit, group)] = float(patch_mask.sum()) / patch_mask.size
 
 # %% Part 3.6 — encode each part type's *full, uncropped* reference image once: the
 # "global" scale background source. Every close/mid bg gallery below is drawn only from
@@ -442,9 +505,35 @@ for (unit, group), pixel_mask in group_query_masks.items():
 # just the local crop border. This mirrors that: one full-image encode per part type,
 # reused as every combo's extra bg source below.
 ref_encodings: dict[str, dict] = {}
-for unit in tqdm(sorted(ref_images), desc="Encoding ref images (global bg scale)"):
-    r_tokens, r_h, r_w = extract_patch_tokens(encoder, ref_images[unit], LAYER_IDX, debias=True)
-    ref_encodings[unit] = {"r_tokens": r_tokens, "r_h": r_h, "r_w": r_w}
+with cuda_timer() as t_ref_encode:
+    for unit in tqdm(sorted(ref_images), desc="Encoding ref images (global bg scale)"):
+        r_tokens, r_h, r_w = extract_patch_tokens(
+            encoder, ref_images[unit], LAYER_IDX, debias=True
+        )
+        ref_encodings[unit] = {"r_tokens": r_tokens, "r_h": r_h, "r_w": r_w}
+latency_rows.append(
+    {
+        "phase": "ref_image_encode",
+        "elapsed_s": t_ref_encode["elapsed_s"],
+        "n_units": len(ref_images),
+        "units_per_sec": images_per_sec(len(ref_images), t_ref_encode["elapsed_s"]),
+    }
+)
+
+# Achievable IoU (see _shared.thresholding.achievable_iou, wired into score_and_store above)
+# needs a per-combo reference raw/GT pair that never sees the query's own GT — the natural
+# choice for this file's fixed-pair (no train/eval split) structure is the exemplar itself:
+# this combo's own ref instance mask, projected onto the *full* ref image's patch grid (not
+# just its crop), matching how the query side is scored against the full query image rather
+# than a crop. Computed once per combo here, reused for every (scale, family, severity) key
+# scored against it below.
+ref_gt_patch_masks: dict[tuple, np.ndarray] = {}
+for combo in combos:
+    ck = combo_key(combo)
+    r = ref_encodings[combo["unit"]]
+    ref_gt_patch_masks[ck] = pixel_mask_to_patch_mask(
+        combo["ref_mask"], r["r_h"], r["r_w"], IMG_SIZE, MASK_PATCH_THRESHOLD
+    )
 
 # %% Part 3.5 — encode every combo's *clean* (unaugmented) crops once, up front, to build
 # the baseline prototype (single_proto), fg gallery (knn_fg), and fg/bg prototypes
@@ -472,25 +561,34 @@ for combo in combos:
     for scale, crop in combo["crops"].items():
         clean_items.append((ck, scale, crop["img"], crop["mask_px"], crop["bg_exclude_mask_px"]))
 
-for i in tqdm(range(0, len(clean_items), chunk_size), desc="Encoding clean baseline crops"):
-    chunk = clean_items[i : i + chunk_size]
-    out = encoder([c[2] for c in chunk], layers=[LAYER_IDX], debias=True)
-    chunk_patches = out.patches[:, 0]
-    grid_h, grid_w = chunk_patches.shape[1], chunk_patches.shape[2]
-    for (ck, scale, _, mask_px, bg_exclude_mask_px), patch_tokens in tqdm(
-        zip(chunk, chunk_patches), desc="Building clean baseline galleries", total=len(chunk)
-    ):
-        fg, bg = split_fg_bg_patches(
-            patch_tokens,
-            mask_px,
-            grid_h,
-            grid_w,
-            f"{ck} scale={scale} clean",
-            bg_exclude_mask_px=bg_exclude_mask_px,
-        )
-        clean_fg_bank_lookup[(ck, scale)] = fg
-        clean_bg_by_scale_lookup[(ck, scale)] = bg
-        clean_prototype_lookup[(ck, scale)] = compute_exemplar_features(fg, mode="mean")
+with cuda_timer() as t_clean_encode:
+    for i in tqdm(range(0, len(clean_items), chunk_size), desc="Encoding clean baseline crops"):
+        chunk = clean_items[i : i + chunk_size]
+        out = encoder([c[2] for c in chunk], layers=[LAYER_IDX], debias=True)
+        chunk_patches = out.patches[:, 0]
+        grid_h, grid_w = chunk_patches.shape[1], chunk_patches.shape[2]
+        for (ck, scale, _, mask_px, bg_exclude_mask_px), patch_tokens in tqdm(
+            zip(chunk, chunk_patches), desc="Building clean baseline galleries", total=len(chunk)
+        ):
+            fg, bg = split_fg_bg_patches(
+                patch_tokens,
+                mask_px,
+                grid_h,
+                grid_w,
+                f"{ck} scale={scale} clean",
+                bg_exclude_mask_px=bg_exclude_mask_px,
+            )
+            clean_fg_bank_lookup[(ck, scale)] = fg
+            clean_bg_by_scale_lookup[(ck, scale)] = bg
+            clean_prototype_lookup[(ck, scale)] = compute_exemplar_features(fg, mode="mean")
+latency_rows.append(
+    {
+        "phase": "clean_crop_encode",
+        "elapsed_s": t_clean_encode["elapsed_s"],
+        "n_units": len(clean_items),
+        "units_per_sec": images_per_sec(len(clean_items), t_clean_encode["elapsed_s"]),
+    }
+)
 
 for combo in combos:
     ck = combo_key(combo)
@@ -557,6 +655,19 @@ first_val = AUGMENTATIONS[first_family]["values"][0]
 N_SEVERITY_LEVELS = len(AUGMENTATIONS[first_family]["values"])
 HELD_OUT_LABELS: list[str] = ["none", *AUGMENTATIONS]
 
+# One representative point in this file's own (scale, family, severity, method) config space,
+# used for the worst/best-N qualitative gallery below (see _shared/qualitative_gallery.py) —
+# collecting this for every (scale, family, severity, method) combination the sweep above
+# actually covers would multiply memory/disk cost by hundreds. "mid" matches Part 6's own
+# POOL_SCALE_53 default; the strongest tested severity of the first family is this file's own
+# "does a strong perturbation help or hurt" endpoint; knn_fg is the flagship contrastive
+# method this whole file exists to evaluate against the single_proto baseline.
+QUALITATIVE_SCALE = "mid"
+QUALITATIVE_METHOD = "knn_fg"
+QUALITATIVE_FAMILY = first_family
+QUALITATIVE_VALUE = AUGMENTATIONS[QUALITATIVE_FAMILY]["values"][-1]
+QUALITATIVE_MAX_EXAMPLES = 60  # capped so the gallery figure itself stays a readable size
+
 # %% Focus combo — used for every qualitative (crop-grid / heatmap) figure below. Same
 # fallback logic as augmented_prototype_oracle_iou.py.
 focus_combo = next(
@@ -590,6 +701,14 @@ log.info("Focus combo for qualitative figures: %s", focus_key)
 iou_lookup: dict[str, dict[tuple, float]] = {m: {} for m in METHOD_LABELS}
 composed_iou_lookup: dict[str, dict[tuple, float]] = {m: {} for m in METHOD_LABELS}
 all_aug_composed_iou_lookup: dict[str, dict[tuple, float]] = {m: {} for m in METHOD_LABELS}
+# Achievable IoU (see score_and_store above) — only populated for Layer 1 (single-severity
+# sweep) below, not Layers 2/3 or Part 6's 5-3 section: those reuse score_and_store on top of
+# the exact same clean galleries Layer 1 already characterizes, so an achievable-vs-oracle gap
+# measured once here already tells the "is the score separable enough for a fixed threshold"
+# story without doubling the raw-score-map compute at every one of Layers 2/3's many
+# cumulative-k points.
+achievable_iou_lookup: dict[str, dict[tuple, float]] = {m: {} for m in METHOD_LABELS}
+qualitative_examples: list[ScoredExample] = []
 
 # Qualitative stash for the focus combo only: crop-grid images (single_proto oracle_iou in
 # the title, as in the sibling script) and, per method, the baseline vs. best-severity raw
@@ -597,12 +716,20 @@ all_aug_composed_iou_lookup: dict[str, dict[tuple, float]] = {m: {} for m in MET
 focus_crop_grid: dict[str, list[dict]] = {}  # scale -> list of {family, value, img, oracle_iou}
 focus_heatmaps: dict[str, dict[str, dict]] = {}  # scale -> method -> {"baseline":.., "best":..}
 
+# Timed with cuda_timer's own context-manager protocol invoked manually (enter before the
+# loop, exit after) rather than a `with` block, so this large pre-existing loop body doesn't
+# need reindenting — equivalent to `with cuda_timer() as t: ...` for the normal (non-raising)
+# path this loop always takes.
+_main_sweep_timer = cuda_timer()
+t_main_sweep = _main_sweep_timer.__enter__()
 for combo in tqdm(combos, desc="Main per-combo sweep"):
     ck = combo_key(combo)
     unit, group = ck[0], ck[1]
     q = query_encodings[unit]
     q_tokens, q_h, q_w = q["q_tokens"], q["q_h"], q["q_w"]
     gt = gt_patch_masks[(unit, group)]
+    r = ref_encodings[unit]
+    ref_gt = ref_gt_patch_masks[ck]
     is_focus = ck == focus_key
     if is_focus:
         focus_crop_grid.clear()
@@ -655,7 +782,19 @@ for combo in tqdm(combos, desc="Main per-combo sweep"):
                 dim=-1,
             )
             raw_sp, iou_sp = score_and_store(
-                iou_lookup, "single_proto", key, q_tokens, q_h, q_w, gt, proto=paired_proto
+                iou_lookup,
+                "single_proto",
+                key,
+                q_tokens,
+                q_h,
+                q_w,
+                gt,
+                proto=paired_proto,
+                achievable_lookup=achievable_iou_lookup,
+                ref_tokens=r["r_tokens"],
+                ref_h=r["r_h"],
+                ref_w=r["r_w"],
+                ref_gt=ref_gt,
             )
 
             fg_extra = [] if is_baseline else [e["fg_patches"]]
@@ -670,6 +809,11 @@ for combo in tqdm(combos, desc="Main per-combo sweep"):
                 gt,
                 fg_bank=fg_bank,
                 bg_bank=clean_bg_full,
+                achievable_lookup=achievable_iou_lookup,
+                ref_tokens=r["r_tokens"],
+                ref_h=r["r_h"],
+                ref_w=r["r_w"],
+                ref_gt=ref_gt,
             )
             # proto_fgbg's fg side reuses paired_proto — the same augmented masked-mean
             # prototype single_proto just scored — contrasted against the clean bg prototype.
@@ -683,10 +827,31 @@ for combo in tqdm(combos, desc="Main per-combo sweep"):
                 gt,
                 fg_bank=paired_proto,
                 bg_bank=clean_bg_proto,
+                achievable_lookup=achievable_iou_lookup,
+                ref_tokens=r["r_tokens"],
+                ref_h=r["r_h"],
+                ref_w=r["r_w"],
+                ref_gt=ref_gt,
             )
 
             raws_this_entry = {"single_proto": raw_sp, "knn_fg": raw_fg, "proto_fgbg": raw_pfb}
             ious_this_entry = {"single_proto": iou_sp, "knn_fg": iou_fg, "proto_fgbg": iou_pfb}
+
+            if (
+                scale == QUALITATIVE_SCALE
+                and e["family"] == QUALITATIVE_FAMILY
+                and e["value"] == QUALITATIVE_VALUE
+                and len(qualitative_examples) < QUALITATIVE_MAX_EXAMPLES
+            ):
+                qualitative_examples.append(
+                    ScoredExample(
+                        label=f"{ck}",
+                        image=query_images[unit],
+                        raw=raws_this_entry[QUALITATIVE_METHOD],
+                        gt=gt,
+                        score=ious_this_entry[QUALITATIVE_METHOD],
+                    )
+                )
 
             if is_focus:
                 focus_crop_grid[scale].append(
@@ -830,6 +995,15 @@ for combo in tqdm(combos, desc="Main per-combo sweep"):
                 )
         # scale_entries (and every entry's fg_patches/prototype) goes out of scope here —
         # discarded before the next scale/combo, per the file header's memory rationale.
+_main_sweep_timer.__exit__(None, None, None)
+latency_rows.append(
+    {
+        "phase": "main_combo_sweep",
+        "elapsed_s": t_main_sweep["elapsed_s"],
+        "n_units": len(combos) * len(SCALES),
+        "units_per_sec": images_per_sec(len(combos) * len(SCALES), t_main_sweep["elapsed_s"]),
+    }
+)
 
 log.info("Main per-combo sweep complete: %d combos x %d scales", len(combos), len(SCALES))
 
@@ -865,12 +1039,17 @@ def aggregate_baseline(lookup: dict[tuple, float]) -> dict[str, float]:
     return baseline
 
 
-def aggregate_best_vs_baseline(lookup: dict[tuple, float]) -> list[dict]:
+def aggregate_best_vs_baseline(
+    lookup: dict[tuple, float], achievable_lookup: dict[tuple, float] | None = None
+) -> list[dict]:
+    """*achievable_lookup*, when given, is read at the *same* best severity each combo's
+    oracle IoU picked (not independently re-maximised) — the achievable_iou (realistic,
+    non-oracle) value of the exact config the oracle-best row above already reports on."""
     rows: list[dict] = []
     for scale in SCALES:
         cks = combo_keys_by_scale[scale]
         for family, spec in AUGMENTATIONS.items():
-            best_list, delta_list = [], []
+            best_list, delta_list, achievable_list = [], [], []
             for ck in cks:
                 vals = {
                     v: lookup[(ck, scale, family, v)]
@@ -879,19 +1058,42 @@ def aggregate_best_vs_baseline(lookup: dict[tuple, float]) -> list[dict]:
                 }
                 if not vals:
                     continue
-                best_iou = max(vals.values())
+                best_val = max(vals, key=vals.get)
+                best_iou = vals[best_val]
                 best_list.append(best_iou)
                 baseline_iou = lookup.get((ck, scale, first_family, first_val))
                 if baseline_iou is not None:
                     delta_list.append(best_iou - baseline_iou)
+                if achievable_lookup is not None:
+                    ach = achievable_lookup.get((ck, scale, family, best_val))
+                    if ach is not None:
+                        achievable_list.append(ach)
+            mean_best_iou = float(np.mean(best_list)) if best_list else float("nan")
+            _, ci_lo, ci_hi = bootstrap_ci(
+                np.array(best_list, dtype=float), n_boot=N_BOOTSTRAP, seed=BOOTSTRAP_SEED
+            )
+            mean_achievable_iou = (
+                float(np.mean(achievable_list)) if achievable_list else float("nan")
+            )
             rows.append(
                 {
                     "scale": scale,
                     "family": family,
-                    "mean_best_iou": float(np.mean(best_list)) if best_list else float("nan"),
+                    "mean_best_iou": mean_best_iou,
                     "std_best_iou": float(np.std(best_list)) if best_list else float("nan"),
+                    "ci95_lo": ci_lo,
+                    "ci95_hi": ci_hi,
                     "mean_delta_vs_baseline": (
                         float(np.mean(delta_list)) if delta_list else float("nan")
+                    ),
+                    "mean_achievable_iou": mean_achievable_iou,
+                    "std_achievable_iou": (
+                        float(np.std(achievable_list)) if achievable_list else float("nan")
+                    ),
+                    "oracle_minus_achievable_gap": (
+                        mean_best_iou - mean_achievable_iou
+                        if best_list and achievable_list
+                        else float("nan")
                     ),
                     "n_combos": len(best_list),
                 }
@@ -919,12 +1121,17 @@ def aggregate_k_endpoint(
                 for ck in cks
                 if (ck, scale, first_family, first_val) in baseline_lookup
             ]
+            _, ci_lo, ci_hi = bootstrap_ci(
+                np.array(vals, dtype=float), n_boot=N_BOOTSTRAP, seed=BOOTSTRAP_SEED
+            )
             rows.append(
                 {
                     "scale": scale,
                     "family": family,
                     "mean_best_iou": float(np.mean(vals)) if vals else float("nan"),
                     "std_best_iou": float(np.std(vals)) if vals else float("nan"),
+                    "ci95_lo": ci_lo,
+                    "ci95_hi": ci_hi,
                     "mean_delta_vs_baseline": (
                         float(np.mean(vals)) - float(np.mean(base_vals))
                         if vals and base_vals
@@ -964,6 +1171,49 @@ def plot_severity_curves(
         ax.grid(alpha=0.3)
     axes[0].set_ylabel(ylabel)
     axes[0].legend(fontsize=8)
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_oracle_vs_achievable_curves(
+    oracle_curves: dict, achievable_curves: dict, title: str, out_path: Path, ylabel: str
+) -> None:
+    """Same faceting as plot_severity_curves (one panel per scale, one color per family), but
+    oracle_iou (solid, upper bound — tunes its threshold against the query's own GT) plotted
+    alongside achievable_iou (dashed, same color — a threshold tuned on the exemplar's own GT
+    only, transferred as-is) so the gap between "best any threshold could do" and "what a
+    deployed pipeline without query-time labels would actually see" is visible directly."""
+    fig, axes = plt.subplots(1, len(SCALES), figsize=(7.5 * len(SCALES), 5.5), sharey=True)
+    for ax, scale in zip(axes, SCALES):
+        n = len(combo_keys_by_scale[scale])
+        for i, (family, spec) in enumerate(AUGMENTATIONS.items()):
+            values = np.array(spec["values"], dtype=float)
+            frac = (values - values[0]) / (values[-1] - values[0])
+            color = colors[i % len(colors)]
+            ax.plot(
+                frac,
+                oracle_curves[scale][family]["mean"],
+                marker="o",
+                linestyle="-",
+                label=f"{family} oracle",
+                color=color,
+            )
+            ax.plot(
+                frac,
+                achievable_curves[scale][family]["mean"],
+                marker="^",
+                linestyle="--",
+                label=f"{family} achievable",
+                color=color,
+                alpha=0.6,
+            )
+        ax.set_xlabel("severity fraction (0 = no-op, 1 = strongest tested)")
+        ax.set_title(f"scale = {scale}  (n={n} combos)")
+        ax.grid(alpha=0.3)
+    axes[0].set_ylabel(ylabel)
+    axes[0].legend(fontsize=6, ncol=2)
     fig.suptitle(title)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -1108,7 +1358,9 @@ best_over_baseline: dict[str, list[dict]] = {}
 for method in METHOD_LABELS:
     curves = aggregate_curves(iou_lookup[method])
     baseline_oracle_iou[method] = aggregate_baseline(iou_lookup[method])
-    best_over_baseline[method] = aggregate_best_vs_baseline(iou_lookup[method])
+    best_over_baseline[method] = aggregate_best_vs_baseline(
+        iou_lookup[method], achievable_lookup=achievable_iou_lookup[method]
+    )
     log.info(
         "[%s] baseline oracle IoU: %s",
         method,
@@ -1116,13 +1368,17 @@ for method in METHOD_LABELS:
     )
     for row in sorted(best_over_baseline[method], key=lambda r: -r["mean_delta_vs_baseline"]):
         log.info(
-            "[%s] BEST scale=%-5s %-22s mean_best_iou=%.3f±%.3f (%+.3f vs. baseline, n=%d combos)",
+            "[%s] BEST scale=%-5s %-22s mean_best_iou=%.3f±%.3f (95%% CI [%.3f, %.3f], "
+            "%+.3f vs. baseline, achievable=%.3f, n=%d combos)",
             method,
             row["scale"],
             row["family"],
             row["mean_best_iou"],
             row["std_best_iou"],
+            row["ci95_lo"],
+            row["ci95_hi"],
             row["mean_delta_vs_baseline"],
+            row["mean_achievable_iou"],
             row["n_combos"],
         )
     plot_severity_curves(
@@ -1132,6 +1388,18 @@ for method in METHOD_LABELS:
         f"— {len(combos)} combos",
         OUTPUT_DIR / f"oracle_iou_curves__{method}.png",
         "oracle IoU (mean across combos)",
+    )
+    # Oracle (upper bound) vs. achievable (threshold tuned on the exemplar image only,
+    # transferred as-is) — see score_and_store's docstring for how achievable_iou_lookup was
+    # populated (Layer 1 only, one extra score per (method, key)).
+    achievable_curves = aggregate_curves(achievable_iou_lookup[method])
+    plot_oracle_vs_achievable_curves(
+        curves,
+        achievable_curves,
+        f"[{METHOD_TITLES[method]}] 1-1 — Oracle vs. achievable IoU vs. severity "
+        f"— {len(combos)} combos",
+        OUTPUT_DIR / f"oracle_vs_achievable__{method}.png",
+        "IoU (mean across combos)",
     )
 
 baseline_rows = [
@@ -1376,9 +1644,22 @@ for inst in tqdm(discovery_53.instances, desc="5-3: building mid crops"):
 log.info("5-3: usable instances %d/%d", len(usable_instances_53), len(discovery_53.instances))
 
 image_encodings_53: dict[tuple[str, int], dict] = {}
-for key in tqdm(sorted(discovery_53.images), desc="5-3: encoding images"):
-    tokens, h, w = extract_patch_tokens(encoder, discovery_53.images[key], LAYER_IDX, debias=True)
-    image_encodings_53[key] = {"tokens": tokens, "h": h, "w": w}
+with cuda_timer() as t_53_image_encode:
+    for key in tqdm(sorted(discovery_53.images), desc="5-3: encoding images"):
+        tokens, h, w = extract_patch_tokens(
+            encoder, discovery_53.images[key], LAYER_IDX, debias=True
+        )
+        image_encodings_53[key] = {"tokens": tokens, "h": h, "w": w}
+latency_rows.append(
+    {
+        "phase": "5-3_image_encode",
+        "elapsed_s": t_53_image_encode["elapsed_s"],
+        "n_units": len(discovery_53.images),
+        "units_per_sec": images_per_sec(
+            len(discovery_53.images), t_53_image_encode["elapsed_s"]
+        ),
+    }
+)
 
 gt_patch_masks_53: dict[tuple[str, str, int], np.ndarray] = {}
 for (part_type, group, n), pixel_mask in discovery_53.gt_masks.items():
@@ -1395,6 +1676,8 @@ clean_items_53 = [
     (i, inst["img"], inst["mask_px"], inst["bg_exclude_mask_px"])
     for i, inst in enumerate(usable_instances_53)
 ]
+_53_clean_encode_timer = cuda_timer()
+t_53_clean_encode = _53_clean_encode_timer.__enter__()
 for i in tqdm(range(0, len(clean_items_53), chunk_size), desc="5-3: encoding clean crops"):
     chunk = clean_items_53[i : i + chunk_size]
     out = encoder([c[1] for c in chunk], layers=[LAYER_IDX], debias=True)
@@ -1415,6 +1698,15 @@ for i in tqdm(range(0, len(clean_items_53), chunk_size), desc="5-3: encoding cle
         # fix as every other 5-3 addition's per-instance/per-scale banks.
         clean_fg_53[idx] = fg.cpu()
         clean_bg_53[idx] = bg.cpu()
+_53_clean_encode_timer.__exit__(None, None, None)
+latency_rows.append(
+    {
+        "phase": "5-3_clean_crop_encode",
+        "elapsed_s": t_53_clean_encode["elapsed_s"],
+        "n_units": len(clean_items_53),
+        "units_per_sec": images_per_sec(len(clean_items_53), t_53_clean_encode["elapsed_s"]),
+    }
+)
 
 clean_bg_global_53: dict[int, torch.Tensor] = {}
 for i, inst in enumerate(usable_instances_53):
@@ -1655,6 +1947,200 @@ for _, row in comparison_53_df.iterrows():
     )
 log.info("Wrote %s", OUTPUT_DIR / "comparison_1_1_vs_5_3.csv")
 
+# %% Part 7 — does oracle IoU correlate with object size? An aggregate mean (every figure
+# above) can hide "this only helps small/large instances" — `gt_area_frac_by_group` (the query
+# GT's own patch-mask coverage, computed once in Part 3) lets us check per (method, scale,
+# family), mirroring the pearson/spearman correlation pattern
+# `scale_composition_adaptive_oracle.py` already established for instance size vs. optimal
+# scale (and resolution_ablation.py/training_set_size_ablation.py's own copies of it). Pools
+# across every severity within a (method, scale, family) cell — the question here is whether
+# size predicts IoU at all, not whether that holds at one fixed severity.
+size_corr_df = pd.DataFrame(
+    [
+        {
+            "method": method,
+            "scale": scale,
+            "family": family,
+            "value": value,
+            "gt_area_frac": gt_area_frac_by_group.get((ck[0], ck[1]), float("nan")),
+            "oracle_iou": iou,
+        }
+        for method in METHOD_LABELS
+        for (ck, scale, family, value), iou in iou_lookup[method].items()
+    ]
+)
+
+size_correlation_rows = []
+for method in METHOD_LABELS:
+    for scale in SCALES:
+        for family in AUGMENTATIONS:
+            sub = size_corr_df[
+                (size_corr_df.method == method)
+                & (size_corr_df.scale == scale)
+                & (size_corr_df.family == family)
+            ]
+            if len(sub) < 3:
+                continue
+            pearson_r, pearson_p = pearsonr(sub["gt_area_frac"], sub["oracle_iou"])
+            spearman_r, spearman_p = spearmanr(sub["gt_area_frac"], sub["oracle_iou"])
+            size_correlation_rows.append(
+                {
+                    "method": method,
+                    "scale": scale,
+                    "family": family,
+                    "pearson_r": pearson_r,
+                    "pearson_p": pearson_p,
+                    "spearman_r": spearman_r,
+                    "spearman_p": spearman_p,
+                    "n_samples": len(sub),
+                }
+            )
+size_correlation_df = pd.DataFrame(size_correlation_rows)
+size_correlation_df.to_csv(OUTPUT_DIR / "size_correlation.csv", index=False)
+
+# Object-size terciles (global, computed once so the same size cutoffs apply everywhere) x
+# oracle IoU, faceted by scale, pooled across family/severity/combo per method — the more
+# interpretable companion to the raw correlation coefficients above.
+try:
+    size_corr_df["size_tercile"] = pd.qcut(
+        size_corr_df["gt_area_frac"], 3, labels=["small", "medium", "large"]
+    )
+except ValueError:
+    log.warning(
+        "gt_area_frac has too few distinct values for 3 clean terciles — falling back to "
+        "qcut's own duplicate-safe binning (labels become numeric ranges, not small/medium/large)"
+    )
+    size_corr_df["size_tercile"] = pd.qcut(size_corr_df["gt_area_frac"], 3, duplicates="drop")
+
+fig, axes = plt.subplots(1, len(SCALES), figsize=(6 * len(SCALES), 5), sharey=True)
+for ax, scale in zip(axes, SCALES):
+    tercile_means = (
+        size_corr_df[size_corr_df.scale == scale]
+        .groupby(["size_tercile", "method"], observed=True)["oracle_iou"]
+        .mean()
+        .unstack("method")
+    )
+    tercile_means.plot(kind="bar", ax=ax, color=[METHOD_COLOR[m] for m in tercile_means.columns])
+    ax.set_title(f"scale = {scale}")
+    ax.set_xlabel("object-size tercile (by GT patch-mask area fraction)")
+    ax.set_ylim(0, 1.0)
+    ax.grid(alpha=0.3, axis="y")
+axes[0].set_ylabel("mean oracle IoU (pooled across family/severity)")
+fig.suptitle("Does object size predict oracle IoU?")
+fig.tight_layout()
+fig.savefig(OUTPUT_DIR / "size_correlation.png", dpi=150, bbox_inches="tight")
+plt.close(fig)
+log.info(
+    "Wrote %s and %s", OUTPUT_DIR / "size_correlation.csv", OUTPUT_DIR / "size_correlation.png"
+)
+
+# %% Part 8 — is the "best augmentation severity beats the clean baseline" effect
+# (`best_over_baseline.csv`'s `mean_delta_vs_baseline` column) real, or combo-to-combo noise?
+# An unpaired bootstrap comparison (see `_shared/stats.py`) of each (method, scale, family)
+# cell's per-combo best-over-severities oracle_iou array against that cell's per-combo baseline
+# (severity-0) oracle_iou array — the significance check `best_over_baseline.csv` leaves the
+# reader to eyeball, mirroring resolution_ablation.py Part 9 / training_set_size_ablation.py
+# Part 6d.
+significance_rows = []
+for method in METHOD_LABELS:
+    for scale in SCALES:
+        cks = combo_keys_by_scale[scale]
+        baseline_vals = [
+            iou_lookup[method][(ck, scale, first_family, first_val)]
+            for ck in cks
+            if (ck, scale, first_family, first_val) in iou_lookup[method]
+        ]
+        for family, spec in AUGMENTATIONS.items():
+            best_vals = []
+            for ck in cks:
+                vals = {
+                    v: iou_lookup[method][(ck, scale, family, v)]
+                    for v in spec["values"]
+                    if (ck, scale, family, v) in iou_lookup[method]
+                }
+                if vals:
+                    best_vals.append(max(vals.values()))
+            if not baseline_vals or not best_vals:
+                continue
+            prob_best_beats_baseline = bootstrap_prob_greater(
+                np.array(best_vals),
+                np.array(baseline_vals),
+                n_boot=N_BOOTSTRAP,
+                seed=BOOTSTRAP_SEED,
+            )
+            significance_rows.append(
+                {
+                    "method": method,
+                    "scale": scale,
+                    "family": family,
+                    "prob_best_beats_baseline": prob_best_beats_baseline,
+                    "n_baseline": len(baseline_vals),
+                    "n_best": len(best_vals),
+                }
+            )
+significance_df = pd.DataFrame(significance_rows)
+significance_df.to_csv(OUTPUT_DIR / "best_over_baseline_significance.csv", index=False)
+log.info(
+    "Best-severity-vs-baseline significance (P(best-severity mean > baseline mean) under "
+    "%d-resample bootstrap; near 0.5 = indistinguishable from noise):",
+    N_BOOTSTRAP,
+)
+for _, row in significance_df.iterrows():
+    log.info(
+        "  method=%-13s scale=%-5s %-22s P(best beats baseline)=%.3f (n=%d vs n=%d)",
+        row.method,
+        row.scale,
+        row.family,
+        row.prob_best_beats_baseline,
+        row.n_best,
+        row.n_baseline,
+    )
+log.info("Wrote %s", OUTPUT_DIR / "best_over_baseline_significance.csv")
+
+# %% Part 9 — latency/throughput summary: every phase above (query/ref image encode, ref image
+# encode, clean-crop encode, the main combo sweep, and the 5-3 image/clean-crop encode) was
+# already timed with `cuda_timer` (see `_shared/latency.py`) into `latency_rows` as it ran;
+# written out here as this file's own record of wall-clock cost per phase. No curve plot — this
+# file's phases each run once rather than sweeping a resolution/size/N_train axis, so a
+# per-phase table is the useful artifact here, not a curve (see the "Latency" addition note in
+# the shared instrumentation spec for this fallback).
+latency_df = pd.DataFrame(latency_rows)
+latency_df.to_csv(OUTPUT_DIR / "latency.csv", index=False)
+log.info("Wrote %s", OUTPUT_DIR / "latency.csv")
+for _, row in latency_df.iterrows():
+    log.info("  phase=%-24s elapsed=%.1fs n_units=%d", row.phase, row.elapsed_s, row.n_units)
+
+# %% Part 10 — worst/best-N qualitative gallery at one representative point (see
+# QUALITATIVE_SCALE/QUALITATIVE_FAMILY/QUALITATIVE_VALUE/QUALITATIVE_METHOD above) — every
+# other figure in this script averages across combos; this shows actual individual query
+# images so a failure mode (one orientation, one lighting condition) is visible instead of
+# washed out by the mean.
+if qualitative_examples:
+    save_score_gallery(
+        qualitative_examples,
+        OUTPUT_DIR / "qualitative_worst_best.png",
+        n=5,
+        score_name="oracle_iou",
+        title=(
+            f"Worst/best oracle_iou examples: scale={QUALITATIVE_SCALE} "
+            f"family={QUALITATIVE_FAMILY} value={QUALITATIVE_VALUE} method={QUALITATIVE_METHOD}"
+        ),
+    )
+    log.info(
+        "Wrote %s (%d examples)",
+        OUTPUT_DIR / "qualitative_worst_best.png",
+        len(qualitative_examples),
+    )
+else:
+    log.warning(
+        "No qualitative examples collected for the representative point "
+        "(scale=%s, family=%s, value=%s, method=%s)",
+        QUALITATIVE_SCALE,
+        QUALITATIVE_FAMILY,
+        QUALITATIVE_VALUE,
+        QUALITATIVE_METHOD,
+    )
+
 # %% [markdown]
 # ## Reading the results
 #
@@ -1686,5 +2172,24 @@ log.info("Wrote %s", OUTPUT_DIR / "comparison_1_1_vs_5_3.csv")
 # now for both contrastive methods — a family where `knn_fg`'s leave-one-out curve pulls away
 # from `proto_fgbg`'s as more severities compose in says that family's value compounds better
 # in a growing raw gallery than in a growing-then-collapsed mean vector.
+#
+# - **`size_correlation.csv`/`.png`** — does oracle IoU correlate with the query GT's own area
+#   fraction (`gt_area_frac_by_group`), per (method, scale, family)? Same
+#   aggregation-can-hide-an-effect caveat as every other breakdown in this file — check whether
+#   a method/family's apparent edge concentrates on small or large instances before
+#   generalizing it from the pooled curves above.
+# - **`best_over_baseline_significance.csv`** — an unpaired bootstrap comparison (2000
+#   resamples) of each (method, scale, family) cell's best-over-severities oracle_iou array
+#   against its own baseline (severity-0) array: `prob_best_beats_baseline` near 0.5 means that
+#   cell's entry in `best_over_baseline.csv`'s `mean_delta_vs_baseline` column is not
+#   distinguishable from combo-to-combo noise.
+# - **`latency.csv`** — GPU-synchronized wall-clock cost (see `_shared/latency.py`) of every
+#   phase (query/ref image encode, clean-crop encode, the main combo sweep, the 5-3 image/crop
+#   encode), logged per phase since this file's phases each run once rather than sweeping a
+#   resolution/size/N_train axis.
+# - **`qualitative_worst_best.png`** — actual worst-5/best-5 query images (crop, raw score map,
+#   GT mask) at one representative (scale, family, value, method) point, not an average — every
+#   other figure here plots a mean or an averaged heatmap, which can't show *why* a config
+#   fails on a specific image.
 
 # %%

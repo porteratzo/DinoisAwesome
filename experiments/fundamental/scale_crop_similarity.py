@@ -53,16 +53,19 @@ import torch.nn.functional as F
 from dotenv import load_dotenv
 from matplotlib.patches import Rectangle
 from PIL import Image
+from scipy.stats import pearsonr, spearmanr
 
 from dinoisawesome import DinoEncoder, EncoderWithCache, compute_exemplar_features, load_annotations
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from _shared.augmentations import mean_color  # noqa: E402
+from _shared.latency import cuda_timer, images_per_sec  # noqa: E402
 from _shared.mask_geometry import (  # noqa: E402
     mask_bbox_px,
     pixel_mask_to_patch_mask,
     scale_crop_box,
 )
+from _shared.stats import bootstrap_ci, bootstrap_prob_greater  # noqa: E402
 
 # %% Parameters
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -89,6 +92,18 @@ MASK_PATCH_THRESHOLD = 0.3  # patch-grid cell counts as "object" once this fract
 N_SCALES = 7  # crop steps, t = 0 (global) .. 1 (closest), evenly spaced
 CLOSE_PADDING_FRACTION = 0.5  # closest crop's padding around the mask bbox, fraction of its extent
 MIN_CROP_SIZE = 64  # closest crop must be at least this many native px on each side
+
+# Bootstrap settings (see the "per-patch similarity spread" Part below). This script has a
+# single image/instance, so there's no repeated-sample population per scale the way sibling
+# sweep scripts have per-fold/per-instance samples — the individual masked patch tokens within
+# one crop are used as the resampling population instead (see that Part's own docstring).
+N_BOOTSTRAP = 2000
+BOOTSTRAP_SEED = 0
+
+# Worst/best-N qualitative gallery size — this script's own crop set (N_SCALES + 2*len
+# (ASPECT_RATIOS)) is already small (~17 images), so no "one representative point" subsetting
+# is needed (see the qualitative Part below); n is just how many of each side to show.
+QUALITATIVE_N = 3
 
 OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental" / "scale_crop_similarity"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -158,13 +173,28 @@ encoder = DinoEncoder(
     amp=True,
 )
 encoder = EncoderWithCache(encoder, cache_dir=DINO_ENCODING_CACHE_DIR)
-out = encoder(crops, layers=[LAYER_IDX], debias=True)
+latency_rows: list[dict] = []
+with cuda_timer() as t_scale_encode:
+    out = encoder(crops, layers=[LAYER_IDX], debias=True)
+latency_rows.append(
+    {
+        "phase": "scale_crop_encode",
+        "elapsed_s": t_scale_encode["elapsed_s"],
+        "n_units": len(crops),
+        "units_per_sec": images_per_sec(len(crops), t_scale_encode["elapsed_s"]),
+    }
+)
 patches = out.patches[:, 0]  # (N_SCALES, grid_h, grid_w, D)
 cls = out.cls[:, 0]  # (N_SCALES, D)
 _, grid_h, grid_w, D = patches.shape
 
-# %% Per-scale masked-mean object embedding + how many patches the mask covers
+# %% Per-scale masked-mean object embedding + how many patches the mask covers. Also keeps each
+# scale's individual masked patch tokens (`masked_tokens_per_scale`), not just their pooled
+# mean — used by the per-patch bootstrap CI/significance Part below, since this script's single
+# image/instance has no repeated-sample population across scales the way sibling sweep scripts
+# do across folds/instances.
 object_embeddings = []
+masked_tokens_per_scale: list[torch.Tensor] = []
 n_masked_patches = []
 for i, box in enumerate(boxes):
     x0, y0, x1, y1 = box
@@ -182,10 +212,13 @@ for i, box in enumerate(boxes):
         )
         masked = tokens
     object_embeddings.append(compute_exemplar_features(masked, mode="mean"))  # (1, D)
+    masked_tokens_per_scale.append(masked)
     n_masked_patches.append(int(patch_flat.sum()))
 
 object_embeddings = torch.cat(object_embeddings, dim=0)  # (N_SCALES, D)
 cls_embeddings = F.normalize(cls, p=2, dim=-1)  # (N_SCALES, D)
+grid_area = grid_h * grid_w
+mask_area_frac = [n / grid_area for n in n_masked_patches]  # per-scale object patch coverage
 
 log.info("Masked patch count per scale: %s", n_masked_patches)
 
@@ -200,6 +233,29 @@ cls_sim_to_global = cls_sim_matrix[0]  # whole-crop CLS token, same comparison
 log.info("Object-embedding similarity to global (t=0): %s", np.round(sim_to_global, 3))
 log.info("Object-embedding similarity to closest (t=1): %s", np.round(sim_to_closest, 3))
 
+# %% Per-patch similarity spread — a bootstrap CI adaptation for a single-image/instance
+# script. `bootstrap_ci`/`bootstrap_prob_greater` (see _shared/stats.py) are built for a
+# per-config population of independent samples (folds, instances, ...); this script has
+# exactly one sample per scale (`sim_to_global[i]`/`sim_to_closest[i]` are each a single
+# pooled-embedding cosine similarity). Instead of leaving the CI/significance additions out,
+# the population used here is each scale's own *individual masked patch tokens*: every patch
+# inside the object mask, each dotted against the anchor scale's pooled mean embedding, gives
+# an n_masked_patches[i]-sized array per scale — a genuine within-object spread measure,
+# complementing (not replacing) the single-pooled-vector curves above.
+ci_lo_to_global, ci_hi_to_global = [], []
+ci_lo_to_closest, ci_hi_to_closest = [], []
+per_patch_sims_to_global: list[np.ndarray] = []
+for i in range(N_SCALES):
+    sims_to_global = (masked_tokens_per_scale[i] @ object_embeddings[0].T).cpu().float().numpy()
+    sims_to_closest = (masked_tokens_per_scale[i] @ object_embeddings[-1].T).cpu().float().numpy()
+    per_patch_sims_to_global.append(sims_to_global)
+    _, lo_g, hi_g = bootstrap_ci(sims_to_global, n_boot=N_BOOTSTRAP, seed=BOOTSTRAP_SEED)
+    _, lo_c, hi_c = bootstrap_ci(sims_to_closest, n_boot=N_BOOTSTRAP, seed=BOOTSTRAP_SEED)
+    ci_lo_to_global.append(lo_g)
+    ci_hi_to_global.append(hi_g)
+    ci_lo_to_closest.append(lo_c)
+    ci_hi_to_closest.append(hi_c)
+
 # %% Numeric results — per-scale table + full similarity matrices
 scale_df = pd.DataFrame(
     {
@@ -207,9 +263,16 @@ scale_df = pd.DataFrame(
         "crop_w": [box[2] - box[0] for box in boxes],
         "crop_h": [box[3] - box[1] for box in boxes],
         "n_masked_patches": n_masked_patches,
+        "mask_area_frac": mask_area_frac,
         "sim_to_global": sim_to_global,
         "sim_to_closest": sim_to_closest,
         "cls_sim_to_global": cls_sim_to_global,
+        # Per-patch bootstrap CI band (2000 resamples over that scale's own masked patch
+        # tokens) around the pooled sim_to_global/sim_to_closest point estimates above.
+        "ci95_lo_to_global": ci_lo_to_global,
+        "ci95_hi_to_global": ci_hi_to_global,
+        "ci95_lo_to_closest": ci_lo_to_closest,
+        "ci95_hi_to_closest": ci_hi_to_closest,
     }
 )
 scale_df.to_csv(OUTPUT_DIR / "scale_similarity.csv", index=False)
@@ -221,6 +284,107 @@ pd.DataFrame(cls_sim_matrix, index=_t_labels, columns=_t_labels).to_csv(
     OUTPUT_DIR / "scale_cls_similarity_matrix.csv"
 )
 log.info("Wrote %s\n%s", OUTPUT_DIR / "scale_similarity.csv", scale_df.to_string(index=False))
+
+# %% Is the mildest-vs-strongest crop-scale step's drift real, or within a single scale's own
+# per-patch spread? An unpaired bootstrap comparison (see _shared/stats.py) of the mildest
+# tested crop step's (t_values[1], the first step off the global view — t_values[0] itself is
+# pixel-identical to the anchor, a degenerate zero-variance comparison) vs. the strongest
+# tested step's (t_values[-1], closest) per-patch similarity-to-global arrays.
+mild_idx, strong_idx = 1, N_SCALES - 1
+prob_mild_greater = bootstrap_prob_greater(
+    per_patch_sims_to_global[mild_idx],
+    per_patch_sims_to_global[strong_idx],
+    n_boot=N_BOOTSTRAP,
+    seed=BOOTSTRAP_SEED,
+)
+significance_df = pd.DataFrame(
+    [
+        {
+            "t_mild": t_values[mild_idx],
+            "t_strong": t_values[strong_idx],
+            "prob_mild_beats_strong": prob_mild_greater,
+            "n_mild": len(per_patch_sims_to_global[mild_idx]),
+            "n_strong": len(per_patch_sims_to_global[strong_idx]),
+        }
+    ]
+)
+significance_df.to_csv(OUTPUT_DIR / "scale_effect_significance.csv", index=False)
+log.info(
+    "Mildest-vs-strongest crop-scale-step significance (P(t=%.2f per-patch sim-to-global mean > "
+    "t=%.2f's) under %d-resample bootstrap; near 0.5 = indistinguishable from per-patch noise): "
+    "%.3f (n=%d vs n=%d)",
+    t_values[mild_idx],
+    t_values[strong_idx],
+    N_BOOTSTRAP,
+    prob_mild_greater,
+    len(per_patch_sims_to_global[mild_idx]),
+    len(per_patch_sims_to_global[strong_idx]),
+)
+log.info("Wrote %s", OUTPUT_DIR / "scale_effect_significance.csv")
+
+# %% Does object size (in-frame patch coverage) correlate with how much cropping-in moves the
+# embedding? This script has no GT/IoU scoring (it measures embedding drift, not localization),
+# so `mask_area_frac` (the object's own patch-mask coverage at each scale, already in
+# `scale_similarity.csv`) is correlated against `sim_to_global`/`sim_to_closest` directly rather
+# than against an oracle_iou — the adapted version of the size-correlation check
+# `scale_composition_adaptive_oracle.py`'s own Part 7 established for instance size vs. optimal
+# scale. One row per curve, mirroring the two headline curves (`sim_to_global`/`sim_to_closest`)
+# this script's own drift plot already reports — only N_SCALES=7 points (single image/instance),
+# enough for pearsonr/spearmanr but not for a per-group breakdown.
+size_correlation_rows = []
+for sim_col in ["sim_to_global", "sim_to_closest"]:
+    pearson_r, pearson_p = pearsonr(scale_df["mask_area_frac"], scale_df[sim_col])
+    spearman_r, spearman_p = spearmanr(scale_df["mask_area_frac"], scale_df[sim_col])
+    size_correlation_rows.append(
+        {
+            "compared_to": sim_col,
+            "pearson_r": pearson_r,
+            "pearson_p": pearson_p,
+            "spearman_r": spearman_r,
+            "spearman_p": spearman_p,
+            "n_samples": len(scale_df),
+        }
+    )
+size_correlation_df = pd.DataFrame(size_correlation_rows)
+size_correlation_df.to_csv(OUTPUT_DIR / "size_correlation.csv", index=False)
+
+try:
+    scale_df["size_tercile"] = pd.qcut(
+        scale_df["mask_area_frac"], 3, labels=["small", "medium", "large"]
+    )
+except ValueError:
+    log.warning(
+        "mask_area_frac has too few distinct values for 3 clean terciles — falling back to "
+        "qcut's own duplicate-safe binning (labels become numeric ranges, not small/medium/large)"
+    )
+    scale_df["size_tercile"] = pd.qcut(scale_df["mask_area_frac"], 3, duplicates="drop")
+
+fig, ax = plt.subplots(figsize=(6.5, 5))
+tercile_means = scale_df.groupby("size_tercile", observed=True)[
+    ["sim_to_global", "sim_to_closest"]
+].mean()
+tercile_means.plot(kind="bar", ax=ax, color=["#2ecc71", "#e74c3c"])
+ax.set_xlabel("object-size tercile (by in-crop patch-mask area fraction)")
+ax.set_ylabel("mean similarity")
+ax.set_ylim(0, 1.02)
+ax.set_title(f"Does object size predict embedding drift? ({IMAGE_STEM}/{TARGET_CLASS!r})")
+ax.grid(alpha=0.3, axis="y")
+fig.tight_layout()
+fig.savefig(OUTPUT_DIR / "size_correlation.png", dpi=150, bbox_inches="tight")
+plt.close(fig)
+log.info(
+    "Wrote %s and %s", OUTPUT_DIR / "size_correlation.csv", OUTPUT_DIR / "size_correlation.png"
+)
+for _, row in size_correlation_df.iterrows():
+    log.info(
+        "  vs %-14s pearson_r=%.3f (p=%.3f)  spearman_r=%.3f (p=%.3f)  n=%d",
+        row.compared_to,
+        row.pearson_r,
+        row.pearson_p,
+        row.spearman_r,
+        row.spearman_p,
+        row.n_samples,
+    )
 
 # %% Visualization — crop sequence with the instance bbox overlaid
 rmin, rmax, cmin, cmax = mask_bbox_px(mask)
@@ -384,7 +548,16 @@ for ratio, box in zip(ASPECT_RATIOS, ar_boxes):
         {"ratio": ratio, "variant": "conserve", "img": padded_crop, "mask_px": padded_mask_px}
     )
 
-ar_out = encoder([p["img"] for p in ar_pending], layers=[LAYER_IDX], debias=True)
+with cuda_timer() as t_ar_encode:
+    ar_out = encoder([p["img"] for p in ar_pending], layers=[LAYER_IDX], debias=True)
+latency_rows.append(
+    {
+        "phase": "aspect_ratio_crop_encode",
+        "elapsed_s": t_ar_encode["elapsed_s"],
+        "n_units": len(ar_pending),
+        "units_per_sec": images_per_sec(len(ar_pending), t_ar_encode["elapsed_s"]),
+    }
+)
 ar_patches = ar_out.patches[:, 0]  # (2*N_AR, ar_grid_h, ar_grid_w, D)
 _, ar_grid_h, ar_grid_w, _ = ar_patches.shape
 
