@@ -332,6 +332,41 @@ oom_failures: list[tuple[str, str]] = []
 
 with tqdm(total=n_sweep_units, desc="Part 3: per-(size,resolution) 1-1/5-3 CV sweep") as pbar:
     for dino_size in DINO_SIZES:
+        # Backbone loaded once per size, then reused across every resolution in
+        # RESOLUTION_SWEEP via DinoEncoder.with_resolution() — the weights don't depend on
+        # img_size (a ViT interpolates its position embeddings per forward call from the
+        # actual input shape), only the per-resolution grid/preprocessing/positional-basis
+        # bookkeeping does, so the old code's fresh DinoEncoder() per (size, resolution) point
+        # re-ran the same torch.hub.load + state_dict load len(RESOLUTION_SWEEP) times (5x) for
+        # every size, for no reason. Built at RESOLUTION_SWEEP[0] so that first point can reuse
+        # it directly with no with_resolution() call at all.
+        base_raw_encoder = None
+        try:
+            base_raw_encoder = DinoEncoder(
+                version=DINO_VERSION,
+                size=dino_size,
+                img_size=RESOLUTION_SWEEP[0],
+                weights_dir=DINO_WEIGHTS_DIR,
+                amp=True,
+            )
+            # layer_idx is block-count- (architecture-) dependent, not resolution-dependent, so
+            # it's derived once per size here rather than once per (size, resolution) point.
+            layer_idx = len(base_raw_encoder.backbone.blocks) - 1
+        except torch.OutOfMemoryError as exc:
+            log.error(
+                "size=%s: FAILED to load backbone (CUDA OOM) — skipping every resolution for "
+                "this size: %s",
+                dino_size,
+                exc,
+            )
+            oom_failures.append((f"size={dino_size}/res=ALL", str(exc)))
+            pbar.update(len(RESOLUTION_SWEEP) * units_per_point)
+            del base_raw_encoder
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            continue
+
         for resolution in RESOLUTION_SWEEP:
             point_tag = f"size={dino_size}/res={resolution}"
             units_done = 0
@@ -341,16 +376,11 @@ with tqdm(total=n_sweep_units, desc="Part 3: per-(size,resolution) 1-1/5-3 CV sw
             image_encodings = gt_patch_masks = None
             fg_by_instance_scale = bg_by_instance_scale = None
             try:
-                raw_encoder = DinoEncoder(
-                    version=DINO_VERSION,
-                    size=dino_size,
-                    img_size=resolution,
-                    weights_dir=DINO_WEIGHTS_DIR,
-                    amp=True,
+                raw_encoder = (
+                    base_raw_encoder
+                    if resolution == RESOLUTION_SWEEP[0]
+                    else DinoEncoder.with_resolution(base_raw_encoder, resolution)
                 )
-                # layer_idx derived live from the just-built backbone's own block count — see
-                # the DINO_SIZES parameter comment above for why this can't be a constant here.
-                layer_idx = len(raw_encoder.backbone.blocks) - 1
                 log.info(
                     "=== %s | depth=%d layer_idx=%d | grid=%dx%d ===",
                     point_tag,
@@ -479,6 +509,16 @@ with tqdm(total=n_sweep_units, desc="Part 3: per-(size,resolution) 1-1/5-3 CV sw
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+
+        # Only now — after every resolution for this size has run — is the shared backbone
+        # actually freed. Each per-resolution `del raw_encoder` above only ever dropped that
+        # point's own DinoEncoder wrapper; base_raw_encoder (and the backbone submodule every
+        # with_resolution() call shared with it) stayed alive across the whole inner loop,
+        # which is the entire point of building it once per size instead of once per point.
+        del base_raw_encoder
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 results_df = pd.DataFrame(results)
 results_df.to_csv(OUTPUT_DIR / "oracle_iou_per_sample.csv", index=False)
