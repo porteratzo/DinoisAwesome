@@ -169,6 +169,18 @@ script's docstring explicitly builds on the previous one's finding. All three ar
 cell-based, need `data/abc3`, and save figures under
 `outputs/fundamental/<script_name>/`.
 
+**Running the whole suite from one cfg:** every script below still works exactly as
+described here — cell-by-cell in an Interactive Window, hardcoded parameters — but
+`scripts/run_fundamental_suite.py` can also drive some or all of them from a single
+YAML config (`experiments/fundamental/suite_config.example.yaml` is a starting point),
+one subprocess per script. Each run gets its own
+`outputs/fundamental_runs/<timestamp>_<name>/` directory (never overwrites a previous
+run), with a copy of the exact cfg used, a per-script log, and a `manifest.json`
+summary. See that script's own docstring/`--help` for the cfg format (shared
+`defaults:` + per-script override sections, keyed by lowercase snake_case names of
+each script's own UPPERCASE constants) and `experiments/_shared/run_config.py` for how
+a script picks the overrides up.
+
 1. **`scale_crop_similarity.py`** — as you crop progressively tighter around one
    instance, how far does its patch embedding move in feature space?
 2. **`augmentation_sensitivity.py`** — holding the crop fixed, how far do six

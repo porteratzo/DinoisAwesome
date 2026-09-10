@@ -67,6 +67,7 @@ from _shared.latency import cuda_timer, images_per_sec  # noqa: E402
 from _shared.mask_geometry import pixel_mask_to_patch_mask, scale_crop_box  # noqa: E402
 from _shared.prototype_ops import knn_score_heatmap, score_heatmap  # noqa: E402
 from _shared.qualitative_gallery import ScoredExample, save_score_gallery  # noqa: E402
+from _shared.run_config import apply_overrides, load_run_config, resolve_output_dir  # noqa: E402
 from _shared.stats import bootstrap_ci, bootstrap_prob_greater  # noqa: E402
 from _shared.thresholding import achievable_iou, oracle_iou  # noqa: E402
 
@@ -124,11 +125,14 @@ BOOTSTRAP_SEED = 0
 # part_type) order. Seeded from OS entropy (no fixed seed), not from SEED below: folds should
 # be genuinely randomized on every run, not the same replayed permutations forever.
 SEED = 0
+
+apply_overrides(globals(), load_run_config(__file__))
 torch.manual_seed(SEED)
 fold_rng = np.random.default_rng()
 
-OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental_abc5" / "training_set_size_ablation"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR = resolve_output_dir(
+    _REPO_ROOT / "outputs" / "fundamental_abc5" / "training_set_size_ablation"
+)
 
 log.info(
     "dataset=%s part_types=%s all_numbers=%s N_TRAIN_SWEEP=%s n_eval=%d n_folds=%d  |  "

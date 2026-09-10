@@ -35,6 +35,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("drift_vs_iou_correlation")
 
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -42,10 +43,18 @@ import pandas as pd
 from dotenv import load_dotenv
 from scipy.stats import pearsonr, spearmanr
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from _shared.run_config import apply_overrides, load_run_config, resolve_output_dir  # noqa: E402
+
 # %% Parameters
 _REPO_ROOT = Path(__file__).parent.parent.parent
 load_dotenv(_REPO_ROOT / ".env")
 
+# Read from wherever augmentation_sensitivity.py/augmented_prototype_oracle_iou_knn_fgbg.py wrote
+# their CSVs — their own *default* location unless overridden. When chaining this into one
+# suite run alongside those two, point these at that run's own RUN_DIR via cfg overrides
+# (`drift_csv`/`iou_csv`), otherwise this reads whatever's already at the global default path
+# (or raises below if nothing's there yet) rather than that run's freshly written CSVs.
 DRIFT_CSV = (
     _REPO_ROOT / "outputs" / "fundamental_abc5" / "augmentation_sensitivity" / "drift_summary.csv"
 )
@@ -57,8 +66,11 @@ IOU_CSV = (
     / "composed_endpoint.csv"
 )
 
-OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental_abc5" / "drift_vs_iou_correlation"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+apply_overrides(globals(), load_run_config(__file__))
+
+OUTPUT_DIR = resolve_output_dir(
+    _REPO_ROOT / "outputs" / "fundamental_abc5" / "drift_vs_iou_correlation"
+)
 
 for csv_path, script_name in (
     (DRIFT_CSV, "augmentation_sensitivity.py"),

@@ -65,6 +65,7 @@ from _shared.mask_geometry import (  # noqa: E402
     pixel_mask_to_patch_mask,
     scale_crop_box,
 )
+from _shared.run_config import apply_overrides, load_run_config, resolve_output_dir  # noqa: E402
 from _shared.stats import bootstrap_ci, bootstrap_prob_greater  # noqa: E402
 
 # %% Parameters
@@ -105,11 +106,12 @@ BOOTSTRAP_SEED = 0
 # is needed (see the qualitative Part below); n is just how many of each side to show.
 QUALITATIVE_N = 3
 
-OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental" / "scale_crop_similarity"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
 SEED = 0
+
+apply_overrides(globals(), load_run_config(__file__))
 torch.manual_seed(SEED)
+
+OUTPUT_DIR = resolve_output_dir(_REPO_ROOT / "outputs" / "fundamental" / "scale_crop_similarity")
 
 log.info(
     "image=%s class=%r  |  DINO%s-%s img_size=%d layer=%d  |  n_scales=%d",

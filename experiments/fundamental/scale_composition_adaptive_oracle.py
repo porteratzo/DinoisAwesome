@@ -58,6 +58,7 @@ from _shared.latency import cuda_timer, images_per_sec  # noqa: E402
 from _shared.mask_geometry import pixel_mask_to_patch_mask  # noqa: E402
 from _shared.prototype_ops import knn_score_heatmap, score_heatmap  # noqa: E402
 from _shared.qualitative_gallery import ScoredExample, save_score_gallery  # noqa: E402
+from _shared.run_config import apply_overrides, load_run_config, resolve_output_dir  # noqa: E402
 from _shared.stats import bootstrap_ci, bootstrap_prob_greater  # noqa: E402
 from _shared.thresholding import achievable_iou, oracle_iou  # noqa: E402
 
@@ -105,10 +106,13 @@ N_BOOTSTRAP = 2000
 BOOTSTRAP_SEED = 0
 
 SEED = 0
+
+apply_overrides(globals(), load_run_config(__file__))
 torch.manual_seed(SEED)
 
-OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental_abc5" / "scale_composition_adaptive_oracle"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR = resolve_output_dir(
+    _REPO_ROOT / "outputs" / "fundamental_abc5" / "scale_composition_adaptive_oracle"
+)
 
 log.info(
     "RUN_PAIRS=%d units (%s)  |  DINO%s-%s img_size=%d layer=%d  |  n_scale_steps=%d",

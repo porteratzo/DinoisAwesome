@@ -1,0 +1,33 @@
+# Example config for scripts/run_fundamental_suite.py.
+#
+#   python scripts/run_fundamental_suite.py \
+#       --config experiments/fundamental/suite_config.example.yaml \
+#       --name my-run
+#
+# `defaults:` applies to every script in the suite; a section named after a script's
+# own filename (without .py) overrides `defaults:` for that script only. A key only
+# takes effect if the target script already defines a same-named UPPERCASE constant
+# in its "# %% Parameters" cell (e.g. `dino_size:` -> `DINO_SIZE`) — unmatched keys are
+# logged as warnings and ignored rather than silently doing nothing. `scripts:` is
+# optional; omit it to run the full suite (see `--list`), or use `--scripts` on the
+# command line to override this file's list for one invocation.
+#
+# `name:` here is a fallback used only when --name isn't passed on the command line.
+
+name: example-run
+
+scripts:
+  - scale_crop_similarity
+  - augmentation_sensitivity
+  - debias_ablation
+
+defaults:
+  dino_size: base
+  img_size: 768
+  seed: 0
+
+scale_crop_similarity:
+  n_scales: 9
+
+debias_ablation:
+  dino_size: large
