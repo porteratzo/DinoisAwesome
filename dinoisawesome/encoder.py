@@ -143,6 +143,11 @@ class DinoEncoder(nn.Module):  # type: ignore[misc]  # torch's Module stubs reso
                      input list/tensor into chunks of at most this size and concatenates
                      the results, so callers can pass an arbitrarily long list without
                      batching manually or risking a CUDA OOM from one oversized pass.
+
+    Internal (do not pass directly — use `DinoEncoder.with_resolution()` instead):
+        _backbone:           Reuse this already-loaded backbone module instead of loading one
+                              from torch hub/disk. When given, `weights_dir` is ignored.
+        _weights_signature:  `weights_signature` to record alongside a reused `_backbone`.
     """
 
     def __init__(
@@ -157,6 +162,8 @@ class DinoEncoder(nn.Module):  # type: ignore[misc]  # torch's Module stubs reso
         svd_components: int = 8,
         weights_dir: str | Path | None = None,
         max_batch_size: int = 16,
+        _backbone: nn.Module | None = None,
+        _weights_signature: str | None = None,
     ) -> None:
         super().__init__()
 
@@ -193,7 +200,12 @@ class DinoEncoder(nn.Module):  # type: ignore[misc]  # torch's Module stubs reso
             )
 
         model_name = _MODEL_NAMES[(version, size)]
-        if weights_dir is not None:
+        if _backbone is not None:
+            # Reused from another DinoEncoder (see with_resolution()) — skip torch hub/disk
+            # entirely; the weights don't depend on img_size, only the bookkeeping below does.
+            backbone = _backbone
+            self.weights_signature = _weights_signature
+        elif weights_dir is not None:
             weights_path = _find_weights_file(Path(weights_dir), model_name)
             self.weights_signature = f"{weights_path}:{weights_path.stat().st_mtime_ns}"
             _log.info("Loading %s architecture from hub (no pretrained weights)", model_name)
@@ -231,6 +243,45 @@ class DinoEncoder(nn.Module):  # type: ignore[misc]  # torch's Module stubs reso
                 transforms.ToTensor(),
                 transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
             ]
+        )
+
+    @classmethod
+    def with_resolution(cls, base: DinoEncoder, img_size: int) -> DinoEncoder:
+        """Build a new `DinoEncoder` at a different `img_size`, reusing *base*'s already-loaded
+        backbone instead of re-running torch.hub.load + weight loading.
+
+        The backbone's weights don't depend on img_size — a ViT interpolates its position
+        embeddings per forward call based on the actual input shape — so only img_size-dependent
+        bookkeeping differs from *base*: grid dimensions, the preprocess Resize target, and the
+        positional-basis/debias cache (rebuilt lazily on first `debias=True` call, since the
+        patch grid — and therefore the positional subspace — changes with resolution).
+        `version`, `size`, `layers`, `device`, `amp`, `dtype`, `svd_components`, and
+        `max_batch_size` are all copied from *base* unchanged.
+
+        Intended for sweeps that vary resolution while holding backbone size fixed (see
+        `experiments/fundamental/resolution_ablation.py`), where constructing a fresh
+        `DinoEncoder` per resolution point reloads the same weights from torch hub/disk
+        redundantly at every point.
+
+        Args:
+            base:     An already-constructed `DinoEncoder` whose backbone to reuse.
+            img_size: The new square input resolution (same divisibility rule as `__init__`).
+
+        Returns:
+            A new `DinoEncoder` sharing `base.backbone` (same object, not a copy).
+        """
+        return cls(
+            version=base.version,
+            size=base.size,
+            img_size=img_size,
+            layers=base.layers,
+            device=base.device,
+            amp=base.amp,
+            dtype=base.model_dtype,
+            svd_components=base.svd_components,
+            max_batch_size=base.max_batch_size,
+            _backbone=base.backbone,
+            _weights_signature=base.weights_signature,
         )
 
     def _autocast_ctx(self) -> contextlib.AbstractContextManager[Any]:
