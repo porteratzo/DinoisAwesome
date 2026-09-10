@@ -167,6 +167,12 @@ class EncoderWithCache:
             )
 
         self._encoder = encoder
+        # Cumulative across every `forward()` call on this instance — callers sweeping a
+        # resolution/size/config axis can read these after each point to report cache
+        # effectiveness (e.g. `outputs/.../latency.csv`'s hit_rate column) instead of only the
+        # per-call log line below.
+        self.total_hits = 0
+        self.total_misses = 0
         self._fingerprint = EncoderFingerprint.from_encoder(encoder)
         self._fingerprint_dir = Path(resolved) / self._fingerprint.digest
         self._embeddings_dir = self._fingerprint_dir / "embeddings"
@@ -236,9 +242,12 @@ class EncoderWithCache:
             else:
                 miss_positions.append(i)
 
+        n_hits = len(items) - len(miss_positions)
+        self.total_hits += n_hits
+        self.total_misses += len(miss_positions)
         _log.info(
             "EncoderWithCache: %d/%d hits (layers=%s debias=%s)",
-            len(items) - len(miss_positions),
+            n_hits,
             len(items),
             layers_key,
             debias,
