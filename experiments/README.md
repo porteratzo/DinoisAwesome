@@ -138,6 +138,13 @@ cross-validating instead (data `abc5`, save under `outputs/fundamental_abc5/<scr
   5-train/3-eval regimes (2-fold CV each), to tell a real resolution trend from
   fold-to-fold noise and check it against `object_detection/resolution_ablation/`'s
   own fixed-pair (uncross-validated) resolution sweep.
+- **`debias_ablation.py`** — applies the same 1-1-vs-5-3 CV check to `DinoEncoder`'s
+  `debias=True` positional-debiasing flag (every other script in the repo passes it
+  unconditionally, never ablated against `debias=False`): does projecting out the
+  INSID3-derived positional subspace actually improve oracle IoU, at both endpoints and
+  for both `single_proto`/`knn_fgbg` scoring? Also reports a paired per-sample IoU delta
+  (matched on the same fold/pool/eval-image), a more sensitive check than comparing the
+  two arms' independent means.
 
 ## `object_detection/` — training-free instance detection (actively maintained)
 
