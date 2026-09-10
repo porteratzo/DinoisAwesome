@@ -64,6 +64,7 @@ import torch
 import torch.nn.functional as F
 from dotenv import load_dotenv
 from PIL import Image
+from scipy.stats import pearsonr, spearmanr
 from tqdm import tqdm
 
 from dinoisawesome import DinoEncoder, EncoderWithCache, compute_exemplar_features, load_annotations
@@ -79,8 +80,10 @@ from _shared.augmentations import (  # noqa: E402
     mean_color,
     pixel_only,
 )
+from _shared.latency import cuda_timer, images_per_sec  # noqa: E402
 from _shared.mask_geometry import pixel_mask_to_patch_mask, scale_crop_box  # noqa: E402
 from _shared.run_config import apply_overrides, load_run_config, resolve_output_dir  # noqa: E402
+from _shared.stats import bootstrap_ci, bootstrap_prob_greater  # noqa: E402
 
 # %% Parameters
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -115,6 +118,20 @@ DINO_ENCODING_CACHE_DIR: str | None = os.environ.get("DINO_ENCODING_CACHE_DIR")
 
 MASK_PATCH_THRESHOLD = 0.3  # patch-grid cell counts as "object" once this fraction is masked
 MID_PADDING_FRACTION = 1.0  # mid-crop padding around the mask bbox, fraction of its extent
+
+# One representative (family, severity) point whose individual crops get kept as PIL images
+# for the worst/best-N qualitative gallery below — collecting every instance's image at every
+# family/severity would multiply memory cost by n_instances x n_families x n_severities, so
+# only this one point (the strongest tested severity of "gaussian blur" — a real-world-relevant
+# failure mode per the module docstring's own factory-floor framing) is captured, capped at
+# QUALITATIVE_MAX_EXAMPLES. Must be a member of AUGMENTATIONS above.
+QUALITATIVE_FAMILY = "gaussian blur"
+QUALITATIVE_SEVERITY_INDEX = -1  # index into AUGMENTATIONS[QUALITATIVE_FAMILY]["values"]
+QUALITATIVE_MAX_EXAMPLES = 60  # capped so the gallery figure itself stays a readable size
+
+# Bootstrap settings for the drift-summary CI and the mildest-vs-strongest significance check.
+N_BOOTSTRAP = 2000
+BOOTSTRAP_SEED = 0
 
 SEED = 0
 
@@ -245,61 +262,93 @@ encoder = DinoEncoder(
 encoder = EncoderWithCache(encoder, cache_dir=DINO_ENCODING_CACHE_DIR)
 chunk_size = encoder.max_batch_size
 
+qualitative_severity_value = AUGMENTATIONS[QUALITATIVE_FAMILY]["values"][QUALITATIVE_SEVERITY_INDEX]
+n_qualitative_imgs_kept = 0  # bounds how many non-reference crops keep their PIL image below
+
 entries: list[dict] = []
-for inst in tqdm(instances, desc="Building + encoding augmented crops"):
-    is_reference = inst is reference_instance
-    inst_entries: list[dict] = []
-    for family, spec in AUGMENTATIONS.items():
-        for val in spec["values"]:
-            img, mask_px = spec["apply"](inst["base_crop"], inst["base_mask_px"], val, inst["fill"])
-            inst_entries.append(
-                {
-                    "dataset": inst["dataset"],
-                    "image_stem": inst["image_stem"],
-                    "class": inst["class"],
-                    "instance_id": inst["instance_id"],
-                    "family": family,
-                    "value": val,
-                    "img": img,
-                    "mask_px": mask_px,
-                }
-            )
-
-    for i in range(0, len(inst_entries), chunk_size):
-        chunk = inst_entries[i : i + chunk_size]
-        out = encoder([e["img"] for e in chunk], layers=[LAYER_IDX], debias=True)
-        chunk_patches = out.patches[:, 0].cpu()  # (chunk, grid_h, grid_w, D) — freed at loop end
-        D = chunk_patches.shape[-1]
-
-        for entry, patch_tokens in zip(chunk, chunk_patches):
-            patch_mask = pixel_mask_to_patch_mask(
-                entry["mask_px"], encoder.grid_h, encoder.grid_w, IMG_SIZE, MASK_PATCH_THRESHOLD
-            )
-            tokens = F.normalize(
-                patch_tokens.reshape(encoder.grid_h * encoder.grid_w, D), p=2, dim=-1
-            )
-            patch_flat = torch.from_numpy(patch_mask.reshape(-1)).to(tokens.device)
-
-            masked = tokens[patch_flat]
-            if masked.shape[0] == 0:
-                log.warning(
-                    "image=%s class=%s instance=%s family=%s value=%s: mask empty after patch-grid "
-                    "projection — using all crop patches",
-                    entry["image_stem"],
-                    entry["class"],
-                    entry["instance_id"],
-                    entry["family"],
-                    entry["value"],
+latency_rows: list[dict] = []
+with cuda_timer() as t_crop_encode:
+    for inst in tqdm(instances, desc="Building + encoding augmented crops"):
+        is_reference = inst is reference_instance
+        inst_entries: list[dict] = []
+        for family, spec in AUGMENTATIONS.items():
+            for val in spec["values"]:
+                img, mask_px = spec["apply"](
+                    inst["base_crop"], inst["base_mask_px"], val, inst["fill"]
                 )
-                masked = tokens
-            entry["embedding"] = compute_exemplar_features(masked, mode="mean")  # (1, D)
-            entry["n_masked_patches"] = int(patch_flat.sum())
+                inst_entries.append(
+                    {
+                        "dataset": inst["dataset"],
+                        "image_stem": inst["image_stem"],
+                        "class": inst["class"],
+                        "instance_id": inst["instance_id"],
+                        "family": family,
+                        "value": val,
+                        "img": img,
+                        "mask_px": mask_px,
+                    }
+                )
 
-    if not is_reference:
-        for e in inst_entries:
-            e.pop("img", None)
-            e.pop("mask_px", None)
-    entries.extend(inst_entries)
+        for i in range(0, len(inst_entries), chunk_size):
+            chunk = inst_entries[i : i + chunk_size]
+            out = encoder([e["img"] for e in chunk], layers=[LAYER_IDX], debias=True)
+            chunk_patches = out.patches[:, 0].cpu()  # (chunk, grid_h, grid_w, D) — freed at loop end
+            D = chunk_patches.shape[-1]
+
+            for entry, patch_tokens in zip(chunk, chunk_patches):
+                patch_mask = pixel_mask_to_patch_mask(
+                    entry["mask_px"], encoder.grid_h, encoder.grid_w, IMG_SIZE, MASK_PATCH_THRESHOLD
+                )
+                tokens = F.normalize(
+                    patch_tokens.reshape(encoder.grid_h * encoder.grid_w, D), p=2, dim=-1
+                )
+                patch_flat = torch.from_numpy(patch_mask.reshape(-1)).to(tokens.device)
+
+                masked = tokens[patch_flat]
+                if masked.shape[0] == 0:
+                    log.warning(
+                        "image=%s class=%s instance=%s family=%s value=%s: mask empty after "
+                        "patch-grid projection — using all crop patches",
+                        entry["image_stem"],
+                        entry["class"],
+                        entry["instance_id"],
+                        entry["family"],
+                        entry["value"],
+                    )
+                    masked = tokens
+                entry["embedding"] = compute_exemplar_features(masked, mode="mean")  # (1, D)
+                entry["n_masked_patches"] = int(patch_flat.sum())
+                # Object-size proxy for Part "size correlation" below: this crop's own object
+                # patch-mask coverage, not a scored ground-truth region (this script has no
+                # IoU/oracle-threshold step) — see that Part's docstring for why.
+                entry["mask_area_frac"] = float(patch_flat.sum()) / patch_flat.numel()
+
+        # Every non-reference instance's own PIL img/mask_px is dropped right after encoding to
+        # keep `entries` small (see module docstring) — except the one representative
+        # (QUALITATIVE_FAMILY, QUALITATIVE_SEVERITY_INDEX) point's crops, kept (capped at
+        # QUALITATIVE_MAX_EXAMPLES total across all instances) for the worst/best-N qualitative
+        # gallery below, which needs the actual images to show.
+        if not is_reference:
+            for e in inst_entries:
+                if (
+                    e["family"] == QUALITATIVE_FAMILY
+                    and e["value"] == qualitative_severity_value
+                    and n_qualitative_imgs_kept < QUALITATIVE_MAX_EXAMPLES
+                ):
+                    n_qualitative_imgs_kept += 1
+                    continue
+                e.pop("img", None)
+                e.pop("mask_px", None)
+        entries.extend(inst_entries)
+
+latency_rows.append(
+    {
+        "phase": "augmented_crop_encode",
+        "elapsed_s": t_crop_encode["elapsed_s"],
+        "n_units": len(entries),
+        "units_per_sec": images_per_sec(len(entries), t_crop_encode["elapsed_s"]),
+    }
+)
 
 log.info(
     "Built + encoded %d augmented crops across %d instances x %d families",
@@ -324,28 +373,77 @@ for family, spec in AUGMENTATIONS.items():
             )
             baseline_by_instance_family[key] = entry["embedding"]
 
-for entry in entries:
-    key = (
-        entry["dataset"],
-        entry["image_stem"],
-        entry["class"],
-        entry["instance_id"],
-        entry["family"],
-    )
-    baseline = baseline_by_instance_family[key]
-    entry["similarity"] = float((entry["embedding"] @ baseline.T).item())
+with cuda_timer() as t_scoring:
+    for entry in entries:
+        key = (
+            entry["dataset"],
+            entry["image_stem"],
+            entry["class"],
+            entry["instance_id"],
+            entry["family"],
+        )
+        baseline = baseline_by_instance_family[key]
+        entry["similarity"] = float((entry["embedding"] @ baseline.T).item())
+latency_rows.append(
+    {
+        "phase": "similarity_scoring",
+        "elapsed_s": t_scoring["elapsed_s"],
+        "n_units": len(entries),
+        "units_per_sec": images_per_sec(len(entries), t_scoring["elapsed_s"]),
+    }
+)
+cache_hits, cache_misses = encoder.total_hits, encoder.total_misses
+cache_total = cache_hits + cache_misses
+latency_rows.append(
+    {
+        "phase": "total",
+        "elapsed_s": t_crop_encode["elapsed_s"] + t_scoring["elapsed_s"],
+        "n_units": len(entries),
+        "units_per_sec": float("nan"),
+        "cache_hits": cache_hits,
+        "cache_misses": cache_misses,
+        "cache_hit_rate": cache_hits / cache_total if cache_total > 0 else float("nan"),
+    }
+)
+latency_df = pd.DataFrame(latency_rows)
+latency_df.to_csv(OUTPUT_DIR / "latency.csv", index=False)
+log.info(
+    "Latency: augmented_crop_encode=%.1fs similarity_scoring=%.1fs total=%.1fs "
+    "cache_hit_rate=%.2f (%d hits / %d misses) — no sweep axis in this script, so no "
+    "latency.png (see latency.csv for the per-phase breakdown)",
+    t_crop_encode["elapsed_s"],
+    t_scoring["elapsed_s"],
+    t_crop_encode["elapsed_s"] + t_scoring["elapsed_s"],
+    cache_hits / cache_total if cache_total > 0 else float("nan"),
+    cache_hits,
+    cache_misses,
+)
 
 drift_summary: dict[str, dict[str, np.ndarray]] = {}
 for family, spec in AUGMENTATIONS.items():
     mean_sim = []
     std_sim = []
+    ci_lo_sim = []
+    ci_hi_sim = []
     for val in spec["values"]:
         sims = np.array(
             [e["similarity"] for e in entries if e["family"] == family and e["value"] == val]
         )
         mean_sim.append(float(sims.mean()))
         std_sim.append(float(sims.std()))
-    drift_summary[family] = {"mean": np.array(mean_sim), "std": np.array(std_sim)}
+        # Percentile bootstrap CI on the mean, alongside the plain std this script already
+        # reported — std alone doesn't say whether e.g. this severity's and the no-op severity's
+        # mean similarity are actually distinguishable across instances or both plausible draws
+        # from the same distribution; see _shared/stats.py.
+        _, ci_lo, ci_hi = bootstrap_ci(sims, n_boot=N_BOOTSTRAP, seed=BOOTSTRAP_SEED)
+        ci_lo_sim.append(ci_lo)
+        ci_hi_sim.append(ci_hi)
+    drift_summary[family] = {
+        "mean": np.array(mean_sim),
+        "std": np.array(std_sim),
+        "ci_lo": np.array(ci_lo_sim),
+        "ci_hi": np.array(ci_hi_sim),
+    }
     log.info(
         "%-22s values=%s  mean_sim=%s  std=%s",
         family,
@@ -365,6 +463,7 @@ entries_df = pd.DataFrame(
             "family": e["family"],
             "value": e["value"],
             "n_masked_patches": e["n_masked_patches"],
+            "mask_area_frac": e["mask_area_frac"],
             "similarity": e["similarity"],
         }
         for e in entries
@@ -373,10 +472,21 @@ entries_df = pd.DataFrame(
 entries_df.to_csv(OUTPUT_DIR / "per_crop_similarity.csv", index=False)
 
 summary_rows = [
-    {"family": family, "value": val, "mean_similarity": mean, "std_similarity": std}
+    {
+        "family": family,
+        "value": val,
+        "mean_similarity": mean,
+        "std_similarity": std,
+        "ci95_lo": ci_lo,
+        "ci95_hi": ci_hi,
+    }
     for family, spec in AUGMENTATIONS.items()
-    for val, mean, std in zip(
-        spec["values"], drift_summary[family]["mean"], drift_summary[family]["std"]
+    for val, mean, std, ci_lo, ci_hi in zip(
+        spec["values"],
+        drift_summary[family]["mean"],
+        drift_summary[family]["std"],
+        drift_summary[family]["ci_lo"],
+        drift_summary[family]["ci_hi"],
     )
 ]
 summary_df = pd.DataFrame(summary_rows)
@@ -388,6 +498,128 @@ log.info(
     OUTPUT_DIR / "drift_summary.csv",
     summary_df.to_string(index=False),
 )
+
+# %% Is the mildest-vs-strongest severity drop within each family real, or just per-instance
+# noise? An unpaired bootstrap comparison (see _shared/stats.py) of the mildest tested
+# severity's vs. the strongest tested severity's per-instance similarity arrays, per family —
+# the significance check `drift_curves.png` below leaves the reader to eyeball. "Mildest" here
+# is `spec["values"][1]` (the first real perturbation), not `spec["values"][0]` (the literal
+# no-op, whose similarity is always exactly 1.0 for every instance by construction — a
+# degenerate, zero-variance comparison that would tell us nothing).
+significance_rows = []
+for family, spec in AUGMENTATIONS.items():
+    if len(spec["values"]) < 2:
+        continue
+    mild_val, strong_val = spec["values"][1], spec["values"][-1]
+    mild_vals = np.array(
+        [e["similarity"] for e in entries if e["family"] == family and e["value"] == mild_val]
+    )
+    strong_vals = np.array(
+        [e["similarity"] for e in entries if e["family"] == family and e["value"] == strong_val]
+    )
+    prob_mild_greater = bootstrap_prob_greater(
+        mild_vals, strong_vals, n_boot=N_BOOTSTRAP, seed=BOOTSTRAP_SEED
+    )
+    significance_rows.append(
+        {
+            "family": family,
+            "value_mild": mild_val,
+            "value_strong": strong_val,
+            "prob_mild_beats_strong": prob_mild_greater,
+            "n_mild": len(mild_vals),
+            "n_strong": len(strong_vals),
+        }
+    )
+significance_df = pd.DataFrame(significance_rows)
+significance_df.to_csv(OUTPUT_DIR / "augmentation_effect_significance.csv", index=False)
+log.info(
+    "Mildest-vs-strongest severity significance (P(mild mean similarity > strong mean "
+    "similarity) under %d-resample bootstrap; near 0.5 = indistinguishable from noise):",
+    N_BOOTSTRAP,
+)
+for _, row in significance_df.iterrows():
+    log.info(
+        "  %-22s P(value=%s beats value=%s)=%.3f (n=%d vs n=%d)",
+        row.family,
+        row.value_mild,
+        row.value_strong,
+        row.prob_mild_beats_strong,
+        row.n_mild,
+        row.n_strong,
+    )
+log.info("Wrote %s", OUTPUT_DIR / "augmentation_effect_significance.csv")
+
+# %% Does object size correlate with how much an augmentation moves the embedding? This script
+# has no GT/IoU scoring (it measures embedding drift via cosine similarity, not localization),
+# so `mask_area_frac` (this crop's own object patch-mask coverage, added to every entries_df row
+# above) is correlated against `similarity` directly rather than against an oracle_iou — the
+# adapted version of the size-correlation check `scale_composition_adaptive_oracle.py`'s own
+# Part 7 established for instance size vs. optimal scale. Grouped by family, the same grouping
+# this script's own headline breakdown (`drift_summary.csv`) already uses.
+size_correlation_rows = []
+for family in AUGMENTATIONS:
+    sub = entries_df[entries_df.family == family]
+    if len(sub) < 3:
+        continue
+    pearson_r, pearson_p = pearsonr(sub["mask_area_frac"], sub["similarity"])
+    spearman_r, spearman_p = spearmanr(sub["mask_area_frac"], sub["similarity"])
+    size_correlation_rows.append(
+        {
+            "family": family,
+            "pearson_r": pearson_r,
+            "pearson_p": pearson_p,
+            "spearman_r": spearman_r,
+            "spearman_p": spearman_p,
+            "n_samples": len(sub),
+        }
+    )
+size_correlation_df = pd.DataFrame(size_correlation_rows)
+size_correlation_df.to_csv(OUTPUT_DIR / "size_correlation.csv", index=False)
+
+# Object-size terciles (global, computed once across every row so the same size cutoffs apply
+# everywhere) x similarity, faceted by family — does the smallest third of instances lose more
+# similarity than the largest third under the same augmentation?
+try:
+    entries_df["size_tercile"] = pd.qcut(
+        entries_df["mask_area_frac"], 3, labels=["small", "medium", "large"]
+    )
+except ValueError:
+    log.warning(
+        "mask_area_frac has too few distinct values for 3 clean terciles — falling back to "
+        "qcut's own duplicate-safe binning (labels become numeric ranges, not small/medium/large)"
+    )
+    entries_df["size_tercile"] = pd.qcut(entries_df["mask_area_frac"], 3, duplicates="drop")
+
+n_families = len(AUGMENTATIONS)
+fig, axes = plt.subplots(1, n_families, figsize=(4 * n_families, 5), sharey=True)
+for ax, family in zip(axes, AUGMENTATIONS):
+    tercile_means = (
+        entries_df[entries_df.family == family].groupby("size_tercile", observed=True)["similarity"]
+        .mean()
+    )
+    tercile_means.plot(kind="bar", ax=ax, color="#2ecc71")
+    ax.set_title(family, fontsize=9)
+    ax.set_xlabel("object-size tercile")
+    ax.set_ylim(0, 1.02)
+    ax.grid(alpha=0.3, axis="y")
+axes[0].set_ylabel("mean similarity to severity=0 (pooled across severities)")
+fig.suptitle("Does object size predict augmentation robustness?")
+fig.tight_layout()
+fig.savefig(OUTPUT_DIR / "size_correlation.png", dpi=150, bbox_inches="tight")
+plt.close(fig)
+log.info(
+    "Wrote %s and %s", OUTPUT_DIR / "size_correlation.csv", OUTPUT_DIR / "size_correlation.png"
+)
+for _, row in size_correlation_df.iterrows():
+    log.info(
+        "  %-22s pearson_r=%.3f (p=%.3f)  spearman_r=%.3f (p=%.3f)  n=%d",
+        row.family,
+        row.pearson_r,
+        row.pearson_p,
+        row.spearman_r,
+        row.spearman_p,
+        row.n_samples,
+    )
 
 # %% Visualization — augmented crop grid, one row per family (reference instance only;
 # a grid across all instances would be unreadable, so this is a qualitative sample —
@@ -448,6 +680,65 @@ fig.savefig(OUTPUT_DIR / "drift_curves.png", dpi=150, bbox_inches="tight")
 
 log.info("Saved figures to %s", OUTPUT_DIR)
 
+# %% Worst/best-N qualitative gallery — actual individual crops at one representative
+# (QUALITATIVE_FAMILY, strongest severity) point, ranked by *similarity drop* rather than an
+# IoU score (this script has no GT/oracle-threshold step). Uses matplotlib imshow directly
+# rather than `_shared/qualitative_gallery.py`'s `save_score_gallery` helper, since that helper
+# expects a GT mask this drift-based use case doesn't have.
+qualitative_candidates = [
+    e
+    for e in entries
+    if e["family"] == QUALITATIVE_FAMILY
+    and e["value"] == qualitative_severity_value
+    and "img" in e
+]
+if qualitative_candidates:
+    ranked = sorted(qualitative_candidates, key=lambda e: e["similarity"])  # worst (lowest) first
+    n_show = min(5, len(ranked) // 2) or 1
+    worst = ranked[:n_show]
+    best = ranked[-n_show:][::-1]
+    fig, axes = plt.subplots(2, n_show, figsize=(2.8 * n_show, 6.2), squeeze=False)
+    for col, e in enumerate(worst):
+        axes[0, col].imshow(e["img"])
+        axes[0, col].set_title(
+            f"{e['image_stem']}/{e['class']}#{e['instance_id']}\nsim={e['similarity']:.3f}",
+            fontsize=8,
+        )
+        axes[0, col].axis("off")
+    for col in range(len(worst), n_show):
+        axes[0, col].axis("off")
+    for col, e in enumerate(best):
+        axes[1, col].imshow(e["img"])
+        axes[1, col].set_title(
+            f"{e['image_stem']}/{e['class']}#{e['instance_id']}\nsim={e['similarity']:.3f}",
+            fontsize=8,
+        )
+        axes[1, col].axis("off")
+    for col in range(len(best), n_show):
+        axes[1, col].axis("off")
+    axes[0, 0].set_ylabel("worst (lowest sim)", fontsize=9)
+    axes[1, 0].set_ylabel("best (highest sim)", fontsize=9)
+    fig.suptitle(
+        f"Worst/best similarity examples: family={QUALITATIVE_FAMILY!r} "
+        f"value={qualitative_severity_value} (n={len(qualitative_candidates)} candidates)"
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    fig.savefig(OUTPUT_DIR / "qualitative_worst_best.png", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    log.info(
+        "Wrote %s (%d candidates, showing worst/best %d)",
+        OUTPUT_DIR / "qualitative_worst_best.png",
+        len(qualitative_candidates),
+        n_show,
+    )
+else:
+    log.warning(
+        "No qualitative candidates collected for family=%s value=%s — check "
+        "QUALITATIVE_FAMILY/QUALITATIVE_SEVERITY_INDEX",
+        QUALITATIVE_FAMILY,
+        qualitative_severity_value,
+    )
+
 # %% [markdown]
 # ## Reading the results
 #
@@ -457,6 +748,37 @@ log.info("Saved figures to %s", OUTPUT_DIR)
 # variation (e.g. if `gaussian blur` drops fast, a slightly out-of-focus camera frame
 # is a bigger risk to a prototype-matching pipeline than `jpeg compression` at typical
 # stream-quality settings).
+#
+# This script measures embedding *drift* (cosine similarity vs. the instance's own
+# severity=0 embedding), not localization IoU, so the achievable-IoU addition from the
+# other `fundamental/` scripts doesn't apply here — there's no oracle-threshold step to
+# give a realistic counterpart to.
+#
+# - **`latency.csv`** — GPU-synchronized wall-clock cost (see `_shared/latency.py`) of the
+#   augmented-crop encoding pass and the similarity-scoring pass, plus encoding-cache
+#   hit/miss counts and hit rate. No sweep-axis plot (`latency.png`) — this script has one
+#   fixed model config, not a sweep of separate configs — see the logged total instead.
+# - **`drift_summary.csv`'s `ci95_lo`/`ci95_hi` columns** — a percentile bootstrap CI (2000
+#   resamples across instances) on each family/severity's mean similarity, alongside the
+#   plain std already reported — std alone doesn't say whether two severities' means are
+#   actually distinguishable or both plausible draws from the same distribution.
+# - **`augmentation_effect_significance.csv`** — an unpaired bootstrap comparison of the
+#   mildest tested (non-no-op) severity's vs. the strongest tested severity's per-instance
+#   similarity arrays, per family: `prob_mild_beats_strong` near 0.5 means that family's
+#   apparent drop in `drift_curves.png` is not distinguishable from per-instance noise.
+# - **`size_correlation.csv`/`.png`** — does an instance's own object-mask patch-coverage
+#   (`mask_area_frac`, added to every `per_crop_similarity.csv` row) correlate with how much
+#   similarity it loses under each augmentation family (pearson/spearman, mirroring
+#   `scale_composition_adaptive_oracle.py`'s own instance-size-vs-optimal-scale check, here
+#   against similarity directly since this script has no oracle_iou to correlate against)?
+#   Same aggregation-can-hide-an-effect caveat as every sibling script's own size checks —
+#   worth knowing whether a family that "drops fast" on average is actually a small-object
+#   problem specifically.
+# - **`qualitative_worst_best.png`** — actual worst-N/best-N individual crops (not an
+#   average) at one representative point (`QUALITATIVE_FAMILY`'s strongest tested severity),
+#   ranked by similarity drop rather than IoU (this script scores drift, not localization) —
+#   built with matplotlib `imshow` directly rather than `_shared/qualitative_gallery.py`'s
+#   `save_score_gallery`, which expects a GT mask this use case doesn't have.
 #
 # ## Other augmentation/robustness experiments worth running in this dir
 #

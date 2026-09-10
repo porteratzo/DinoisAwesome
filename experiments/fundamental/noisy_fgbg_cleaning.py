@@ -115,6 +115,7 @@ from dotenv import load_dotenv
 from matplotlib.colors import to_rgb
 from PIL import Image
 from scipy import ndimage
+from scipy.stats import pearsonr, spearmanr
 from sklearn.cluster import HDBSCAN
 from sklearn.decomposition import PCA
 from tqdm import tqdm
@@ -126,6 +127,7 @@ from dinoisawesome.instance_detection import extract_patch_tokens
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from _shared.abc3_combos import combo_key  # noqa: E402
 from _shared.dataset_pairs import REF_QUERY_PAIRS, RefQueryPair  # noqa: E402
+from _shared.latency import cuda_timer, images_per_sec  # noqa: E402
 from _shared.mask_geometry import patch_fg_fraction, scale_crop_box  # noqa: E402
 from _shared.pooled_gallery_cv import (  # noqa: E402
     MAX_BANK_SIZE_DENOISE_53,
@@ -139,8 +141,10 @@ from _shared.prototype_ops import (  # noqa: E402
     knn_score_heatmap,
     score_heatmap,
 )
+from _shared.qualitative_gallery import ScoredExample, save_score_gallery  # noqa: E402
 from _shared.run_config import apply_overrides, load_run_config, resolve_output_dir  # noqa: E402
-from _shared.thresholding import oracle_iou  # noqa: E402
+from _shared.stats import bootstrap_ci, bootstrap_prob_greater  # noqa: E402
+from _shared.thresholding import achievable_iou, oracle_iou  # noqa: E402
 
 # %% Parameters
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -228,6 +232,19 @@ STAGE_LABELS: dict[str, str] = {
 }
 METHODS: list[str] = ["proto", "knn_fgbg"]
 METHOD_COLOR: dict[str, str] = {"proto": "#7f8c8d", "knn_fgbg": "#2ecc71"}
+
+# One representative stage whose individual per-combo scoring results (query crop, raw
+# knn_fgbg score map, GT mask, oracle IoU) get kept for the worst/best-N qualitative gallery
+# in Part 7 below — collecting this for every stage would multiply memory/disk cost, so only
+# "raw" (today's single-threshold baseline, the most decision-relevant single stage to see
+# failure modes for) is captured.
+QUALITATIVE_STAGE = "raw"
+QUALITATIVE_MAX_EXAMPLES = 60  # capped so the gallery figure itself stays a readable size
+
+# Bootstrap settings for the headline CI (Part 8) and the 1-1-vs-5-3 significance check
+# (Part 11).
+N_BOOTSTRAP = 2000
+BOOTSTRAP_SEED = 0
 
 SEED = 0
 
@@ -671,10 +688,23 @@ encoder = DinoEncoder(
 encoder = EncoderWithCache(encoder, cache_dir=DINO_ENCODING_CACHE_DIR)
 chunk_size = encoder.max_batch_size
 
+latency_rows: list[dict] = []
+
 query_encodings: dict[str, dict] = {}
-for unit in tqdm(sorted(query_images), desc="Encoding query images"):
-    q_tokens, q_h, q_w = extract_patch_tokens(encoder, query_images[unit], LAYER_IDX, debias=DEBIAS)
-    query_encodings[unit] = {"q_tokens": q_tokens, "q_h": q_h, "q_w": q_w}
+with cuda_timer() as t_query_encode:
+    for unit in tqdm(sorted(query_images), desc="Encoding query images"):
+        q_tokens, q_h, q_w = extract_patch_tokens(
+            encoder, query_images[unit], LAYER_IDX, debias=DEBIAS
+        )
+        query_encodings[unit] = {"q_tokens": q_tokens, "q_h": q_h, "q_w": q_w}
+latency_rows.append(
+    {
+        "phase": "query_image_encode",
+        "elapsed_s": t_query_encode["elapsed_s"],
+        "n_units": len(query_images),
+        "units_per_sec": images_per_sec(len(query_images), t_query_encode["elapsed_s"]),
+    }
+)
 
 gt_patch_masks: dict[tuple[str, str], np.ndarray] = {}
 for (unit, group), pixel_mask in group_query_masks.items():
@@ -686,23 +716,56 @@ for (unit, group), pixel_mask in group_query_masks.items():
 # %% Part 3.5 — encode each ref/query unit's full, uncropped reference image once: the
 # "global" scale for every combo sharing that unit.
 ref_encodings: dict[str, dict] = {}
-for unit in tqdm(sorted(ref_images), desc="Encoding ref images (global scale)"):
-    r_tokens, r_h, r_w = extract_patch_tokens(encoder, ref_images[unit], LAYER_IDX, debias=DEBIAS)
-    ref_encodings[unit] = {"r_tokens": r_tokens, "r_h": r_h, "r_w": r_w}
+with cuda_timer() as t_ref_encode:
+    for unit in tqdm(sorted(ref_images), desc="Encoding ref images (global scale)"):
+        r_tokens, r_h, r_w = extract_patch_tokens(
+            encoder, ref_images[unit], LAYER_IDX, debias=DEBIAS
+        )
+        ref_encodings[unit] = {"r_tokens": r_tokens, "r_h": r_h, "r_w": r_w}
+latency_rows.append(
+    {
+        "phase": "ref_image_encode",
+        "elapsed_s": t_ref_encode["elapsed_s"],
+        "n_units": len(ref_images),
+        "units_per_sec": images_per_sec(len(ref_images), t_ref_encode["elapsed_s"]),
+    }
+)
+
+# Achievable IoU (Part 7 below) needs the reference/exemplar image's own GT projected to
+# patch space, mirroring gt_patch_masks above but for the image that *built* each combo's
+# gallery rather than the query being scored — the same "own-GT reference" pattern
+# scale_composition_bg_ablation.py's own Part 3 already established for a fixed-pair script
+# (the exemplar already has its own GT, so it can stand in for a query-time-labeled
+# reference without needing the query's own GT to tune a threshold).
+ref_gt_patch_masks: dict[tuple[str, str], np.ndarray] = {}
+for (unit, group), pixel_mask in group_ref_masks.items():
+    r = ref_encodings[unit]
+    ref_gt_patch_masks[(unit, group)] = (
+        patch_fg_fraction(pixel_mask, r["r_h"], r["r_w"], IMG_SIZE) >= MASK_PATCH_THRESHOLD
+    )
 
 # %% Part 4 — batched-encode every combo's mid/close crops (patch tokens + [CLS] token)
 crop_items: list[tuple[tuple, str]] = [
     (combo_key(c), scale) for c in combos for scale in c["crops"]
 ]
-for i in tqdm(range(0, len(crop_items), chunk_size), desc="Encoding mid/close crops"):
-    chunk = crop_items[i : i + chunk_size]
-    images = [combos_by_key[ck]["crops"][scale]["img"] for ck, scale in chunk]
-    encoded = extract_patch_tokens_batch_with_cls(encoder, images, LAYER_IDX, debias=DEBIAS)
-    for (ck, scale), (tokens, cls, grid_h, grid_w) in zip(chunk, encoded):
-        crop = combos_by_key[ck]["crops"][scale]
-        crop["tokens"], crop["grid_h"], crop["grid_w"] = tokens, grid_h, grid_w
-        if scale == "close":
-            crop["cls"] = cls
+with cuda_timer() as t_crop_encode:
+    for i in tqdm(range(0, len(crop_items), chunk_size), desc="Encoding mid/close crops"):
+        chunk = crop_items[i : i + chunk_size]
+        images = [combos_by_key[ck]["crops"][scale]["img"] for ck, scale in chunk]
+        encoded = extract_patch_tokens_batch_with_cls(encoder, images, LAYER_IDX, debias=DEBIAS)
+        for (ck, scale), (tokens, cls, grid_h, grid_w) in zip(chunk, encoded):
+            crop = combos_by_key[ck]["crops"][scale]
+            crop["tokens"], crop["grid_h"], crop["grid_w"] = tokens, grid_h, grid_w
+            if scale == "close":
+                crop["cls"] = cls
+latency_rows.append(
+    {
+        "phase": "gallery_crop_encode",
+        "elapsed_s": t_crop_encode["elapsed_s"],
+        "n_units": len(crop_items),
+        "units_per_sec": images_per_sec(len(crop_items), t_crop_encode["elapsed_s"]),
+    }
+)
 
 log.info("Encoded %d (combo, scale) crops with patch tokens + [CLS]", len(crop_items))
 
@@ -857,31 +920,80 @@ else:
     step3_diagnostics_by_focus = {combo_key(c): None for c in focus_combos}
     log.info("Step 3 (HDBSCAN + kNN consensus) disabled — ENABLE_STEP3=False, skipping")
 
-# %% Part 7 — score every combo x every stage x every method (oracle IoU)
+# %% Part 7 — score every combo x every stage x every method (oracle IoU). Alongside oracle_iou
+# (tunes its threshold against the query's own GT — an upper bound), also scores the *same*
+# gallery against the reference/exemplar image's own full extent + its own GT
+# (ref_encodings/ref_gt_patch_masks from Part 3.5) to get achievable_iou: a threshold tuned on
+# the exemplar, transferred as-is to the query — the number a deployed pipeline without
+# query-time labels would actually see. One extra score_heatmap/knn_score_heatmap call per
+# (combo, stage), not per query, since there is exactly one query per combo in this fixed-pair
+# script (mirrors scale_composition_bg_ablation.py's own Part 5).
 iou_lookup: dict[str, dict[str, dict[tuple, float]]] = {m: {s: {} for s in STAGES} for m in METHODS}
+achievable_iou_lookup: dict[str, dict[str, dict[tuple, float]]] = {
+    m: {s: {} for s in STAGES} for m in METHODS
+}
+gt_area_frac_by_key: dict[tuple[str, str], float] = {}
+qualitative_examples: list[ScoredExample] = []
 
-for combo in tqdm(combos, desc="Part 7: scoring"):
-    ck = combo_key(combo)
-    unit, group = combo["unit"], combo["group"]
-    q = query_encodings[unit]
-    gt = gt_patch_masks.get((unit, group))
-    if gt is None:
-        continue
-    for stage in STAGES:
-        fg, bg = combo_galleries[ck][stage]["fg"], combo_galleries[ck][stage]["bg"]
-        if fg.shape[0] == 0 or bg.shape[0] == 0:
-            log.warning(
-                "%s stage=%s: empty fg/bg gallery — skipping this (combo, stage)", ck, stage
-            )
+with cuda_timer() as t_scoring_1_1:
+    for combo in tqdm(combos, desc="Part 7: scoring"):
+        ck = combo_key(combo)
+        unit, group = combo["unit"], combo["group"]
+        q = query_encodings[unit]
+        gt = gt_patch_masks.get((unit, group))
+        if gt is None:
             continue
-        proto = compute_exemplar_features(fg, mode="mean")
-        raw_proto = score_heatmap(q["q_tokens"], proto, q["q_h"], q["q_w"])
-        iou_lookup["proto"][stage][ck] = oracle_iou(raw_proto, gt, ORACLE_THRESHOLD_STEPS)
+        gt_area_frac_by_key[(unit, group)] = float(gt.sum()) / gt.size
+        r = ref_encodings[unit]
+        ref_gt = ref_gt_patch_masks.get((unit, group))
+        if ref_gt is None:
+            log.warning("%s: no reference-image GT — achievable_iou left NaN", ck)
+        for stage in STAGES:
+            fg, bg = combo_galleries[ck][stage]["fg"], combo_galleries[ck][stage]["bg"]
+            if fg.shape[0] == 0 or bg.shape[0] == 0:
+                log.warning(
+                    "%s stage=%s: empty fg/bg gallery — skipping this (combo, stage)", ck, stage
+                )
+                continue
+            proto = compute_exemplar_features(fg, mode="mean")
+            raw_proto = score_heatmap(q["q_tokens"], proto, q["q_h"], q["q_w"])
+            iou_lookup["proto"][stage][ck] = oracle_iou(raw_proto, gt, ORACLE_THRESHOLD_STEPS)
 
-        raw_knn = knn_score_heatmap(
-            q["q_tokens"], fg, bg, KNN_FGBG_NUM_NEIGHBOURS, q["q_h"], q["q_w"]
-        )
-        iou_lookup["knn_fgbg"][stage][ck] = oracle_iou(raw_knn, gt, ORACLE_THRESHOLD_STEPS)
+            raw_knn = knn_score_heatmap(
+                q["q_tokens"], fg, bg, KNN_FGBG_NUM_NEIGHBOURS, q["q_h"], q["q_w"]
+            )
+            iou_lookup["knn_fgbg"][stage][ck] = oracle_iou(raw_knn, gt, ORACLE_THRESHOLD_STEPS)
+
+            if ref_gt is not None:
+                ref_raw_proto = score_heatmap(r["r_tokens"], proto, r["r_h"], r["r_w"])
+                achievable_iou_lookup["proto"][stage][ck] = achievable_iou(
+                    ref_raw_proto, ref_gt, raw_proto, gt, ORACLE_THRESHOLD_STEPS
+                )
+                ref_raw_knn = knn_score_heatmap(
+                    r["r_tokens"], fg, bg, KNN_FGBG_NUM_NEIGHBOURS, r["r_h"], r["r_w"]
+                )
+                achievable_iou_lookup["knn_fgbg"][stage][ck] = achievable_iou(
+                    ref_raw_knn, ref_gt, raw_knn, gt, ORACLE_THRESHOLD_STEPS
+                )
+
+            if stage == QUALITATIVE_STAGE and len(qualitative_examples) < QUALITATIVE_MAX_EXAMPLES:
+                qualitative_examples.append(
+                    ScoredExample(
+                        label=f"{unit}/{group}/{combo['class']}#{combo['instance_id']}",
+                        image=query_images[unit],
+                        raw=raw_knn,
+                        gt=gt,
+                        score=iou_lookup["knn_fgbg"][stage][ck],
+                    )
+                )
+latency_rows.append(
+    {
+        "phase": "scoring_1_1",
+        "elapsed_s": t_scoring_1_1["elapsed_s"],
+        "n_units": len(combos),
+        "units_per_sec": images_per_sec(len(combos), t_scoring_1_1["elapsed_s"]),
+    }
+)
 
 log.info(
     "Scoring complete: %d combos x %d stages x %d methods", len(combos), len(STAGES), len(METHODS)
@@ -896,6 +1008,8 @@ _per_combo_rows = [
         "class": ck[2],
         "instance_id": ck[3],
         "oracle_iou": iou,
+        "achievable_iou": achievable_iou_lookup[method][stage].get(ck, float("nan")),
+        "gt_area_frac": gt_area_frac_by_key.get((ck[0], ck[1]), float("nan")),
     }
     for method, by_stage in iou_lookup.items()
     for stage, by_ck in by_stage.items()
@@ -903,6 +1017,25 @@ _per_combo_rows = [
 ]
 pd.DataFrame(_per_combo_rows).to_csv(OUTPUT_DIR / "oracle_iou_per_combo.csv", index=False)
 log.info("Wrote %s (%d rows)", OUTPUT_DIR / "oracle_iou_per_combo.csv", len(_per_combo_rows))
+
+# Worst/best-N qualitative gallery at one representative stage (QUALITATIVE_STAGE, knn_fgbg
+# method) — every figure above averages across combos; this shows actual individual query
+# images so a failure mode is visible instead of washed out by the mean.
+if qualitative_examples:
+    save_score_gallery(
+        qualitative_examples,
+        OUTPUT_DIR / "qualitative_worst_best.png",
+        n=5,
+        score_name="oracle_iou (knn_fgbg)",
+        title=f"Worst/best oracle_iou examples: stage={QUALITATIVE_STAGE} method=knn_fgbg (1-1)",
+    )
+    log.info(
+        "Wrote %s (%d examples)",
+        OUTPUT_DIR / "qualitative_worst_best.png",
+        len(qualitative_examples),
+    )
+else:
+    log.warning("No qualitative examples collected for stage=%s", QUALITATIVE_STAGE)
 
 # %% Part 8 — aggregate + bar chart
 
@@ -919,12 +1052,40 @@ def stage_method_summary(combo_keys: set[tuple] | None = None) -> pd.DataFrame:
                 for ck, v in iou_lookup[method][stage].items()
                 if combo_keys is None or ck in combo_keys
             ]
+            achievable_vals = [
+                v
+                for ck, v in achievable_iou_lookup[method][stage].items()
+                if combo_keys is None or ck in combo_keys
+            ]
+            # Percentile bootstrap CI on the mean, alongside the plain std this script
+            # already reported — std alone doesn't say whether e.g. `raw`'s and a cleaned
+            # stage's means are actually distinguishable or both plausible draws from the
+            # same underlying distribution; see _shared/stats.py.
+            if vals:
+                _, ci_lo, ci_hi = bootstrap_ci(
+                    np.array(vals), n_boot=N_BOOTSTRAP, seed=BOOTSTRAP_SEED
+                )
+            else:
+                ci_lo = ci_hi = float("nan")
             rows.append(
                 {
                     "method": method,
                     "stage": stage,
                     "mean_iou": float(np.mean(vals)) if vals else float("nan"),
                     "std_iou": float(np.std(vals)) if vals else float("nan"),
+                    "ci95_lo": ci_lo,
+                    "ci95_hi": ci_hi,
+                    "mean_achievable_iou": (
+                        float(np.mean(achievable_vals)) if achievable_vals else float("nan")
+                    ),
+                    "std_achievable_iou": (
+                        float(np.std(achievable_vals)) if achievable_vals else float("nan")
+                    ),
+                    "oracle_minus_achievable_gap": (
+                        float(np.mean(vals) - np.mean(achievable_vals))
+                        if vals and achievable_vals
+                        else float("nan")
+                    ),
                     "n_combos": len(vals),
                 }
             )
@@ -1033,6 +1194,132 @@ pd.concat(_group_summary_frames, ignore_index=True).to_csv(
     OUTPUT_DIR / "oracle_iou_by_stage_per_group.csv", index=False
 )
 log.info("Wrote %s", OUTPUT_DIR / "oracle_iou_by_stage_per_group.csv")
+
+# %% Part 8c — oracle IoU (upper bound, tunes the threshold against the query's own GT) vs.
+# achievable IoU (a threshold tuned on the reference/exemplar image's own GT, transferred
+# as-is to the query — what a deployed pipeline without query-time labels would actually
+# get). Every figure through Part 8b plots oracle_iou only; this is the gap between "what's
+# the best any threshold could do" and "what a realistic fixed threshold does," per stage.
+_stage_x = np.arange(len(STAGES))
+_stage_labels = [STAGE_LABELS[s] for s in STAGES]
+fig, ax = plt.subplots(figsize=(11, 5.5))
+for method in METHODS:
+    oracle_means = [
+        summary_df[(summary_df.stage == s) & (summary_df.method == method)]["mean_iou"].iloc[0]
+        for s in STAGES
+    ]
+    achievable_means = [
+        summary_df[(summary_df.stage == s) & (summary_df.method == method)][
+            "mean_achievable_iou"
+        ].iloc[0]
+        for s in STAGES
+    ]
+    ax.plot(
+        _stage_x,
+        oracle_means,
+        marker="o",
+        linestyle="-",
+        color=METHOD_COLOR[method],
+        label=f"{method} oracle",
+    )
+    ax.plot(
+        _stage_x,
+        achievable_means,
+        marker="^",
+        linestyle="--",
+        color=METHOD_COLOR[method],
+        alpha=0.6,
+        label=f"{method} achievable",
+    )
+ax.set_xticks(_stage_x)
+ax.set_xticklabels(_stage_labels, rotation=20, ha="right")
+ax.set_xlabel("stage")
+ax.set_ylabel("mean IoU across combos")
+ax.set_ylim(0, 1.0)
+ax.set_title(
+    "1-1 (single ref/query pair) — Oracle (upper bound) vs. achievable "
+    "(exemplar-tuned threshold) IoU, per stage"
+)
+ax.legend(fontsize=8)
+ax.grid(alpha=0.3)
+fig.tight_layout()
+fig.savefig(OUTPUT_DIR / "oracle_vs_achievable.png", dpi=150, bbox_inches="tight")
+plt.close(fig)
+log.info("Oracle-vs-achievable gap by stage (mean oracle_iou - mean achievable_iou):")
+for _, row in summary_df.iterrows():
+    log.info(
+        "  stage=%-14s method=%-9s gap=%.3f (oracle=%.3f achievable=%.3f)",
+        row.stage,
+        row.method,
+        row.oracle_minus_achievable_gap,
+        row.mean_iou,
+        row.mean_achievable_iou,
+    )
+log.info("Saved %s", OUTPUT_DIR / "oracle_vs_achievable.png")
+
+# %% Part 8d — does oracle IoU correlate with object size? An aggregate mean (every figure
+# above) can hide "cleaning only helps small/large instances" — `gt_area_frac` (the query
+# GT's own patch-mask coverage, added to every row of oracle_iou_per_combo.csv in Part 7)
+# lets us check, mirroring the pearson/spearman correlation pattern
+# `scale_composition_adaptive_oracle.py` already established for instance size vs. optimal
+# scale.
+_per_combo_df = pd.DataFrame(_per_combo_rows)
+size_correlation_rows = []
+for method in METHODS:
+    for stage in STAGES:
+        sub = _per_combo_df[(_per_combo_df.method == method) & (_per_combo_df.stage == stage)]
+        if len(sub) < 3:
+            continue
+        pearson_r, pearson_p = pearsonr(sub["gt_area_frac"], sub["oracle_iou"])
+        spearman_r, spearman_p = spearmanr(sub["gt_area_frac"], sub["oracle_iou"])
+        size_correlation_rows.append(
+            {
+                "method": method,
+                "stage": stage,
+                "pearson_r": pearson_r,
+                "pearson_p": pearson_p,
+                "spearman_r": spearman_r,
+                "spearman_p": spearman_p,
+                "n_samples": len(sub),
+            }
+        )
+size_correlation_df = pd.DataFrame(size_correlation_rows)
+size_correlation_df.to_csv(OUTPUT_DIR / "size_correlation.csv", index=False)
+
+# Object-size terciles (global, computed once across every row so the same size cutoffs
+# apply everywhere) x oracle IoU, faceted per stage like the per-group charts above: does the
+# smallest third of instances systematically score worse, and does that gap close or widen
+# for a cleaned stage vs. `raw`?
+try:
+    _per_combo_df["size_tercile"] = pd.qcut(
+        _per_combo_df["gt_area_frac"], 3, labels=["small", "medium", "large"]
+    )
+except ValueError:
+    log.warning(
+        "gt_area_frac has too few distinct values for 3 clean terciles — falling back to "
+        "qcut's own duplicate-safe binning (labels become numeric ranges, not small/medium/large)"
+    )
+    _per_combo_df["size_tercile"] = pd.qcut(_per_combo_df["gt_area_frac"], 3, duplicates="drop")
+
+fig, axes = plt.subplots(1, len(STAGES), figsize=(3.2 * len(STAGES), 5), sharey=True)
+for ax, stage in zip(axes, STAGES):
+    tercile_means = (
+        _per_combo_df[_per_combo_df.stage == stage]
+        .groupby(["size_tercile", "method"], observed=True)["oracle_iou"]
+        .mean()
+        .unstack("method")
+    )
+    tercile_means.plot(kind="bar", ax=ax, color=[METHOD_COLOR[m] for m in tercile_means.columns])
+    ax.set_title(STAGE_LABELS[stage], fontsize=9)
+    ax.set_xlabel("size tercile")
+    ax.set_ylim(0, 1.0)
+    ax.grid(alpha=0.3, axis="y")
+axes[0].set_ylabel("mean oracle IoU")
+fig.suptitle("Does object size predict oracle IoU, per stage?")
+fig.tight_layout()
+fig.savefig(OUTPUT_DIR / "size_correlation.png", dpi=150, bbox_inches="tight")
+plt.close(fig)
+log.info("Wrote %s and %s", OUTPUT_DIR / "size_correlation.csv", OUTPUT_DIR / "size_correlation.png")
 
 # %% [markdown]
 # ## Qualitative figures — one figure set per focus combo, all three scales
@@ -1928,9 +2215,20 @@ log.info("5-3: instances %d", len(usable_instances_53))
 # Full-image encodings — each instance's own "global" scale source (Part 3.5's per-unit role,
 # generalized to per-image), and every image's own query/eval tokens (Part 3's role).
 image_encodings_53: dict[tuple[str, int], dict] = {}
-for key in tqdm(sorted(discovery_53.images), desc="5-3: encoding images"):
-    tokens, h, w = extract_patch_tokens(encoder, discovery_53.images[key], LAYER_IDX, debias=DEBIAS)
-    image_encodings_53[key] = {"tokens": tokens, "h": h, "w": w}
+with cuda_timer() as t_image_encode_53:
+    for key in tqdm(sorted(discovery_53.images), desc="5-3: encoding images"):
+        tokens, h, w = extract_patch_tokens(
+            encoder, discovery_53.images[key], LAYER_IDX, debias=DEBIAS
+        )
+        image_encodings_53[key] = {"tokens": tokens, "h": h, "w": w}
+latency_rows.append(
+    {
+        "phase": "image_encode_5_3",
+        "elapsed_s": t_image_encode_53["elapsed_s"],
+        "n_units": len(discovery_53.images),
+        "units_per_sec": images_per_sec(len(discovery_53.images), t_image_encode_53["elapsed_s"]),
+    }
+)
 
 gt_patch_masks_53: dict[tuple[str, str, int], np.ndarray] = {}
 for (part_type, group, n), pixel_mask in discovery_53.gt_masks.items():
@@ -1944,15 +2242,28 @@ for (part_type, group, n), pixel_mask in discovery_53.gt_masks.items():
 crop_items_53: list[tuple[int, str]] = [
     (i, scale) for i, inst in enumerate(usable_instances_53) for scale in inst["crops"]
 ]
-for i in tqdm(range(0, len(crop_items_53), chunk_size), desc="5-3: encoding mid/close crops"):
-    chunk = crop_items_53[i : i + chunk_size]
-    images_chunk = [usable_instances_53[idx]["crops"][scale]["img"] for idx, scale in chunk]
-    encoded = extract_patch_tokens_batch_with_cls(encoder, images_chunk, LAYER_IDX, debias=DEBIAS)
-    for (idx, scale), (tokens, cls, grid_h, grid_w) in zip(chunk, encoded):
-        crop = usable_instances_53[idx]["crops"][scale]
-        crop["tokens"], crop["grid_h"], crop["grid_w"] = tokens, grid_h, grid_w
-        if scale == "close":
-            crop["cls"] = cls
+with cuda_timer() as t_crop_encode_53:
+    for i in tqdm(
+        range(0, len(crop_items_53), chunk_size), desc="5-3: encoding mid/close crops"
+    ):
+        chunk = crop_items_53[i : i + chunk_size]
+        images_chunk = [usable_instances_53[idx]["crops"][scale]["img"] for idx, scale in chunk]
+        encoded = extract_patch_tokens_batch_with_cls(
+            encoder, images_chunk, LAYER_IDX, debias=DEBIAS
+        )
+        for (idx, scale), (tokens, cls, grid_h, grid_w) in zip(chunk, encoded):
+            crop = usable_instances_53[idx]["crops"][scale]
+            crop["tokens"], crop["grid_h"], crop["grid_w"] = tokens, grid_h, grid_w
+            if scale == "close":
+                crop["cls"] = cls
+latency_rows.append(
+    {
+        "phase": "gallery_crop_encode_5_3",
+        "elapsed_s": t_crop_encode_53["elapsed_s"],
+        "n_units": len(crop_items_53),
+        "units_per_sec": images_per_sec(len(crop_items_53), t_crop_encode_53["elapsed_s"]),
+    }
+)
 
 # Build each instance's own raw/step1/step2_cls/step2_center galleries — identical logic to
 # Part 5, run per discovered instance instead of per ref/query-pair combo.
@@ -2042,7 +2353,9 @@ fold_splits_53 = make_fold_role_splits(
 iou_lookup_53: dict[str, dict[str, list[float]]] = {m: {s: [] for s in STAGES} for m in METHODS}
 
 n_units_53 = N_FOLDS_53 * len(groups_by_pt_53)
-with tqdm(total=n_units_53, desc="5-3: cross-validated fit + score") as pbar:
+with cuda_timer() as t_scoring_53, tqdm(
+    total=n_units_53, desc="5-3: cross-validated fit + score"
+) as pbar:
     for fold_idx, split in enumerate(fold_splits_53):
         for part_type in groups_by_pt_53:
             train_numbers, eval_numbers = split[part_type]
@@ -2117,6 +2430,14 @@ with tqdm(total=n_units_53, desc="5-3: cross-validated fit + score") as pbar:
                             oracle_iou(raw_knn, gt, ORACLE_THRESHOLD_STEPS)
                         )
             pbar.update(1)
+latency_rows.append(
+    {
+        "phase": "scoring_5_3",
+        "elapsed_s": t_scoring_53["elapsed_s"],
+        "n_units": n_units_53,
+        "units_per_sec": images_per_sec(n_units_53, t_scoring_53["elapsed_s"]),
+    }
+)
 
 summary_53_rows = []
 for method in METHODS:
@@ -2148,6 +2469,17 @@ for method in METHODS:
             if not (np.isnan(row_11.mean_iou) or np.isnan(row_53.mean_iou))
             else float("nan")
         )
+        # Is the 1-1-vs-5-3 gap (this file's most central comparison — is a pooled 5-image
+        # gallery actually better than a single reference image, for the same cleaning
+        # stage?) real, or combo/fold-to-fold noise? An unpaired bootstrap comparison (see
+        # _shared/stats.py) of the two regimes' own per-sample oracle_iou arrays.
+        vals_11 = np.array(list(iou_lookup[method][stage].values()))
+        vals_53 = np.array(iou_lookup_53[method][stage])
+        prob_53_beats_11 = (
+            bootstrap_prob_greater(vals_53, vals_11, n_boot=N_BOOTSTRAP, seed=BOOTSTRAP_SEED)
+            if len(vals_11) and len(vals_53)
+            else float("nan")
+        )
         comparison_53_rows.append(
             {
                 "method": method,
@@ -2157,10 +2489,14 @@ for method in METHODS:
                 "iou_5_3": row_53.mean_iou,
                 "std_5_3": row_53.std_iou,
                 "delta": delta,
+                "prob_5_3_beats_1_1": prob_53_beats_11,
+                "n_1_1": len(vals_11),
+                "n_5_3": len(vals_53),
             }
         )
         log.info(
-            "  %-14s %-10s 1-1=%.3f+/-%.3f  5-3=%.3f+/-%.3f  delta=%+.3f",
+            "  %-14s %-10s 1-1=%.3f+/-%.3f  5-3=%.3f+/-%.3f  delta=%+.3f  "
+            "P(5-3 beats 1-1)=%.3f",
             stage,
             method,
             row_11.mean_iou,
@@ -2168,6 +2504,7 @@ for method in METHODS:
             row_53.mean_iou,
             row_53.std_iou,
             delta,
+            prob_53_beats_11,
         )
 comparison_53_df = pd.DataFrame(comparison_53_rows)
 comparison_53_df.to_csv(OUTPUT_DIR / "comparison_1_1_vs_5_3.csv", index=False)
@@ -2208,6 +2545,38 @@ fig.savefig(_comparison_53_path, dpi=150, bbox_inches="tight")
 plt.close(fig)
 log.info("Saved %s and %s", OUTPUT_DIR / "comparison_1_1_vs_5_3.csv", _comparison_53_path)
 
+# %% Part 12 — latency/throughput: every phase above traded off against wall-clock cost,
+# which no figure in this script reported before now. `torch.cuda.synchronize()` is called
+# around every timed block (see `_shared/latency.py`) so GPU-async dispatch doesn't
+# understate elapsed time. Scoped to this file's own headline sections (Parts 3-4's
+# encoding, Part 7's 1-1 scoring, and the 5-3 section's encoding/scoring) rather than every
+# intermediate stage's own sub-loop (Part 5's spatial-filter/attention-check pass, Part 6's
+# Step-3 clustering, Part 10's composed-pipeline sweep) — those are covered by the encoding
+# phases they reuse and by Part 7/the 5-3 section's own scoring timers, and separately timing
+# every one of them would multiply this already-large file's latency bookkeeping for a
+# question ("which of Steps 1-3 is slow") this file's own module docstring already answers
+# qualitatively (Step 3's HDBSCAN + kNN pass is by far the most expensive part of the 5-3
+# section, hence ENABLE_STEP3=False by default).
+cache_hits, cache_misses = encoder.total_hits, encoder.total_misses
+cache_total = cache_hits + cache_misses
+latency_rows.append(
+    {
+        "phase": "total",
+        "elapsed_s": sum(r["elapsed_s"] for r in latency_rows),
+        "n_units": float("nan"),
+        "units_per_sec": float("nan"),
+        "cache_hits": cache_hits,
+        "cache_misses": cache_misses,
+        "cache_hit_rate": cache_hits / cache_total if cache_total > 0 else float("nan"),
+    }
+)
+latency_df = pd.DataFrame(latency_rows)
+latency_df.to_csv(OUTPUT_DIR / "latency.csv", index=False)
+log.info("Latency by phase (GPU-synchronized wall-clock time):")
+for _, row in latency_df.iterrows():
+    log.info("  phase=%-24s elapsed=%.1fs n_units=%s", row.phase, row.elapsed_s, row.n_units)
+log.info("Wrote %s", OUTPUT_DIR / "latency.csv")
+
 # %% [markdown]
 # ## Reading the composed-pipeline results
 #
@@ -2231,5 +2600,34 @@ log.info("Saved %s and %s", OUTPUT_DIR / "comparison_1_1_vs_5_3.csv", _compariso
 # than the oracle-IoU bar alone would suggest. Comparing the two branches' patch counts for
 # the same variant also shows whether "cls" and "center" disagree about *how much* to keep,
 # not just *how well* what they keep scores.
+#
+# - **`oracle_vs_achievable.png`/`oracle_iou_by_stage.csv`'s `mean_achievable_iou`/
+#   `oracle_minus_achievable_gap` columns** — `oracle_iou` everywhere else in Parts 7-9 is an
+#   upper bound (tunes its threshold against the query's own GT); achievable_iou tunes the
+#   threshold on the *reference/exemplar* image's own GT instead (the same image that built
+#   the gallery) and transfers it as-is to the query — the number a deployed pipeline without
+#   query-time labels would actually see. A cleaning stage that beats `raw` for oracle but
+#   not achievable IoU means it's a trend in "how separable the scores could be," not in what
+#   a real threshold captures — check both before trusting `oracle_iou_by_stage.png` alone.
+# - **`latency.csv`** — GPU-synchronized wall-clock cost (see `_shared/latency.py`) of this
+#   file's own headline phases: query/reference image encode, gallery-crop encode, 1-1
+#   scoring (Part 7), and the 5-3 section's own image encode/crop encode/scoring, plus cache
+#   hit-rate on the final "total" row. Scoped to these phases rather than every intermediate
+#   stage's own sub-loop — see Part 12's own comment for why.
+# - **`size_correlation.csv`/`.png`** — does oracle IoU correlate with the query GT's own area
+#   fraction (`gt_area_frac`, added to every row of `oracle_iou_per_combo.csv` in Part 7)?
+#   `.csv` covers every (method, stage); `.png`'s tercile bars facet by stage, mirroring
+#   `oracle_iou_by_stage.png`'s own per-stage breakdown — check whether a cleaning stage's
+#   benefit concentrates on small objects specifically before generalizing it.
+# - **`qualitative_worst_best.png`** — actual worst-5/best-5 query images (crop, raw knn_fgbg
+#   score map, GT mask) at the `raw` stage across every combo, not an average — unlike the
+#   per-focus-combo figures above (which show *where* a technique cleaned one instance), this
+#   shows *which whole combos* the fixed `raw` baseline fails or succeeds on hardest.
+# - **`comparison_1_1_vs_5_3.csv`'s `prob_5_3_beats_1_1` column** — an unpaired bootstrap
+#   comparison (2000 resamples, see `_shared/stats.py`) of this file's most central
+#   comparison: for each (method, stage), is the pooled 5-3 gallery's oracle IoU actually
+#   distinguishable from the single-reference 1-1 gallery's, or within combo/fold-to-fold
+#   noise? Near 0.5 means indistinguishable — a quantitative version of
+#   `comparison_1_1_vs_5_3.png`'s own eyeball comparison.
 
 # %%

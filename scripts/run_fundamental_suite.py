@@ -50,6 +50,12 @@ RUNS_ROOT = REPO_ROOT / "outputs" / "fundamental_runs"
 # first six); the rest follow directory order. `_scale_composition_common.py` is
 # shared plumbing imported by the scale_composition_* scripts below, not a runnable
 # experiment itself, so it's excluded here — same convention as `_shared/`.
+#
+# `drift_vs_iou_correlation.py` is also excluded by default: it's pure post-hoc analysis
+# that reads augmentation_sensitivity.py's and augmented_prototype_oracle_iou_knn_fgbg.py's
+# *own default* CSV output paths (raises FileNotFoundError if they're missing), not this
+# run's redirected RUN_DIR outputs — including it in a fresh isolated run would fail unless
+# you also override its `drift_csv`/`iou_csv` in the cfg to point at this run's own dir.
 SUITE_SCRIPTS: list[str] = [
     "scale_crop_similarity",
     "augmentation_sensitivity",

@@ -46,6 +46,7 @@ import torch
 import torch.nn.functional as F
 from dotenv import load_dotenv
 from PIL import Image
+from scipy.stats import pearsonr, spearmanr
 from tqdm import tqdm
 
 from dinoisawesome import DinoEncoder, EncoderWithCache, compute_exemplar_features, load_annotations
@@ -59,10 +60,13 @@ from _scale_composition_common import (  # noqa: E402
 )
 from _shared.abc3_combos import combo_key  # noqa: E402
 from _shared.dataset_pairs import REF_QUERY_PAIRS, RefQueryPair  # noqa: E402
+from _shared.latency import cuda_timer, images_per_sec  # noqa: E402
 from _shared.mask_geometry import pixel_mask_to_patch_mask  # noqa: E402
 from _shared.prototype_ops import knn_score_heatmap, score_heatmap  # noqa: E402
+from _shared.qualitative_gallery import ScoredExample, save_score_gallery  # noqa: E402
 from _shared.run_config import apply_overrides, load_run_config, resolve_output_dir  # noqa: E402
-from _shared.thresholding import oracle_iou  # noqa: E402
+from _shared.stats import bootstrap_ci, bootstrap_prob_greater  # noqa: E402
+from _shared.thresholding import achievable_iou, oracle_iou  # noqa: E402
 
 # %% Parameters
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -91,6 +95,19 @@ KNN_FGBG_NUM_NEIGHBOURS = 10
 N_SCALE_STEPS = 6
 
 METHODS: list[str] = ["single_proto", "knn_fgbg"]
+METHOD_COLOR: dict[str, str] = {"single_proto": "#7f8c8d", "knn_fgbg": "#2ecc71"}
+
+# One representative (ref_scale, method) row whose individual per-query-scale-cell samples get
+# kept as PIL crops + raw score maps for the worst/best-N qualitative gallery — collecting every
+# row would multiply memory/disk cost 7x, so only the midpoint ref scale (QUALITATIVE_REF_SCALE,
+# set below once SCALE_NAMES exists) and the stronger knn_fgbg method are captured.
+QUALITATIVE_METHOD = "knn_fgbg"
+QUALITATIVE_MAX_EXAMPLES = 60  # capped so the gallery figure itself stays a readable size
+
+# Bootstrap settings for the per-cell CI added to the headline matrix CSV and for the
+# diagonal-vs-off-diagonal significance check below.
+N_BOOTSTRAP = 2000
+BOOTSTRAP_SEED = 0
 
 SEED = 0
 
@@ -118,6 +135,12 @@ T_VALUES: np.ndarray = np.linspace(0.0, 1.0, N_SCALE_STEPS + 1)
 
 SCALE_NAMES: list[str] = [scale_step_name(i, N_SCALE_STEPS) for i in range(N_SCALE_STEPS + 1)]
 log.info("Scale steps (global -> close): %s", SCALE_NAMES)
+
+# Depends on SCALE_NAMES, so set here rather than in the Parameters section above — the
+# midpoint scale (not global or close, both edge cases) for the qualitative gallery's one
+# representative row (see QUALITATIVE_METHOD's comment above).
+QUALITATIVE_REF_SCALE: str = SCALE_NAMES[len(SCALE_NAMES) // 2]
+log.info("Qualitative gallery representative row: ref_scale=%s", QUALITATIVE_REF_SCALE)
 
 
 # %% Part 1 — discover every (part_type, instance-type group, ref instance) combo
@@ -240,6 +263,13 @@ log.info(
     len(group_query_masks),
 )
 
+# Lookup of each query scale-step's own PIL crop, keyed the same way as query_scale_items below
+# — needed by the qualitative gallery (Part 9) to show the actual query crop a raw score map and
+# GT mask came from, not just an average.
+query_scale_images: dict[tuple[str, str, str], Image.Image] = {
+    (unit, group, name): img for unit, group, name, img, _gt_mask_px in query_scale_items
+}
+
 # %% Part 3 — encoder
 encoder = DinoEncoder(
     version=DINO_VERSION,
@@ -267,27 +297,38 @@ for combo in combos:
     for name, crop in combo["crops"].items():
         clean_items.append((ck, name, crop["img"], crop["mask_px"], crop["bg_exclude_mask_px"]))
 
-for i in tqdm(range(0, len(clean_items), chunk_size), desc="Encoding reference crops"):
-    chunk = clean_items[i : i + chunk_size]
-    out = encoder([c[2] for c in chunk], layers=[LAYER_IDX], debias=True)
-    chunk_patches = out.patches[:, 0]
-    grid_h, grid_w = chunk_patches.shape[1], chunk_patches.shape[2]
-    for (ck, name, _, mask_px, bg_exclude_mask_px), patch_tokens in zip(chunk, chunk_patches):
-        fg, bg = split_fg_bg_patches(
-            patch_tokens,
-            mask_px,
-            grid_h,
-            grid_w,
-            f"{ck} scale={name}",
-            IMG_SIZE,
-            MASK_PATCH_THRESHOLD,
-            bg_exclude_mask_px=bg_exclude_mask_px,
-        )
-        # Kept on CPU: with REF_QUERY_PAIRS spanning 16 ref/query pairs, every combo's every-scale
-        # fg/bg bank held on GPU simultaneously no longer fits (abc3-only fit in ~12GB, the
-        # combined pool doesn't) — moved back to the query's device per combo in Part 6.
-        fg_by_scale[(ck, name)] = fg.cpu()
-        bg_by_scale[(ck, name)] = bg.cpu()
+latency_rows: list[dict] = []
+with cuda_timer() as t_ref_crop_encode:
+    for i in tqdm(range(0, len(clean_items), chunk_size), desc="Encoding reference crops"):
+        chunk = clean_items[i : i + chunk_size]
+        out = encoder([c[2] for c in chunk], layers=[LAYER_IDX], debias=True)
+        chunk_patches = out.patches[:, 0]
+        grid_h, grid_w = chunk_patches.shape[1], chunk_patches.shape[2]
+        for (ck, name, _, mask_px, bg_exclude_mask_px), patch_tokens in zip(chunk, chunk_patches):
+            fg, bg = split_fg_bg_patches(
+                patch_tokens,
+                mask_px,
+                grid_h,
+                grid_w,
+                f"{ck} scale={name}",
+                IMG_SIZE,
+                MASK_PATCH_THRESHOLD,
+                bg_exclude_mask_px=bg_exclude_mask_px,
+            )
+            # Kept on CPU: with REF_QUERY_PAIRS spanning 16 ref/query pairs, every combo's
+            # every-scale fg/bg bank held on GPU simultaneously no longer fits (abc3-only fit in
+            # ~12GB, the combined pool doesn't) — moved back to the query's device per combo in
+            # Part 6.
+            fg_by_scale[(ck, name)] = fg.cpu()
+            bg_by_scale[(ck, name)] = bg.cpu()
+latency_rows.append(
+    {
+        "phase": "reference_crop_encode",
+        "elapsed_s": t_ref_crop_encode["elapsed_s"],
+        "n_units": len(clean_items),
+        "units_per_sec": images_per_sec(len(clean_items), t_ref_crop_encode["elapsed_s"]),
+    }
+)
 
 bg_all_lookup: dict[tuple, torch.Tensor] = {
     ck: torch.cat([bg_by_scale[(ck, name)] for name in SCALE_NAMES], dim=0)
@@ -301,18 +342,27 @@ log.info("Built per-scale reference fg/bg galleries for %d combos", len(usable_c
 query_scale_encodings: dict[tuple[str, str, str], tuple[torch.Tensor, int, int]] = {}
 query_scale_gt: dict[tuple[str, str, str], np.ndarray] = {}
 
-for i in tqdm(range(0, len(query_scale_items), chunk_size), desc="Encoding query crops"):
-    chunk = query_scale_items[i : i + chunk_size]
-    out = encoder([c[3] for c in chunk], layers=[LAYER_IDX], debias=True)
-    chunk_patches = out.patches[:, 0]
-    grid_h, grid_w = chunk_patches.shape[1], chunk_patches.shape[2]
-    for (unit, group, name, _, gt_mask_px), patch_tokens in zip(chunk, chunk_patches):
-        tokens = F.normalize(patch_tokens.reshape(grid_h * grid_w, -1), p=2, dim=-1)
-        key = (unit, group, name)
-        query_scale_encodings[key] = (tokens, grid_h, grid_w)
-        query_scale_gt[key] = pixel_mask_to_patch_mask(
-            gt_mask_px, grid_h, grid_w, IMG_SIZE, MASK_PATCH_THRESHOLD
-        )
+with cuda_timer() as t_query_crop_encode:
+    for i in tqdm(range(0, len(query_scale_items), chunk_size), desc="Encoding query crops"):
+        chunk = query_scale_items[i : i + chunk_size]
+        out = encoder([c[3] for c in chunk], layers=[LAYER_IDX], debias=True)
+        chunk_patches = out.patches[:, 0]
+        grid_h, grid_w = chunk_patches.shape[1], chunk_patches.shape[2]
+        for (unit, group, name, _, gt_mask_px), patch_tokens in zip(chunk, chunk_patches):
+            tokens = F.normalize(patch_tokens.reshape(grid_h * grid_w, -1), p=2, dim=-1)
+            key = (unit, group, name)
+            query_scale_encodings[key] = (tokens, grid_h, grid_w)
+            query_scale_gt[key] = pixel_mask_to_patch_mask(
+                gt_mask_px, grid_h, grid_w, IMG_SIZE, MASK_PATCH_THRESHOLD
+            )
+latency_rows.append(
+    {
+        "phase": "query_crop_encode",
+        "elapsed_s": t_query_crop_encode["elapsed_s"],
+        "n_units": len(query_scale_items),
+        "units_per_sec": images_per_sec(len(query_scale_items), t_query_crop_encode["elapsed_s"]),
+    }
+)
 log.info("Built per-scale query crop tokens for %d groups", len(usable_query_groups))
 _QUERY_DEVICE = next(iter(query_scale_encodings.values()))[0].device
 
@@ -322,35 +372,113 @@ MatrixIou = dict[str, dict[str, dict[str, dict[tuple, float]]]]
 matrix_iou: MatrixIou = {
     method: {tr: {tq: {} for tq in SCALE_NAMES} for tr in SCALE_NAMES} for method in METHODS
 }
+# matrix_achievable_iou mirrors matrix_iou's shape — achievable (non-oracle) IoU instead of the
+# oracle upper bound; see the ACHIEVABLE-IOU REFERENCE CHOICE comment inside the loop below.
+matrix_achievable_iou: MatrixIou = {
+    method: {tr: {tq: {} for tq in SCALE_NAMES} for tr in SCALE_NAMES} for method in METHODS
+}
+# Per-(method, ref_scale, query_scale, combo) sample rows — needed for the object-size
+# correlation in Part 7c below, which needs each cell's individual gt_area_frac/oracle_iou
+# pairs, not just the per-cell mean matrix_iou already collapses them to.
+matrix_sample_rows: list[dict] = []
+# One representative row's worth of ScoredExamples for the qualitative gallery (Part 9).
+qualitative_examples: list[ScoredExample] = []
 
-for combo in tqdm(combos, desc="Part 6: scoring ref x query scale matrix"):
-    ck = combo_key(combo)
-    if ck not in usable_combo_keys:
-        continue
-    unit, group = ck[0], ck[1]
-    if (unit, group) not in usable_query_groups:
-        continue
-    bg_bank = bg_all_lookup[ck].to(_QUERY_DEVICE)
+n_score_evals = 0
+with cuda_timer() as t_scoring:
+    for combo in tqdm(combos, desc="Part 6: scoring ref x query scale matrix"):
+        ck = combo_key(combo)
+        if ck not in usable_combo_keys:
+            continue
+        unit, group = ck[0], ck[1]
+        if (unit, group) not in usable_query_groups:
+            continue
+        bg_bank = bg_all_lookup[ck].to(_QUERY_DEVICE)
 
-    for t_ref in SCALE_NAMES:
-        fg_bank = fg_by_scale[(ck, t_ref)].to(_QUERY_DEVICE)
-        proto = compute_exemplar_features(fg_bank, mode="mean")
+        for t_ref in SCALE_NAMES:
+            fg_bank = fg_by_scale[(ck, t_ref)].to(_QUERY_DEVICE)
+            proto = compute_exemplar_features(fg_bank, mode="mean")
 
-        for t_query in SCALE_NAMES:
-            q_tokens, q_h, q_w = query_scale_encodings[(unit, group, t_query)]
-            gt_local = query_scale_gt[(unit, group, t_query)]
-
-            raw_proto = score_heatmap(q_tokens, proto, q_h, q_w)
-            matrix_iou["single_proto"][t_ref][t_query][ck] = oracle_iou(
-                raw_proto, gt_local, ORACLE_THRESHOLD_STEPS
+            # ACHIEVABLE-IOU REFERENCE CHOICE: this script has no train/eval split (every combo
+            # is one fixed ref/query pair, scored at every scale) and no separate "own GT" image
+            # beyond the query crops already being scored here — so the natural reference for
+            # achievable_iou is this row's own diagonal cell (t_query == t_ref, the query crop
+            # cropped to the *same* scale as this row's reference gallery). It's the one
+            # query-side GT this ref-scale gallery could plausibly be threshold-tuned against
+            # without leaking any *other* cell's own GT. Scored once per (combo, t_ref) here and
+            # reused as achievable_iou's reference for every t_query in the row below — including
+            # the diagonal cell itself, where achievable_iou trivially equals oracle_iou (the
+            # threshold is tuned on the same raw score map/GT it's then applied to).
+            ref_q_tokens, ref_q_h, ref_q_w = query_scale_encodings[(unit, group, t_ref)]
+            ref_gt = query_scale_gt[(unit, group, t_ref)]
+            ref_raw_proto = score_heatmap(ref_q_tokens, proto, ref_q_h, ref_q_w)
+            ref_raw_knn = knn_score_heatmap(
+                ref_q_tokens, fg_bank, bg_bank, KNN_FGBG_NUM_NEIGHBOURS, ref_q_h, ref_q_w
             )
 
-            raw_knn = knn_score_heatmap(
-                q_tokens, fg_bank, bg_bank, KNN_FGBG_NUM_NEIGHBOURS, q_h, q_w
-            )
-            matrix_iou["knn_fgbg"][t_ref][t_query][ck] = oracle_iou(
-                raw_knn, gt_local, ORACLE_THRESHOLD_STEPS
-            )
+            for t_query in SCALE_NAMES:
+                if t_query == t_ref:
+                    # Reuse the row's own diagonal scoring above instead of recomputing it.
+                    raw_proto, raw_knn, gt_local = ref_raw_proto, ref_raw_knn, ref_gt
+                else:
+                    q_tokens, q_h, q_w = query_scale_encodings[(unit, group, t_query)]
+                    gt_local = query_scale_gt[(unit, group, t_query)]
+                    raw_proto = score_heatmap(q_tokens, proto, q_h, q_w)
+                    raw_knn = knn_score_heatmap(
+                        q_tokens, fg_bank, bg_bank, KNN_FGBG_NUM_NEIGHBOURS, q_h, q_w
+                    )
+                n_score_evals += 1
+                gt_area_frac = float(gt_local.sum()) / gt_local.size
+
+                oi_proto = oracle_iou(raw_proto, gt_local, ORACLE_THRESHOLD_STEPS)
+                ai_proto = achievable_iou(
+                    ref_raw_proto, ref_gt, raw_proto, gt_local, ORACLE_THRESHOLD_STEPS
+                )
+                matrix_iou["single_proto"][t_ref][t_query][ck] = oi_proto
+                matrix_achievable_iou["single_proto"][t_ref][t_query][ck] = ai_proto
+
+                oi_knn = oracle_iou(raw_knn, gt_local, ORACLE_THRESHOLD_STEPS)
+                ai_knn = achievable_iou(
+                    ref_raw_knn, ref_gt, raw_knn, gt_local, ORACLE_THRESHOLD_STEPS
+                )
+                matrix_iou["knn_fgbg"][t_ref][t_query][ck] = oi_knn
+                matrix_achievable_iou["knn_fgbg"][t_ref][t_query][ck] = ai_knn
+
+                for method, oi, ai in (
+                    ("single_proto", oi_proto, ai_proto),
+                    ("knn_fgbg", oi_knn, ai_knn),
+                ):
+                    matrix_sample_rows.append(
+                        {
+                            "method": method,
+                            "ref_scale": t_ref,
+                            "query_scale": t_query,
+                            "unit": unit,
+                            "group": group,
+                            "class": combo["class"],
+                            "instance_id": combo["instance_id"],
+                            "oracle_iou": oi,
+                            "achievable_iou": ai,
+                            "gt_area_frac": gt_area_frac,
+                        }
+                    )
+
+                if (
+                    t_ref == QUALITATIVE_REF_SCALE
+                    and len(qualitative_examples) < QUALITATIVE_MAX_EXAMPLES
+                ):
+                    q_raw = raw_proto if QUALITATIVE_METHOD == "single_proto" else raw_knn
+                    q_oi = oi_proto if QUALITATIVE_METHOD == "single_proto" else oi_knn
+                    qualitative_examples.append(
+                        ScoredExample(
+                            label=f"{unit}/{group}/{combo['class']}#{combo['instance_id']}/"
+                            f"tref={t_ref}/tquery={t_query}",
+                            image=query_scale_images[(unit, group, t_query)],
+                            raw=q_raw,
+                            gt=gt_local,
+                            score=q_oi,
+                        )
+                    )
 
 n_scored_combos = len(
     {ck for combo in combos for ck in [combo_key(combo)] if combo_key(combo) in usable_combo_keys}
@@ -362,6 +490,52 @@ log.info(
     len(METHODS),
 )
 
+# %% Part 6b — latency/throughput: every phase above (reference-crop encode, query-crop encode,
+# scoring) traded off against wall-clock cost, which no figure in this script reported before
+# now. `torch.cuda.synchronize()` is called around every timed block (see `_shared/latency.py`)
+# so GPU-async dispatch doesn't understate elapsed time. Like scale_composition_adaptive_oracle.py
+# (its own Part 5b), this script has no per-point sweep loop that re-runs each phase at multiple
+# configs — every combo/scale pair is encoded and scored once, in one pass — so there's no sweep
+# axis to plot latency against, and no latency.png/accuracy_vs_latency.png; a per-phase log +
+# latency.csv is enough.
+latency_rows.append(
+    {
+        "phase": "scoring",
+        "elapsed_s": t_scoring["elapsed_s"],
+        "n_units": n_score_evals,
+        "units_per_sec": images_per_sec(n_score_evals, t_scoring["elapsed_s"]),
+    }
+)
+cache_hits, cache_misses = encoder.total_hits, encoder.total_misses
+cache_total = cache_hits + cache_misses
+latency_rows.append(
+    {
+        "phase": "total",
+        "elapsed_s": (
+            t_ref_crop_encode["elapsed_s"]
+            + t_query_crop_encode["elapsed_s"]
+            + t_scoring["elapsed_s"]
+        ),
+        "n_units": len(clean_items) + len(query_scale_items) + n_score_evals,
+        "units_per_sec": float("nan"),
+        "cache_hits": cache_hits,
+        "cache_misses": cache_misses,
+        "cache_hit_rate": cache_hits / cache_total if cache_total > 0 else float("nan"),
+    }
+)
+latency_df = pd.DataFrame(latency_rows)
+latency_df.to_csv(OUTPUT_DIR / "latency.csv", index=False)
+log.info("Latency by phase:")
+for _, row in latency_df.iterrows():
+    log.info("  phase=%-24s elapsed=%.1fs n_units=%d", row.phase, row.elapsed_s, row.n_units)
+total_row = latency_df[latency_df.phase == "total"].iloc[0]
+log.info(
+    "  cache_hits=%d cache_misses=%d cache_hit_rate=%.2f",
+    total_row.cache_hits,
+    total_row.cache_misses,
+    total_row.cache_hit_rate,
+)
+log.info("Wrote %s", OUTPUT_DIR / "latency.csv")
 
 # %% Part 7 — heatmaps + diagonal-vs-row-best summary
 def mean_iou(lookup: dict[tuple, float]) -> tuple[float, int]:
@@ -371,11 +545,27 @@ def mean_iou(lookup: dict[tuple, float]) -> tuple[float, int]:
     return float(np.mean(vals)), len(vals)
 
 
+def cell_stats(lookup: dict[tuple, float]) -> tuple[float, float, float]:
+    """(std, ci95_lo, ci95_hi) via a percentile bootstrap on one matrix cell's per-combo
+    values (see _shared/stats.py) — a plain mean/n (mean_iou above) doesn't say whether two
+    cells' means are actually distinguishable from combo-to-combo resampling noise."""
+    vals = np.array(list(lookup.values()), dtype=float)
+    if len(vals) == 0:
+        return float("nan"), float("nan"), float("nan")
+    _, ci_lo, ci_hi = bootstrap_ci(vals, n_boot=N_BOOTSTRAP, seed=BOOTSTRAP_SEED)
+    return float(vals.std()), ci_lo, ci_hi
+
+
 matrix_rows = []
 for method in METHODS:
     for t_ref in SCALE_NAMES:
         for t_query in SCALE_NAMES:
             m, n = mean_iou(matrix_iou[method][t_ref][t_query])
+            std_iou, ci_lo, ci_hi = cell_stats(matrix_iou[method][t_ref][t_query])
+            am, _an = mean_iou(matrix_achievable_iou[method][t_ref][t_query])
+            std_achievable_iou, _ai_lo, _ai_hi = cell_stats(
+                matrix_achievable_iou[method][t_ref][t_query]
+            )
             matrix_rows.append(
                 {
                     "method": method,
@@ -383,6 +573,14 @@ for method in METHODS:
                     "query_scale": t_query,
                     "mean_iou": m,
                     "n_combos": n,
+                    "std_iou": std_iou,
+                    "ci95_lo": ci_lo,
+                    "ci95_hi": ci_hi,
+                    "mean_achievable_iou": am,
+                    "std_achievable_iou": std_achievable_iou,
+                    "oracle_minus_achievable_gap": (
+                        float(m - am) if not (np.isnan(m) or np.isnan(am)) else float("nan")
+                    ),
                 }
             )
 matrix_df = pd.DataFrame(matrix_rows)
@@ -460,6 +658,185 @@ log.info(
     len(diagonal_df),
 )
 
+# %% Part 7b — oracle (upper bound, tunes threshold against the query's own GT) vs. achievable
+# (threshold tuned on this row's own diagonal cell, transferred as-is — see the ACHIEVABLE-IOU
+# REFERENCE CHOICE comment in Part 6) IoU, one line per reference scale, faceted by method — the
+# same facet as `ref_query_matrix_heatmap.png` above. Where a t_ref line's oracle (solid) and
+# achievable (dashed, same color) markers coincide is exactly the diagonal cell (t_query ==
+# t_ref) — the achievable-IoU reference itself, where the two are tautologically equal; the gap
+# that opens up moving away from that point along the row is the actual answer to "how much of
+# the oracle upper bound would a scale-mismatched query actually get with a threshold tuned at
+# the matched scale."
+ref_scale_colors = plt.cm.viridis(np.linspace(0, 1, len(SCALE_NAMES)))
+fig, axes = plt.subplots(1, len(METHODS), figsize=(7.5 * len(METHODS), 6), sharey=True)
+for ax, method in zip(axes, METHODS):
+    for t_ref, color in zip(SCALE_NAMES, ref_scale_colors):
+        oracle_line = [mean_iou(matrix_iou[method][t_ref][tq])[0] for tq in SCALE_NAMES]
+        achievable_line = [
+            mean_iou(matrix_achievable_iou[method][t_ref][tq])[0] for tq in SCALE_NAMES
+        ]
+        ax.plot(SCALE_NAMES, oracle_line, marker="o", linestyle="-", color=color, alpha=0.85)
+        ax.plot(SCALE_NAMES, achievable_line, marker="^", linestyle="--", color=color, alpha=0.85)
+    ax.set_xticks(range(len(SCALE_NAMES)), SCALE_NAMES, rotation=45)
+    ax.set_xlabel("query crop scale")
+    ax.set_title(method)
+    ax.set_ylim(0, 1.0)
+    ax.grid(alpha=0.3)
+axes[0].set_ylabel("mean IoU across combos (solid=oracle, dashed=achievable; color=ref scale)")
+sm = plt.cm.ScalarMappable(cmap="viridis", norm=plt.Normalize(vmin=0, vmax=len(SCALE_NAMES) - 1))
+sm.set_array([])
+cbar = fig.colorbar(sm, ax=axes, fraction=0.025, pad=0.02, ticks=range(len(SCALE_NAMES)))
+cbar.ax.set_yticklabels(SCALE_NAMES)
+cbar.set_label("reference scale")
+fig.suptitle("Oracle vs. achievable IoU across the ref x query matrix (one line per reference scale)")
+fig.savefig(OUTPUT_DIR / "oracle_vs_achievable.png", dpi=150, bbox_inches="tight")
+plt.close(fig)
+log.info("Saved %s", OUTPUT_DIR / "oracle_vs_achievable.png")
+
+# %% Part 7c — does oracle IoU correlate with the query GT's own object size (gt_area_frac,
+# added to every matrix_sample_rows row in Part 6)? Mirrors scale_composition_adaptive_oracle.py's
+# own Part 7 correlation_rows/pearson_r/pearson_p/spearman_r/spearman_p convention (that script
+# set this precedent first), grouped by (method, ref_scale, query_scale) — the same granularity
+# as this script's own headline matrix_rows breakdown above. gt_area_frac genuinely varies
+# combo-to-combo within one cell (different (unit, group) pairs crop to different absolute
+# object sizes) even though every combo in a cell shares the same query crop scale.
+matrix_sample_df = pd.DataFrame(matrix_sample_rows)
+size_correlation_rows = []
+for method in METHODS:
+    for t_ref in SCALE_NAMES:
+        for t_query in SCALE_NAMES:
+            sub = matrix_sample_df[
+                (matrix_sample_df.method == method)
+                & (matrix_sample_df.ref_scale == t_ref)
+                & (matrix_sample_df.query_scale == t_query)
+            ]
+            if len(sub) < 3:
+                continue
+            pearson_r, pearson_p = pearsonr(sub["gt_area_frac"], sub["oracle_iou"])
+            spearman_r, spearman_p = spearmanr(sub["gt_area_frac"], sub["oracle_iou"])
+            size_correlation_rows.append(
+                {
+                    "method": method,
+                    "ref_scale": t_ref,
+                    "query_scale": t_query,
+                    "pearson_r": pearson_r,
+                    "pearson_p": pearson_p,
+                    "spearman_r": spearman_r,
+                    "spearman_p": spearman_p,
+                    "n_samples": len(sub),
+                }
+            )
+size_correlation_df = pd.DataFrame(size_correlation_rows)
+size_correlation_df.to_csv(OUTPUT_DIR / "size_correlation.csv", index=False)
+log.info("Wrote %s (%d rows)", OUTPUT_DIR / "size_correlation.csv", len(size_correlation_df))
+
+# Object-size terciles (global cutoffs, computed once across every sample row so they're
+# consistent everywhere) x oracle IoU, faceted by method — same facet as
+# `ref_query_matrix_heatmap.png` above, pooled across every (ref_scale, query_scale) cell.
+try:
+    matrix_sample_df["size_tercile"] = pd.qcut(
+        matrix_sample_df["gt_area_frac"], 3, labels=["small", "medium", "large"]
+    )
+except ValueError:
+    log.warning(
+        "gt_area_frac has too few distinct values for 3 clean terciles — falling back to "
+        "qcut's own duplicate-safe binning (labels become numeric ranges, not small/medium/large)"
+    )
+    matrix_sample_df["size_tercile"] = pd.qcut(matrix_sample_df["gt_area_frac"], 3, duplicates="drop")
+
+fig, axes = plt.subplots(1, len(METHODS), figsize=(6.5 * len(METHODS), 5.5), sharey=True)
+for ax, method in zip(axes, METHODS):
+    tercile_means = (
+        matrix_sample_df[matrix_sample_df.method == method]
+        .groupby("size_tercile", observed=True)["oracle_iou"]
+        .mean()
+    )
+    tercile_means.plot(kind="bar", ax=ax, color=METHOD_COLOR[method])
+    ax.set_title(method)
+    ax.set_xlabel("object-size tercile (by query GT patch-mask area fraction)")
+    ax.set_ylim(0, 1.0)
+    ax.grid(alpha=0.3, axis="y")
+axes[0].set_ylabel("mean oracle IoU (pooled across every ref/query scale cell)")
+fig.suptitle("Does object size predict oracle IoU in the ref x query scale matrix?")
+fig.tight_layout()
+fig.savefig(OUTPUT_DIR / "size_correlation.png", dpi=150, bbox_inches="tight")
+plt.close(fig)
+log.info("Wrote %s", OUTPUT_DIR / "size_correlation.png")
+
+# %% Part 8 — is the "matched scale beats mismatched scale" pattern real, or combo-to-combo
+# noise? An unpaired bootstrap comparison (see _shared/stats.py) of the matrix's two natural
+# groups of cells, per method: every diagonal (matched ref/query scale) cell's oracle_iou values
+# pooled across ref scales vs. every off-diagonal (mismatched) cell's. This is the direct
+# significance check `diagonal_vs_row_best.csv`'s `diagonal_is_row_best` column above (Part 7)
+# otherwise leaves the reader to eyeball as a plain win-count.
+significance_rows = []
+for method in METHODS:
+    diagonal_vals = matrix_sample_df.loc[
+        (matrix_sample_df.method == method)
+        & (matrix_sample_df.ref_scale == matrix_sample_df.query_scale),
+        "oracle_iou",
+    ].to_numpy()
+    off_diagonal_vals = matrix_sample_df.loc[
+        (matrix_sample_df.method == method)
+        & (matrix_sample_df.ref_scale != matrix_sample_df.query_scale),
+        "oracle_iou",
+    ].to_numpy()
+    prob_diag_greater = bootstrap_prob_greater(
+        diagonal_vals, off_diagonal_vals, n_boot=N_BOOTSTRAP, seed=BOOTSTRAP_SEED
+    )
+    significance_rows.append(
+        {
+            "method": method,
+            "prob_diagonal_beats_off_diagonal": prob_diag_greater,
+            "n_diagonal": len(diagonal_vals),
+            "n_off_diagonal": len(off_diagonal_vals),
+        }
+    )
+significance_df = pd.DataFrame(significance_rows)
+significance_df.to_csv(OUTPUT_DIR / "matrix_diagonal_significance.csv", index=False)
+log.info(
+    "Matched-vs-mismatched scale significance (P(diagonal mean > off-diagonal mean) under "
+    "%d-resample bootstrap; near 0.5 = indistinguishable from noise):",
+    N_BOOTSTRAP,
+)
+for _, row in significance_df.iterrows():
+    log.info(
+        "  method=%-13s P(diagonal beats off-diagonal)=%.3f (n=%d vs n=%d)",
+        row.method,
+        row.prob_diagonal_beats_off_diagonal,
+        row.n_diagonal,
+        row.n_off_diagonal,
+    )
+log.info("Wrote %s", OUTPUT_DIR / "matrix_diagonal_significance.csv")
+
+# %% Part 9 — worst/best-N qualitative gallery at one representative row (see
+# QUALITATIVE_REF_SCALE/QUALITATIVE_METHOD above) — every other figure in this script averages
+# across combos (heatmap cells, tercile bars); this shows actual individual query crops so a
+# failure mode (one orientation, one lighting condition) is visible instead of washed out by
+# the mean.
+if qualitative_examples:
+    save_score_gallery(
+        qualitative_examples,
+        OUTPUT_DIR / "qualitative_worst_best.png",
+        n=5,
+        score_name="oracle_iou",
+        title=(
+            f"Worst/best oracle_iou examples: ref_scale={QUALITATIVE_REF_SCALE} "
+            f"method={QUALITATIVE_METHOD} (across every query scale)"
+        ),
+    )
+    log.info(
+        "Wrote %s (%d examples)",
+        OUTPUT_DIR / "qualitative_worst_best.png",
+        len(qualitative_examples),
+    )
+else:
+    log.warning(
+        "No qualitative examples collected for the representative row (ref_scale=%s, method=%s)",
+        QUALITATIVE_REF_SCALE,
+        QUALITATIVE_METHOD,
+    )
+
 # %% [markdown]
 # ## Reading the results
 #
@@ -478,5 +855,35 @@ log.info(
 #   docstring's caveat: this regime scores within a small, GT-centered query crop (foreground-
 #   dense), not the whole query image (foreground-sparse), so absolute IoU here runs much higher
 #   across the board regardless of scale matching.
+# - **`ref_query_matrix_iou.csv`'s `mean_achievable_iou`/`std_achievable_iou`/
+#   `oracle_minus_achievable_gap` columns**, and **`oracle_vs_achievable.png`** — `mean_iou`
+#   everywhere else is an oracle upper bound (tunes its threshold against the query's own GT);
+#   `achievable_iou` tunes the threshold on this row's own diagonal (matched-scale) cell only and
+#   transfers it as-is to every other cell in the row — the number a deployed pipeline without
+#   query-time labels would actually see (see the ACHIEVABLE-IOU REFERENCE CHOICE comment in
+#   Part 6 for why the diagonal was chosen as the reference). Achievable == oracle exactly on the
+#   diagonal itself (tautologically, since the threshold is tuned on that very cell); the gap
+#   that opens up moving away from the diagonal is the real cost of not having query-time labels.
+#   `ref_query_matrix_iou.csv`'s `ci95_lo`/`ci95_hi` columns are a percentile bootstrap CI (2000
+#   resamples) on each cell's mean.
+# - **`size_correlation.csv`/`.png`** — does oracle IoU correlate with the query GT's own area
+#   fraction (`gt_area_frac`), per (method, ref_scale, query_scale) cell? A resolution here that
+#   `size_vs_optimal_t_correlation.csv` (a *different* script, `scale_composition_adaptive_
+#   oracle.py`) doesn't test: whether small/large query crops are simply harder or easier to
+#   score at any given ref/query scale pairing, not which scale is optimal for them.
+# - **`matrix_diagonal_significance.csv`** — an unpaired bootstrap comparison (2000 resamples) of
+#   every diagonal cell's oracle_iou values (pooled across ref scales) vs. every off-diagonal
+#   cell's, per method: `prob_diagonal_beats_off_diagonal` near 0.5 means the apparent
+#   matched-scale advantage in `ref_query_matrix_heatmap.png`/`diagonal_vs_row_best.csv` is not
+#   distinguishable from combo-to-combo noise — the quantitative version of that CSV's win-count.
+# - **`latency.csv`** — GPU-synchronized wall-clock cost (see `_shared/latency.py`) per phase
+#   (reference-crop encode, query-crop encode, scoring) plus encoding-cache hit rate. No sweep
+#   axis exists in this script to plot latency against (every combo/scale pair is encoded and
+#   scored once, not per-config like `resolution_ablation.py`'s sweep) — see the per-phase log
+#   lines instead.
+# - **`qualitative_worst_best.png`** — actual worst-5/best-5 query crops (crop, raw score map,
+#   GT mask) at one representative reference scale (`QUALITATIVE_REF_SCALE`, the sweep's
+#   midpoint) across every query scale, not an average — no other figure here shows *why* a
+#   specific (ref, query) scale pairing fails on a specific instance.
 
 # %%

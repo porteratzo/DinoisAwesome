@@ -51,7 +51,9 @@ def apply_overrides(script_globals: dict[str, Any], overrides: dict[str, Any]) -
 
     Only overwrites constants the script already defines — an unrecognized key is a
     likely config typo, so it's logged and skipped rather than silently injected as a
-    new global.
+    new global. A `Path`-typed constant (e.g. `OUTPUT_DIR`-adjacent input paths like
+    `DRIFT_CSV`) is wrapped back into a `Path` on override, since YAML always hands
+    back a plain string and downstream code expects the original type.
     """
     for key, value in overrides.items():
         const_name = key.upper()
@@ -62,6 +64,8 @@ def apply_overrides(script_globals: dict[str, Any], overrides: dict[str, Any]) -
                 const_name,
             )
             continue
+        if isinstance(script_globals[const_name], Path):
+            value = Path(value)
         script_globals[const_name] = value
 
 
