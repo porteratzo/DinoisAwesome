@@ -80,6 +80,7 @@ from _shared.augmentations import (  # noqa: E402
     pixel_only,
 )
 from _shared.mask_geometry import pixel_mask_to_patch_mask, scale_crop_box  # noqa: E402
+from _shared.run_config import apply_overrides, load_run_config, resolve_output_dir  # noqa: E402
 
 # %% Parameters
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -116,10 +117,13 @@ MASK_PATCH_THRESHOLD = 0.3  # patch-grid cell counts as "object" once this fract
 MID_PADDING_FRACTION = 1.0  # mid-crop padding around the mask bbox, fraction of its extent
 
 SEED = 0
+
+apply_overrides(globals(), load_run_config(__file__))
 torch.manual_seed(SEED)
 
-OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental_abc5" / "augmentation_sensitivity"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR = resolve_output_dir(
+    _REPO_ROOT / "outputs" / "fundamental_abc5" / "augmentation_sensitivity"
+)
 
 log.info(
     "images=%s  |  DINO%s-%s img_size=%d layer=%d",

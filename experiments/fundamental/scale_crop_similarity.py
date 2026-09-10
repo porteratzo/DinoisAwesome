@@ -63,6 +63,7 @@ from _shared.mask_geometry import (  # noqa: E402
     pixel_mask_to_patch_mask,
     scale_crop_box,
 )
+from _shared.run_config import apply_overrides, load_run_config, resolve_output_dir  # noqa: E402
 
 # %% Parameters
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -90,11 +91,12 @@ N_SCALES = 7  # crop steps, t = 0 (global) .. 1 (closest), evenly spaced
 CLOSE_PADDING_FRACTION = 0.5  # closest crop's padding around the mask bbox, fraction of its extent
 MIN_CROP_SIZE = 64  # closest crop must be at least this many native px on each side
 
-OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental" / "scale_crop_similarity"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
 SEED = 0
+
+apply_overrides(globals(), load_run_config(__file__))
 torch.manual_seed(SEED)
+
+OUTPUT_DIR = resolve_output_dir(_REPO_ROOT / "outputs" / "fundamental" / "scale_crop_similarity")
 
 log.info(
     "image=%s class=%r  |  DINO%s-%s img_size=%d layer=%d  |  n_scales=%d",

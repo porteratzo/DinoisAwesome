@@ -68,6 +68,7 @@ from _shared.pooled_gallery_cv import (  # noqa: E402
     make_fold_role_splits,
 )
 from _shared.prototype_ops import knn_score_heatmap, score_heatmap  # noqa: E402
+from _shared.run_config import apply_overrides, load_run_config, resolve_output_dir  # noqa: E402
 from _shared.thresholding import oracle_iou  # noqa: E402
 
 # %% Parameters
@@ -101,10 +102,13 @@ KNN_COLOR = "#2ecc71"  # matches METHOD_COLOR["knn_fgbg"] in the sibling script
 SINGLE_PROTO_COLOR = "#7f8c8d"  # matches METHOD_COLOR["single_proto"]; bg-invariant reference
 
 SEED = 0
+
+apply_overrides(globals(), load_run_config(__file__))
 torch.manual_seed(SEED)
 
-OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental_abc5" / "scale_composition_bg_ablation"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR = resolve_output_dir(
+    _REPO_ROOT / "outputs" / "fundamental_abc5" / "scale_composition_bg_ablation"
+)
 
 log.info(
     "RUN_PAIRS=%d units (%s)  |  DINO%s-%s img_size=%d layer=%d  |  n_scale_steps=%d",

@@ -139,6 +139,7 @@ from _shared.prototype_ops import (  # noqa: E402
     knn_score_heatmap,
     score_heatmap,
 )
+from _shared.run_config import apply_overrides, load_run_config, resolve_output_dir  # noqa: E402
 from _shared.thresholding import oracle_iou  # noqa: E402
 
 # %% Parameters
@@ -229,10 +230,11 @@ METHODS: list[str] = ["proto", "knn_fgbg"]
 METHOD_COLOR: dict[str, str] = {"proto": "#7f8c8d", "knn_fgbg": "#2ecc71"}
 
 SEED = 0
+
+apply_overrides(globals(), load_run_config(__file__))
 torch.manual_seed(SEED)
 
-OUTPUT_DIR = _REPO_ROOT / "outputs" / "fundamental_abc5" / "noisy_fgbg_cleaning"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR = resolve_output_dir(_REPO_ROOT / "outputs" / "fundamental_abc5" / "noisy_fgbg_cleaning")
 
 log.info(
     "RUN_PAIRS=%d units (%s)  |  DINO%s-%s img_size=%d layer=%d  |  stages=%s methods=%s",
