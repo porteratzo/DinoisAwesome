@@ -279,31 +279,44 @@ for pt, group in instances_by_part_group:
 # tokens, GT patch masks, gallery fg/bg banks, and the 1-1/5-3 cross-validated scoring itself)
 # depends on img_size, so it all lives inside this loop; Parts 1-2 above (pixel-space discovery
 # and cropping) do not and were done once.
-def score_gallery(
+def build_gallery(
     pool_idxs: list[int],
     fg_by_instance_scale: dict[tuple, torch.Tensor],
     bg_by_instance_scale: dict[tuple, torch.Tensor],
-    q_tokens: torch.Tensor,
-    q_h: int,
-    q_w: int,
-    gt: np.ndarray,
-) -> dict[str, float]:
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pool + cap + move to device + build the mean prototype for one (fold, part_type, group)'s
+    training pool. Depends only on `pool_idxs` — not on which eval image is being scored — so
+    callers build this once per pool and reuse it across every eval_number in that fold (it used
+    to be rebuilt from scratch per eval_number inside score_gallery, 3x redundant work for every
+    5-3 fold since N_EVAL_53=3)."""
     fg_bank = cap_bank_size(
         torch.cat(
             [fg_by_instance_scale[(i, scale)] for i in pool_idxs for scale in GALLERY_SCALES], dim=0
         ),
         MAX_BANK_SIZE_KNN,
         SEED,
-    ).to(q_tokens.device)
+    ).to(device)
     bg_bank = cap_bank_size(
         torch.cat(
             [bg_by_instance_scale[(i, scale)] for i in pool_idxs for scale in GALLERY_SCALES], dim=0
         ),
         MAX_BANK_SIZE_KNN,
         SEED,
-    ).to(q_tokens.device)
-
+    ).to(device)
     proto = compute_exemplar_features(fg_bank, mode="mean")
+    return fg_bank, bg_bank, proto
+
+
+def score_gallery(
+    fg_bank: torch.Tensor,
+    bg_bank: torch.Tensor,
+    proto: torch.Tensor,
+    q_tokens: torch.Tensor,
+    q_h: int,
+    q_w: int,
+    gt: np.ndarray,
+) -> dict[str, float]:
     raw_proto = score_heatmap(q_tokens, proto, q_h, q_w)
     raw_knn = knn_score_heatmap(q_tokens, fg_bank, bg_bank, KNN_FGBG_NUM_NEIGHBOURS, q_h, q_w)
     return {
@@ -407,20 +420,25 @@ with tqdm(total=n_sweep_units, desc="Part 3: per-(size,resolution) 1-1/5-3 CV sw
                                 ]
                                 if not pool_idxs:
                                     continue
-                                for eval_number in eval_numbers:
+                                valid_evals = [
+                                    n
+                                    for n in eval_numbers
+                                    if (part_type, group, n) in gt_patch_masks
+                                ]
+                                if not valid_evals:
+                                    continue
+                                fg_bank, bg_bank, proto = build_gallery(
+                                    pool_idxs,
+                                    fg_by_instance_scale,
+                                    bg_by_instance_scale,
+                                    encoder.device,
+                                )
+                                for eval_number in valid_evals:
                                     gt_key = (part_type, group, eval_number)
-                                    if gt_key not in gt_patch_masks:
-                                        continue
                                     q_tokens, q_h, q_w = image_encodings[(part_type, eval_number)]
                                     gt = gt_patch_masks[gt_key]
                                     ious = score_gallery(
-                                        pool_idxs,
-                                        fg_by_instance_scale,
-                                        bg_by_instance_scale,
-                                        q_tokens,
-                                        q_h,
-                                        q_w,
-                                        gt,
+                                        fg_bank, bg_bank, proto, q_tokens, q_h, q_w, gt
                                     )
                                     for method, iou in ious.items():
                                         results.append(

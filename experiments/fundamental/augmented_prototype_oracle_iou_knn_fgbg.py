@@ -1518,10 +1518,49 @@ with tqdm(total=n_units_53, desc="5-3: cross-validated fit + score") as pbar:
                 clean_proto_pool = compute_exemplar_features(clean_fg_pool, mode="mean")
                 clean_bg_proto_pool = compute_exemplar_features(clean_bg_pool, mode="mean")
 
-                for eval_number in eval_numbers:
+                valid_evals = [
+                    n for n in eval_numbers if (part_type, group, n) in gt_patch_masks_53
+                ]
+                if not valid_evals:
+                    continue
+
+                # paired_proto/fg_bank for every non-baseline (family, val) built once per pool
+                # here, independent of which eval image is scored — previously rebuilt from
+                # scratch per eval_number inside the scoring loop below (3x redundant
+                # cat+cap_bank_size+prototype work per 5-3 fold).
+                aug_by_family_val: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+                for family, spec in AUGMENTATIONS.items():
+                    for val in spec["values"]:
+                        if val == spec["values"][0]:  # baseline uses clean_proto_pool directly
+                            continue
+                        aug_fg_pool = cap_bank_size(
+                            torch.cat(
+                                [aug_fg_by_inst[(i, family, val)] for i in pool_idxs], dim=0
+                            ),
+                            MAX_BANK_SIZE_KNN_53,
+                            SEED,
+                        ).to(encoder.device)
+                        aug_proto_pool = (
+                            compute_exemplar_features(aug_fg_pool, mode="mean")
+                            if aug_fg_pool.shape[0] > 0
+                            else clean_proto_pool
+                        )
+                        paired_proto = F.normalize(
+                            torch.cat([clean_proto_pool, aug_proto_pool], dim=0).mean(
+                                dim=0, keepdim=True
+                            ),
+                            p=2,
+                            dim=-1,
+                        )
+                        fg_bank = cap_bank_size(
+                            torch.cat([clean_fg_pool, aug_fg_pool], dim=0),
+                            MAX_BANK_SIZE_KNN_53,
+                            SEED,
+                        )
+                        aug_by_family_val[(family, val)] = (paired_proto, fg_bank)
+
+                for eval_number in valid_evals:
                     key = (part_type, group, eval_number)
-                    if key not in gt_patch_masks_53:
-                        continue
                     q = image_encodings_53[(part_type, eval_number)]
                     gt = gt_patch_masks_53[key]
                     q_tokens = q["tokens"]
@@ -1541,31 +1580,7 @@ with tqdm(total=n_units_53, desc="5-3: cross-validated fit + score") as pbar:
                                 paired_proto = clean_proto_pool
                                 fg_bank = clean_fg_pool
                             else:
-                                aug_fg_pool = cap_bank_size(
-                                    torch.cat(
-                                        [aug_fg_by_inst[(i, family, val)] for i in pool_idxs],
-                                        dim=0,
-                                    ),
-                                    MAX_BANK_SIZE_KNN_53,
-                                    SEED,
-                                ).to(encoder.device)
-                                aug_proto_pool = (
-                                    compute_exemplar_features(aug_fg_pool, mode="mean")
-                                    if aug_fg_pool.shape[0] > 0
-                                    else clean_proto_pool
-                                )
-                                paired_proto = F.normalize(
-                                    torch.cat([clean_proto_pool, aug_proto_pool], dim=0).mean(
-                                        dim=0, keepdim=True
-                                    ),
-                                    p=2,
-                                    dim=-1,
-                                )
-                                fg_bank = cap_bank_size(
-                                    torch.cat([clean_fg_pool, aug_fg_pool], dim=0),
-                                    MAX_BANK_SIZE_KNN_53,
-                                    SEED,
-                                )
+                                paired_proto, fg_bank = aug_by_family_val[(family, val)]
 
                             score_and_store(
                                 iou_lookup_53,

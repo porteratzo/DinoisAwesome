@@ -321,17 +321,33 @@ log.info(
 # group. A fresh shuffle per (N_train, fold, part_type) — folds are independent random
 # resamples (their eval sets can and do overlap across folds), not a non-overlapping partition;
 # that's deliberate, matching "shuffle once more" rather than a strict k-fold split.
-def score_gallery(
-    pool_idxs: list[int], q_tokens: torch.Tensor, q_h: int, q_w: int, gt: np.ndarray
-) -> dict[str, float]:
+def build_gallery(
+    pool_idxs: list[int], device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pool + move to device + build the mean prototype for one (n_train, fold, part_type,
+    group)'s training pool. Depends only on `pool_idxs`, not on which eval image is being
+    scored, so callers build this once per pool and reuse it across every eval_number in that
+    fold (it used to be rebuilt from scratch per eval_number inside score_gallery, N_EVAL-fold
+    redundant work whenever more than one eval image shares a fold)."""
     fg_bank = torch.cat(
         [fg_by_instance_scale[(i, scale)] for i in pool_idxs for scale in GALLERY_SCALES], dim=0
-    ).to(q_tokens.device)
+    ).to(device)
     bg_bank = torch.cat(
         [bg_by_instance_scale[(i, scale)] for i in pool_idxs for scale in GALLERY_SCALES], dim=0
-    ).to(q_tokens.device)
-
+    ).to(device)
     proto = compute_exemplar_features(fg_bank, mode="mean")
+    return fg_bank, bg_bank, proto
+
+
+def score_gallery(
+    fg_bank: torch.Tensor,
+    bg_bank: torch.Tensor,
+    proto: torch.Tensor,
+    q_tokens: torch.Tensor,
+    q_h: int,
+    q_w: int,
+    gt: np.ndarray,
+) -> dict[str, float]:
     raw_proto = score_heatmap(q_tokens, proto, q_h, q_w)
     raw_knn = knn_score_heatmap(q_tokens, fg_bank, bg_bank, KNN_FGBG_NUM_NEIGHBOURS, q_h, q_w)
     return {
@@ -357,13 +373,17 @@ with tqdm(total=n_sweep_units, desc="Part 5: cross-validated sweep") as pbar:
                     ]
                     if not pool_idxs:
                         continue
-                    for eval_number in eval_numbers:
+                    valid_evals = [
+                        n for n in eval_numbers if (part_type, group, n) in gt_patch_masks
+                    ]
+                    if not valid_evals:
+                        continue
+                    fg_bank, bg_bank, proto = build_gallery(pool_idxs, encoder.device)
+                    for eval_number in valid_evals:
                         key = (part_type, group, eval_number)
-                        if key not in gt_patch_masks:
-                            continue
                         q_tokens, q_h, q_w = image_encodings[(part_type, eval_number)]
                         gt = gt_patch_masks[key]
-                        ious = score_gallery(pool_idxs, q_tokens, q_h, q_w, gt)
+                        ious = score_gallery(fg_bank, bg_bank, proto, q_tokens, q_h, q_w, gt)
                         for method, iou in ious.items():
                             results.append(
                                 {

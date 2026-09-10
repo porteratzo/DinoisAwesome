@@ -634,20 +634,49 @@ with tqdm(total=n_units_53, desc="5-3: cross-validated fit + score") as pbar:
                 ]
                 if not pool_idxs:
                     continue
-                for eval_number in eval_numbers:
-                    key = (part_type, group, eval_number)
-                    if key not in gt_patch_masks_53:
-                        continue
-                    q = image_encodings_53[(part_type, eval_number)]
-                    gt = gt_patch_masks_53[key]
-                    for fg_scale in POOL_SCALES_53:
-                        fg_bank = cap_bank_size(
+                valid_evals = [
+                    n for n in eval_numbers if (part_type, group, n) in gt_patch_masks_53
+                ]
+                if not valid_evals:
+                    continue
+
+                # Built once per (fold, part_type, group) pool — independent of which eval
+                # image is scored, so this used to be rebuilt from scratch per eval_number
+                # (3x redundant for every 5-3 fold). bg_bank is further keyed by the *set* of
+                # scales pooled (`members`), not by fg_scale directly: "global_only" and
+                # "every_scale_all" don't depend on fg_scale at all, so the old per-fg_scale
+                # loop rebuilt those two identically for every fg_scale too — deduping on
+                # `tuple(members)` fixes both redundancies at once, with the same cap_bank_size
+                # seed/order guaranteeing byte-identical banks either way.
+                fg_banks = {
+                    fg_scale: cap_bank_size(
+                        torch.cat([fg_by_inst_scale_53[(i, fg_scale)] for i in pool_idxs], dim=0),
+                        MAX_BANK_SIZE_KNN_53,
+                        SEED,
+                    ).to(encoder.device)
+                    for fg_scale in POOL_SCALES_53
+                }
+                bg_bank_by_members: dict[tuple[str, ...], torch.Tensor] = {}
+                for fg_scale in POOL_SCALES_53:
+                    for members in ([fg_scale], ["global"], POOL_SCALES_53):
+                        members_key = tuple(members)
+                        if members_key in bg_bank_by_members:
+                            continue
+                        bg_bank_by_members[members_key] = cap_bank_size(
                             torch.cat(
-                                [fg_by_inst_scale_53[(i, fg_scale)] for i in pool_idxs], dim=0
+                                [bg_by_inst_scale_53[(i, m)] for i in pool_idxs for m in members],
+                                dim=0,
                             ),
                             MAX_BANK_SIZE_KNN_53,
                             SEED,
-                        ).to(q["tokens"].device)
+                        ).to(encoder.device)
+
+                for eval_number in valid_evals:
+                    key = (part_type, group, eval_number)
+                    q = image_encodings_53[(part_type, eval_number)]
+                    gt = gt_patch_masks_53[key]
+                    for fg_scale in POOL_SCALES_53:
+                        fg_bank = fg_banks[fg_scale]
                         if fg_bank.shape[0] == 0:
                             continue
                         for strategy, members in {
@@ -655,18 +684,7 @@ with tqdm(total=n_units_53, desc="5-3: cross-validated fit + score") as pbar:
                             "global_only": ["global"],
                             "every_scale_all": POOL_SCALES_53,
                         }.items():
-                            bg_bank = cap_bank_size(
-                                torch.cat(
-                                    [
-                                        bg_by_inst_scale_53[(i, m)]
-                                        for i in pool_idxs
-                                        for m in members
-                                    ],
-                                    dim=0,
-                                ),
-                                MAX_BANK_SIZE_KNN_53,
-                                SEED,
-                            ).to(q["tokens"].device)
+                            bg_bank = bg_bank_by_members[tuple(members)]
                             if bg_bank.shape[0] == 0:
                                 continue
                             raw_knn = knn_score_heatmap(

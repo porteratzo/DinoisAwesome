@@ -769,25 +769,39 @@ with tqdm(total=n_units_53, desc="5-3: cross-validated fit + score") as pbar:
                     ),
                     MAX_BANK_SIZE_KNN_53,
                     SEED,
-                )
+                ).to(encoder.device)
                 if bg_bank.shape[0] == 0:
                     continue
-                for eval_number in eval_numbers:
+                valid_evals = [
+                    n for n in eval_numbers if (part_type, group, n) in gt_patch_masks_53
+                ]
+                if not valid_evals:
+                    continue
+
+                # fg_bank/proto built once per scale here, independent of which eval image is
+                # scored — previously rebuilt per eval_number inside the scale loop below (3x
+                # redundant cat+cap_bank_size+prototype work per 5-3 fold).
+                fg_bank_by_scale: dict[str, torch.Tensor] = {}
+                proto_by_scale: dict[str, torch.Tensor] = {}
+                for scale in POOL_SCALES_53:
+                    fg_bank = cap_bank_size(
+                        torch.cat([fg_by_inst_scale_53[(i, scale)] for i in pool_idxs], dim=0),
+                        MAX_BANK_SIZE_KNN_53,
+                        SEED,
+                    ).to(encoder.device)
+                    fg_bank_by_scale[scale] = fg_bank
+                    if fg_bank.shape[0] > 0:
+                        proto_by_scale[scale] = compute_exemplar_features(fg_bank, mode="mean")
+
+                for eval_number in valid_evals:
                     key = (part_type, group, eval_number)
-                    if key not in gt_patch_masks_53:
-                        continue
                     q = image_encodings_53[(part_type, eval_number)]
                     gt = gt_patch_masks_53[key]
-                    bg_dev = bg_bank.to(q["tokens"].device)
                     for scale in POOL_SCALES_53:
-                        fg_bank = cap_bank_size(
-                            torch.cat([fg_by_inst_scale_53[(i, scale)] for i in pool_idxs], dim=0),
-                            MAX_BANK_SIZE_KNN_53,
-                            SEED,
-                        ).to(q["tokens"].device)
+                        fg_bank = fg_bank_by_scale[scale]
                         if fg_bank.shape[0] == 0:
                             continue
-                        proto = compute_exemplar_features(fg_bank, mode="mean")
+                        proto = proto_by_scale[scale]
                         raw_proto = score_heatmap(q["tokens"], proto, q["h"], q["w"])
                         results_53.append(
                             {
@@ -797,7 +811,7 @@ with tqdm(total=n_units_53, desc="5-3: cross-validated fit + score") as pbar:
                             }
                         )
                         raw_knn = knn_score_heatmap(
-                            q["tokens"], fg_bank, bg_dev, KNN_FGBG_NUM_NEIGHBOURS, q["h"], q["w"]
+                            q["tokens"], fg_bank, bg_bank, KNN_FGBG_NUM_NEIGHBOURS, q["h"], q["w"]
                         )
                         results_53.append(
                             {

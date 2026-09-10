@@ -29,17 +29,27 @@ Caveats:
     - Every cache-hit touches the `.npz` file's mtime so it reads as "just
       used" for `scripts/prune_cache.py`'s day-based eviction; a fresh miss's
       mtime is already current from the write.
+    - `index.parquet` is bookkeeping for `inspect_cache()` only — cache hits are
+      decided by `.npz` file existence, never by the index — so it is flushed to
+      disk on `flush()`, on `__exit__` (as a context manager), and via an
+      `atexit` safety net rather than after every `forward()` call with a miss.
+      A crash between misses can leave it briefly undercounting; the embeddings
+      themselves are never affected, and the fix is just to keep running (each
+      still-missing key gets an index row next time it's genuinely re-encoded).
 """
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import logging
 import os
+import weakref
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import TracebackType
 from typing import Any, cast
 
 import numpy as np
@@ -145,6 +155,13 @@ def _layers_key(layers: int | list[int]) -> str:
     return ",".join(str(i) for i in layers)
 
 
+def _flush_if_alive(ref: weakref.ReferenceType[EncoderWithCache]) -> None:
+    """atexit callback: flush *ref*'s index iff the EncoderWithCache it points to still exists."""
+    obj = ref()
+    if obj is not None:
+        obj.flush()
+
+
 class EncoderWithCache:
     """Drop-in wrapper around a `DinoEncoder` that caches per-image encodings to disk.
 
@@ -181,6 +198,15 @@ class EncoderWithCache:
             self._index = pd.read_parquet(self._index_path)
         else:
             self._index = pd.DataFrame(columns=_INDEX_COLUMNS)
+        self._index_dirty = False
+        # A weakref, not `atexit.register(self.flush)`: sweep scripts (e.g.
+        # fundamental/resolution_ablation.py) explicitly `del` an EncoderWithCache between
+        # points specifically to free its backbone's GPU memory before building the next one —
+        # a strong reference held by atexit would keep every such instance (and its wrapped
+        # DinoEncoder) alive for the rest of the process, defeating that and risking the exact
+        # CUDA OOM those scripts guard against. `__del__` below covers the explicit-`del` case
+        # directly; this weakref is the backstop for an instance still alive at normal exit.
+        atexit.register(_flush_if_alive, weakref.ref(self))
 
         _log.info(
             "EncoderWithCache: fingerprint=%s dir=%s (%d entries already cached)",
@@ -193,6 +219,39 @@ class EncoderWithCache:
         if name == "_encoder":
             raise AttributeError(name)
         return getattr(self._encoder, name)
+
+    def __enter__(self) -> EncoderWithCache:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.flush()
+
+    def flush(self) -> None:
+        """Write the in-memory index to `index.parquet` if it has unwritten rows.
+
+        Called automatically at process exit (registered in `__init__`) and on
+        `__exit__` when used as a context manager; call it directly for an
+        earlier guaranteed write (e.g. before a long-running script forks or is
+        expected to be killed rather than exit cleanly).
+        """
+        if not self._index_dirty:
+            return
+        self._index.to_parquet(self._index_path, index=False)
+        self._index_dirty = False
+
+    def __del__(self) -> None:
+        # Covers a script `del`-ing its EncoderWithCache mid-run (see the weakref comment in
+        # __init__); best-effort since __del__ can run during interpreter teardown with modules
+        # already torn down, in which case there's nothing useful to do about it.
+        try:
+            self.flush()
+        except Exception:
+            pass
 
     def __call__(
         self,
@@ -275,7 +334,7 @@ class EncoderWithCache:
                 )
 
             self._index = pd.concat([self._index, pd.DataFrame(new_rows)], ignore_index=True)
-            self._index.to_parquet(self._index_path, index=False)
+            self._index_dirty = True
 
         cls = torch.stack(cast("list[torch.Tensor]", cls_list), dim=0)
         patches = torch.stack(cast("list[torch.Tensor]", patches_list), dim=0)
