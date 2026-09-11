@@ -71,7 +71,7 @@ cross-validates or just scores one fixed pair — see above.
 | `fundamental/training_set_size_ablation.py` | Does pooling N=1..5 training images into the gallery improve oracle IoU on held-out eval images? | An earlier fixed-image-order version showed a spurious effect from a dataset-of-origin confound — see own docstring | **cross-validated**: 5-fold, fresh shuffle/fold | active |
 | `fundamental/resolution_ablation.py` | DINOv3 input resolution (256-1536px) effect on oracle IoU | Checked against `object_detection/resolution_ablation/`'s own fixed-pair sweep at the same resolutions | **cross-validated**: 1-1 and 5-3 regimes, 2-fold CV each, to separate real trend from fold noise | active |
 | `fundamental/feature_transform_oracle_iou.py` | Does reshaping raw patch geometry (centering / ZCA / PCA / LDA / Mahalanobis) before matching improve fg/bg separability? | Galleries held fixed (close+mid+global); only the transform is swept, fit per combo | fixed pair; `pooled_gallery_cv` used for a 5-3 addition too | active |
-| `fundamental/head_layer_ablation.py` | Does a *fitted* classification head (linear probe / linear SVM) beat plain cosine-centroid matching for per-patch fg/bg segmentation, and does the answer depend on which DINOv3-base block(s) feed it? | Hard-decision metrics (IoU/F1/accuracy), not oracle-tuned continuous-score IoU — these heads output discrete labels | **cross-validated**: 5-3 pooled CV only (no fixed-pair mode) | active |
+| `fundamental/head_layer_ablation.py` | Does a *fitted* classification head (linear probe / linear SVM) beat plain cosine-centroid matching — and this directory's own best training-free method, contrastive kNN — for per-patch fg/bg segmentation, and does the answer depend on which DINOv3-base block(s) feed it? | The 3 fitted heads report hard-decision IoU/F1/accuracy; the `knn_fgbg` baseline reports oracle IoU (threshold tuned against each eval image's own GT) — not directly comparable operating points, see script docstring | **cross-validated**: 5-3 pooled CV only (no fixed-pair mode) | active |
 | `fundamental/noisy_fgbg_cleaning.py` | Does discarding ambiguous exemplar patches (spatial filter -> DINO-attention check -> HDBSCAN+kNN consensus) improve oracle IoU on a different query? | The 0.3 mask-overlap threshold used elsewhere creates noisy boundary patches; this asks if removing them helps | fixed pair; `pooled_gallery_cv` used for a 5-3 addition too | active |
 | `fundamental/scale_composition_oracle_iou.py` | Finer scale steps (7, not 3) + multi-scale fg/bg composition via a curated combo table (not the full 2^n power set) | `mid` = exact midpoint of `close`/`global` is itself an arbitrary convention every sibling script inherits | fixed pair, oracle IoU, dataset-wide mean +/- std | active |
 | `fundamental/scale_composition_adaptive_oracle.py` | Per-instance adaptive-scale oracle headroom over the fixed-best-scale baseline; does optimal scale correlate with instance size? | Reuses `scale_composition_oracle_iou.py`'s Parts 1-4 verbatim | post-hoc analysis of that script's per-instance IoUs, no new scoring | active |
@@ -236,17 +236,22 @@ sweep — same fixed-pair paradigm as scripts 1-3, with an optional `pooled_gall
   consensus voting pooled per instance-type group) improves localization on a
   *different* query image.
 - **`head_layer_ablation.py`** — every scoring method elsewhere in this directory is
-  training-free (cosine similarity or contrastive kNN against a gallery). This instead
-  fits three classification heads (nearest fg/bg centroid, a logistic-regression linear
-  probe, a linear SVM) directly on labeled patch tokens (the same `MASK_PATCH_THRESHOLD`
-  fg/bg convention, read as a per-patch binary label) and sweeps which DINOv3-base block(s)
-  feed them: four named blocks spanning the depth (`early`=2, `mid`=5, `late`=9, `last`=11)
-  plus every non-empty concatenation combination of them (15 combos total). 5-3 pooled CV
-  only — abc5's 8 images/part type contribute thousands of labeled patches per fold even
-  though the image count is tiny, but a single fixed split would still risk reporting one
-  lucky/unlucky shuffle as if it were stable. Scored with hard-decision IoU/F1/accuracy
-  (all three heads produce discrete labels, so there's no threshold left to tune against
-  ground truth, unlike this directory's usual oracle-IoU convention).
+  training-free (cosine similarity or contrastive kNN against a gallery). This fits three
+  classification heads (nearest fg/bg centroid, a logistic-regression linear probe, a linear
+  SVM) directly on labeled patch tokens (the same `MASK_PATCH_THRESHOLD` fg/bg convention,
+  read as a per-patch binary label), alongside a fourth `knn_fgbg` entry that's this
+  directory's own best-performing training-free method (contrastive kNN against the pooled
+  fg/bg patch banks, unchanged) included as the baseline the fitted heads should beat — and
+  sweeps which DINOv3-base block(s) feed all four: four named blocks spanning the depth
+  (`early`=2, `mid`=5, `late`=9, `last`=11) plus every non-empty concatenation combination of
+  them (15 combos total). 5-3 pooled CV only — abc5's 8 images/part type contribute thousands
+  of labeled patches per fold even though the image count is tiny, but a single fixed split
+  would still risk reporting one lucky/unlucky shuffle as if it were stable. The 3 fitted
+  heads report hard-decision IoU/F1/accuracy (no threshold to tune, since they emit discrete
+  labels); `knn_fgbg` instead reports oracle IoU (threshold tuned against each eval image's
+  own GT, this directory's usual convention for continuous-score methods) — an upper bound
+  that legitimately sees eval labels the other three never do, so it isn't a directly
+  comparable deployment-time operating point, only a reference ceiling.
 
 The newest set of additions generalizes the fixed 3-point `close`/`mid`/`global` crop
 scale used everywhere above into a finer, N-step sweep and a curated (not exhaustive)

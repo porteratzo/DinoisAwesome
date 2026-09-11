@@ -7,13 +7,25 @@
 # *fitted* classification head beat plain cosine similarity, and does that answer change with
 # which transformer block(s) the patch tokens come from?**
 #
-# Three heads, same frozen DINOv3-base patch tokens as input:
+# Four heads, same frozen DINOv3-base patch tokens as input:
 #
 # | Head | What it is | Fit source |
 # |---|---|---|
 # | `cosine` | nearest fg/bg centroid, L2-normalized train-patch means | centroids, no fitting |
 # | `linear_probe` | `LogisticRegression`, `class_weight="balanced"` (bg outnumbers fg) | fit/fold |
 # | `svm` | `LinearSVC`, linear kernel (tests head architecture, not kernel choice) | supervised |
+# | `knn_fgbg` | contrastive kNN vs. pooled fg/bg patch banks (this repo's best method) | no fit |
+#
+# **`knn_fgbg` is scored differently from the other three, and that's deliberate, not an
+# oversight:** it's a continuous score, not a hard label, so — matching every other
+# training-free method's convention throughout this directory — it's scored as **oracle
+# IoU**: the best patch IoU any single global threshold on that score could achieve against
+# *this eval image's own GT* (`_shared.thresholding.iou_tuned_threshold`/`oracle_iou`). That
+# means `knn_fgbg`'s numbers are an upper bound that legitimately gets to see the eval labels
+# to pick its operating point, while `cosine`/`linear_probe`/`svm` never see eval labels at
+# all (their decision boundary is fixed at fit time). Read `knn_fgbg` as "the best this
+# repo's existing method could ever do here," not as a directly comparable deployment-time
+# operating point next to the other three.
 #
 # Four transformer blocks of DINOv3-base (depth 12), roughly evenly spaced across the
 # beginning/middle/near-end/last of the stack:
@@ -91,8 +103,10 @@ from _shared.pooled_gallery_cv import (  # noqa: E402
     discover_all_instances,
     make_fold_role_splits,
 )
+from _shared.prototype_ops import knn_fgbg_score  # noqa: E402
 from _shared.run_config import apply_overrides, load_run_config, resolve_output_dir  # noqa: E402
 from _shared.stats import bootstrap_ci  # noqa: E402
+from _shared.thresholding import iou_tuned_threshold  # noqa: E402
 
 # %% Parameters
 _REPO_ROOT = Path(__file__).parent.parent.parent
@@ -122,11 +136,26 @@ LAYER_COMBOS: dict[str, tuple[str, ...]] = {
     for combo in combinations(LAYER_NAMES, r)
 }
 
-HEADS: list[str] = ["cosine", "linear_probe", "svm"]
-HEAD_COLOR: dict[str, str] = {"cosine": "#7f8c8d", "linear_probe": "#2ecc71", "svm": "#e67e22"}
+# The 3 fitted heads (blind at eval time) and the "knn_fgbg" training-free baseline (scored
+# as oracle IoU, which legitimately sees eval labels — see module docstring) are swept
+# together but scored differently below; FITTED_HEADS drives the shared fit/predict loop,
+# HEADS (superset, used for summary/plotting) fixes their on-chart order.
+FITTED_HEADS: list[str] = ["cosine", "linear_probe", "svm"]
+BASELINE_HEAD = "knn_fgbg"
+HEADS: list[str] = [*FITTED_HEADS, BASELINE_HEAD]
+HEAD_COLOR: dict[str, str] = {
+    "cosine": "#7f8c8d",
+    "linear_probe": "#3498db",
+    "svm": "#e67e22",
+    "knn_fgbg": "#2ecc71",  # same green feature_transform_oracle_iou.py's own METHOD_COLOR uses
+}
 
 MASK_PATCH_THRESHOLD = 0.3
 DEBIAS = True  # matches every sibling fundamental script's default (see debias_ablation.py)
+
+# knn_fgbg baseline: same defaults every sibling fundamental script uses.
+KNN_FGBG_NUM_NEIGHBOURS = 10
+ORACLE_THRESHOLD_STEPS = 25
 
 N_BOOTSTRAP = 2000
 BOOTSTRAP_SEED = 0
@@ -283,6 +312,25 @@ def classification_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, 
     }
 
 
+def knn_fgbg_oracle_metrics(
+    X_train: np.ndarray, y_train: np.ndarray, X_eval: np.ndarray, y_eval: np.ndarray
+) -> dict[str, float]:
+    """The `knn_fgbg` baseline: continuous per-patch contrastive-kNN score against the pooled
+    train fg/bg patch banks (not centroids — `_shared.prototype_ops.knn_fgbg_score`), scored
+    as oracle IoU (`_shared.thresholding.iou_tuned_threshold` picks the threshold that
+    maximizes IoU against *this eval image's own* `y_eval`, then `classification_metrics`
+    reports every metric — including IoU — from that same threshold's hard decision, so all
+    of them agree with the oracle IoU value). Unlike `HEAD_FUNCS`' fitted heads, this
+    legitimately depends on `y_eval` — see the module docstring for why that's this repo's
+    own established convention for training-free continuous-score methods, not a leak."""
+    fg_bank = torch.from_numpy(X_train[y_train])
+    bg_bank = torch.from_numpy(X_train[~y_train])
+    query = torch.from_numpy(X_eval)
+    score = knn_fgbg_score(query, fg_bank, bg_bank, KNN_FGBG_NUM_NEIGHBOURS)
+    thr = iou_tuned_threshold(score, y_eval, ORACLE_THRESHOLD_STEPS)
+    return classification_metrics(y_eval, score > thr)
+
+
 # %% Part 4 — the cross-validated sweep: for every fold x part_type x group, pool the fold's
 # training images' whole patch grids into (X_train, y_train), fit every (layer_combo, head) on
 # that same pool, and score each held-out eval image separately.
@@ -331,28 +379,31 @@ with tqdm(total=n_sweep_units, desc=_desc) as pbar:
                     )
                     continue
 
+                def _record(head: str, combo_name: str, n: int, metrics: dict[str, float]) -> None:
+                    results.append(
+                        {
+                            "fold": fold_idx,
+                            "part_type": part_type,
+                            "group": group,
+                            "layer_combo": combo_name,
+                            "head": head,
+                            "eval_number": n,
+                            "n_train_images": len(train_ns),
+                            **metrics,
+                        }
+                    )
+
                 for combo_name, combo in LAYER_COMBOS.items():
                     X_train = np.concatenate(
                         [combo_features((part_type, n), combo) for n in train_ns], axis=0
                     )
-                    for head in HEADS:
+                    for head in FITTED_HEADS:
                         try:
                             for n in eval_ns:
                                 y_eval = gt_patch_masks[(part_type, group, n)]
                                 X_eval = combo_features((part_type, n), combo)
                                 y_pred = HEAD_FUNCS[head](X_train, y_train_full, X_eval)
-                                results.append(
-                                    {
-                                        "fold": fold_idx,
-                                        "part_type": part_type,
-                                        "group": group,
-                                        "layer_combo": combo_name,
-                                        "head": head,
-                                        "eval_number": n,
-                                        "n_train_images": len(train_ns),
-                                        **classification_metrics(y_eval, y_pred),
-                                    }
-                                )
+                                _record(head, combo_name, n, classification_metrics(y_eval, y_pred))
                         except Exception:
                             log.exception(
                                 "fold=%d part_type=%s group=%s combo=%s head=%s: FAILED, skipping",
@@ -362,6 +413,21 @@ with tqdm(total=n_sweep_units, desc=_desc) as pbar:
                                 combo_name,
                                 head,
                             )
+                    try:
+                        for n in eval_ns:
+                            y_eval = gt_patch_masks[(part_type, group, n)]
+                            X_eval = combo_features((part_type, n), combo)
+                            metrics = knn_fgbg_oracle_metrics(X_train, y_train_full, X_eval, y_eval)
+                            _record(BASELINE_HEAD, combo_name, n, metrics)
+                    except Exception:
+                        log.exception(
+                            "fold=%d part_type=%s group=%s combo=%s head=%s: FAILED, skipping",
+                            fold_idx,
+                            part_type,
+                            group,
+                            combo_name,
+                            BASELINE_HEAD,
+                        )
             pbar.update(1)
 
 if not results:
@@ -494,6 +560,11 @@ log.info("Wrote %s", OUTPUT_DIR / "per_group_breakdown.csv")
 #   "balanced"` is used for both supervised heads and why **IoU**, not accuracy, is the primary
 #   metric — a trivial always-predict-background classifier would still score well over 90% on
 #   accuracy while scoring 0 on IoU.
+# - **`knn_fgbg` is an oracle upper bound, not a deployment-time number** — its IoU comes from
+#   a threshold tuned against each eval image's own GT (this repo's standard convention for
+#   every training-free continuous-score method), while `cosine`/`linear_probe`/`svm` never
+#   see eval labels at all. A fitted head that *still* beats `knn_fgbg` despite that handicap
+#   is a strong result; one that merely comes close is not yet a clear win.
 # - **`per_group_breakdown.csv`** — check before generalizing the headline ranking to every
 #   instance-type group; the same aggregation-can-hide-a-group-effect caveat every sibling
 #   script's own per-group breakdown exists for.
