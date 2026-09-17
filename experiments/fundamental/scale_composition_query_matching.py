@@ -879,7 +879,7 @@ else:
 # - **`latency.csv`** — GPU-synchronized wall-clock cost (see `_shared/latency.py`) per phase
 #   (reference-crop encode, query-crop encode, scoring) plus encoding-cache hit rate. No sweep
 #   axis exists in this script to plot latency against (every combo/scale pair is encoded and
-#   scored once, not per-config like `resolution_ablation.py`'s sweep) — see the per-phase log
+#   scored once, not per-config like `resolution_iou.py`'s sweep) — see the per-phase log
 #   lines instead.
 # - **`qualitative_worst_best.png`** — actual worst-5/best-5 query crops (crop, raw score map,
 #   GT mask) at one representative reference scale (`QUALITATIVE_REF_SCALE`, the sweep's

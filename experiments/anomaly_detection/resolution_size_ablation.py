@@ -1,8 +1,8 @@
 """Resolution x backbone-size ablation for the DINOv3-backed anomaly methods.
 
 `run_experiments.py` hardcodes `img_size=256, size="small"` for `anomalydino_v3` and every
-`dinov3_proto_*` variant. `object_detection/resolution_ablation/` and
-`fundamental/resolution_ablation.py` both found resolution/backbone-size effects worth
+`dinov3_proto_*` variant. `object_detection/resolution_iou/` and
+`fundamental/resolution_iou.py` both found resolution/backbone-size effects worth
 measuring for detection and localization; this is the anomaly-detection analogue, answering
 whether a bigger/higher-resolution DINOv3 backbone actually buys better AUROC/AUPRO per
 category, or whether 256px/small already saturates it (in which case the extra compute the
@@ -17,7 +17,7 @@ name-based dispatch, which has no resolution/size axis) under a synthetic catego
 from scratch (a different `img_size`/`size` means a genuinely different encoder, not just a
 different scoring pass) -- unlike `layer_ablation.py`, there's no shared encoding to reuse
 across points. `base`/`large` and >512px are opt-in for that reason; each point is wrapped in
-its own CUDA-OOM guard (mirroring `fundamental/resolution_ablation.py`'s own guard) so one
+its own CUDA-OOM guard (mirroring `fundamental/resolution_iou.py`'s own guard) so one
 bad combination doesn't abort a long sweep.
 
 Usage:

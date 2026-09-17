@@ -11,7 +11,7 @@
 # actually been ablated against `debias=False` anywhere in this repo: it was adopted wholesale
 # and never measured.
 #
-# `training_set_size_ablation.py` and `resolution_ablation.py` already found that a fixed
+# `training_set_size_iou.py` and `resolution_iou.py` already found that a fixed
 # `(ref, query)` pair — this repo's original per-script paradigm — can show an effect that a
 # proper 1-1-vs-5-3 cross-validated check makes vanish (a dataset-of-origin confound in the
 # first case). Positional debiasing is exactly the kind of binary on/off switch that same
@@ -22,13 +22,13 @@
 # and 5-train/3-eval regimes, 5-fold CV each, score every fold with `debias=False` and
 # `debias=True` and compare. Fold role assignment (which images train/eval this fold) is drawn
 # **once per endpoint**, shared across both `debias` values — the same reasoning as
-# `resolution_ablation.py`: `debias` must be the only thing varying between the two arms of the
+# `resolution_iou.py`: `debias` must be the only thing varying between the two arms of the
 # comparison, or fold-to-fold noise could masquerade as a debiasing effect.
 #
 # Unlike the resolution/size sweep, `debias` doesn't change the backbone or its input
 # resolution — only which forward-pass output is used — so there's no need to rebuild the
 # encoder or guard against OOM per point; one `DinoEncoder` (fixed `DINO_SIZE`/`IMG_SIZE`, the
-# same defaults `training_set_size_ablation.py` uses) is built once and reused for both
+# same defaults `training_set_size_iou.py` uses) is built once and reused for both
 # `debias` values, and the ground-truth patch masks (which only depend on the patch grid shape,
 # not on `debias`) are computed once rather than duplicated per arm.
 #
@@ -93,7 +93,7 @@ DATASET = "abc5"
 # The axis under test: does DinoEncoder's positional-debiasing projection help oracle IoU?
 DEBIAS_SWEEP: list[bool] = [False, True]
 
-# Same 1-1-vs-5-3 two-endpoint CV check `resolution_ablation.py` runs, both at 5-fold CV.
+# Same 1-1-vs-5-3 two-endpoint CV check `resolution_iou.py` runs, both at 5-fold CV.
 N_FOLDS = 5
 N_TRAIN_11, N_EVAL_11 = 1, 1
 ENDPOINTS: list[tuple[str, int, int, int]] = [
@@ -105,8 +105,8 @@ ENDPOINTS: list[tuple[str, int, int, int]] = [
 # here, so it's held fixed rather than swept (see scale_composition_oracle_iou.py for that).
 GALLERY_SCALES: list[str] = ["global", "mid", "close"]
 
-# Fixed encoder config — same defaults training_set_size_ablation.py uses. Unlike
-# resolution_ablation.py, `debias` doesn't change the backbone or its input size, so a single
+# Fixed encoder config — same defaults training_set_size_iou.py uses. Unlike
+# resolution_iou.py, `debias` doesn't change the backbone or its input size, so a single
 # encoder is built once below rather than rebuilt per sweep point.
 DINO_VERSION = "v3"
 DINO_SIZE = "base"
@@ -697,6 +697,6 @@ log.info("Wrote %s", OUTPUT_DIR / "per_group_breakdown.csv")
 # - Every gallery here still uses the classic `global+mid+close` 3-point crop scale and a fixed
 #   DINOv3-base/768px encoder — this experiment isolates *positional debiasing on vs. off*, not
 #   crop composition or resolution/size (see `scale_composition_oracle_iou.py` and
-#   `resolution_ablation.py` for those axes).
+#   `resolution_iou.py` for those axes).
 
 # %%

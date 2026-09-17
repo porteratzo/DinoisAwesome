@@ -33,7 +33,7 @@ logging.basicConfig(
     format="%(levelname)s %(name)s: %(message)s",
     force=True,
 )
-log = logging.getLogger("resolution_ablation.visualize_results")
+log = logging.getLogger("resolution_iou.visualize_results")
 
 import argparse  # noqa: E402
 import dataclasses  # noqa: E402
@@ -73,7 +73,7 @@ DEFAULT_SIZES = ("small", "base", "large")
 LAYER_IDX_BY_SIZE = {"small": 11, "base": 11, "large": 23}
 
 SCORING_CFG = DEFAULT_SCORING_CONFIG
-OUTPUT_DIR = REPO_ROOT / "outputs" / "object_detection" / "resolution_ablation"
+OUTPUT_DIR = REPO_ROOT / "outputs" / "object_detection" / "resolution_iou"
 RESULTS_ROOT = OUTPUT_DIR / "results"
 FIGURES_ROOT = RESULTS_ROOT / "figures"
 

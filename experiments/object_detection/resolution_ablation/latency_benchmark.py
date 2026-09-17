@@ -29,7 +29,7 @@ logging.basicConfig(
     format="%(levelname)s %(name)s: %(message)s",
     force=True,
 )
-log = logging.getLogger("resolution_ablation.latency_benchmark")
+log = logging.getLogger("resolution_iou.latency_benchmark")
 
 import argparse  # noqa: E402
 import os  # noqa: E402
@@ -61,7 +61,7 @@ MAX_BATCH_SIZE_OVERRIDES: dict[tuple[str, int], int] = {("large", 1536): 8}
 # after resize does, so one fixed synthetic image is reused for every cell.
 NATIVE_SIZE = (1280, 960)
 
-OUTPUT_DIR = REPO_ROOT / "outputs" / "object_detection" / "resolution_ablation"
+OUTPUT_DIR = REPO_ROOT / "outputs" / "object_detection" / "resolution_iou"
 RESULTS_ROOT = OUTPUT_DIR / "results"
 FIGURES_ROOT = RESULTS_ROOT / "figures"
 

@@ -1,15 +1,15 @@
 # %% [markdown]
 # # Fundamental: Resolution + Backbone-Size Ablation — 1-1 vs. 5-3 Cross-Validated
 #
-# `training_set_size_ablation.py` found that a single reshuffle can swing oracle IoU
+# `training_set_size_iou.py` found that a single reshuffle can swing oracle IoU
 # substantially at any gallery size, and that its own first (uncross-validated, fixed image
 # order) sweep showed a spurious training-set-size effect that vanished once a cross-validated
 # **1-1 vs. 5-3** check (1 train/1 eval image vs. 5 train/3 eval images, fresh random shuffle
-# per fold) was run instead. `object_detection/resolution_ablation/` sweeps DINOv3 resolution
+# per fold) was run instead. `object_detection/resolution_iou/` sweeps DINOv3 resolution
 # (256/512/768/1024/1536px) and backbone size (small/base/large), but — like every *other*
-# fundamental-family sibling before `training_set_size_ablation.py` — scores a handful of fixed
+# fundamental-family sibling before `training_set_size_iou.py` — scores a handful of fixed
 # `(exemplar, query)` pairs, never cross-validated. A resolution or size effect measured that
-# way is exactly the shape of confound `training_set_size_ablation.py` found: it could be real,
+# way is exactly the shape of confound `training_set_size_iou.py` found: it could be real,
 # or it could be one noisy draw of which images happened to play which role.
 #
 # This script applies that same 1-1/5-3 two-endpoint CV check — reusing `_shared.
@@ -54,7 +54,7 @@ logging.basicConfig(
     format="%(levelname)s %(name)s: %(message)s",
     force=True,
 )
-log = logging.getLogger("resolution_ablation")
+log = logging.getLogger("resolution_iou")
 
 from collections import defaultdict
 from pathlib import Path
@@ -95,7 +95,7 @@ load_dotenv(_REPO_ROOT / ".env")
 DATA_ROOT = _REPO_ROOT / "data"
 DATASET = "abc5"
 
-# The two-endpoint CV check from training_set_size_ablation.py's own original pre-check,
+# The two-endpoint CV check from training_set_size_iou.py's own original pre-check,
 # crossed with resolution/size instead of held fixed. Both endpoints now use 5-fold CV (the
 # user's explicit choice, more folds than either of that script's original 3-for-1-1/2-for-5-3
 # counts — more datapoints per point, at the cost of more compute). (n_train, n_eval, n_folds).
@@ -106,7 +106,7 @@ ENDPOINTS: list[tuple[str, int, int, int]] = [
     ("5-3", N_TRAIN_53, N_EVAL_53, N_FOLDS),
 ]
 
-# DINOv3 img_size values to sweep — same defaults as object_detection/resolution_ablation/ for
+# DINOv3 img_size values to sweep — same defaults as object_detection/resolution_iou/ for
 # a like-for-like comparison against its uncross-validated numbers.
 RESOLUTION_SWEEP: list[int] = [256, 512, 768, 1024, 1536]
 
@@ -116,12 +116,12 @@ GALLERY_SCALES: list[str] = ["global", "mid", "close"]
 
 DINO_VERSION = "v3"
 # Backbone sizes to sweep, crossed with RESOLUTION_SWEEP — same three sizes
-# object_detection/resolution_ablation/ sweeps, for a like-for-like comparison.
+# object_detection/resolution_iou/ sweeps, for a like-for-like comparison.
 DINO_SIZES: list[str] = ["small", "base", "large"]
 # layer_idx is architecture- (not resolution-) dependent, but *is* size-dependent (small/base
 # have 12 blocks, large has 24) — so unlike the single-size version of this script, it can't be
 # a fixed constant any more. Derived live from each just-built encoder's own block count inside
-# the sweep loop below, matching object_detection/resolution_ablation/run_experiments.py's own
+# the sweep loop below, matching object_detection/resolution_iou/run_experiments.py's own
 # reasoning for doing the same rather than hardcoding a per-size table that could drift from the
 # actual loaded checkpoint.
 DINO_WEIGHTS_DIR: str | None = os.environ.get("DINO_WEIGHTS_DIR")
@@ -174,7 +174,7 @@ SEED = 0
 apply_overrides(globals(), load_run_config(__file__))
 torch.manual_seed(SEED)
 
-OUTPUT_DIR = resolve_output_dir(_REPO_ROOT / "outputs" / "fundamental_abc5" / "resolution_ablation")
+OUTPUT_DIR = resolve_output_dir(_REPO_ROOT / "outputs" / "fundamental_abc5" / "resolution_iou")
 
 log.info(
     "dataset=%s part_types=%s resolutions=%s sizes=%s endpoints=%s  |  DINO%s  |  "
@@ -1197,11 +1197,11 @@ else:
 #   finding: a resolution effect that depends on gallery size isn't a clean resolution effect —
 #   check this independently within each size panel, since a confound could in principle affect
 #   one size and not another. If both endpoints track together within a size, that's much
-#   stronger evidence than either alone — and than `object_detection/resolution_ablation/`'s
+#   stronger evidence than either alone — and than `object_detection/resolution_iou/`'s
 #   fixed-pair numbers, which can't distinguish a real trend from which pair happened to be used.
 # - **`fold_variance.png`/`fold_breakdown.csv`** are the direct check on how much a single
 #   reshuffle can swing the result at *any* (size, resolution) point, including the 1-1
-#   endpoint — which is exactly `object_detection/resolution_ablation/`'s own uncross-validated
+#   endpoint — which is exactly `object_detection/resolution_iou/`'s own uncross-validated
 #   paradigm (one fixed pair per part type). A wide spread here means that script's numbers for
 #   the corresponding size/resolution are one noisy draw, not a stable estimate.
 # - **`per_group_breakdown.csv`** — same aggregation-can-hide-a-group-effect caveat as every

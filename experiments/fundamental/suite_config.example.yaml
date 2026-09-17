@@ -17,7 +17,7 @@
 name: example-run
 
 scripts:
-  - scale_crop_similarity
+  - scale_crop_sensitivity
   - augmentation_sensitivity
   - debias_ablation
 
@@ -26,7 +26,7 @@ defaults:
   img_size: 768
   seed: 0
 
-scale_crop_similarity:
+scale_crop_sensitivity:
   n_scales: 9
 
 debias_ablation:

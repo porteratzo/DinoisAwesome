@@ -147,7 +147,7 @@ HEAD_COLOR: dict[str, str] = {
     "cosine": "#7f8c8d",
     "linear_probe": "#3498db",
     "svm": "#e67e22",
-    "knn_fgbg": "#2ecc71",  # same green feature_transform_oracle_iou.py's own METHOD_COLOR uses
+    "knn_fgbg": "#2ecc71",  # same green feature_transform_iou.py's own METHOD_COLOR uses
 }
 
 MASK_PATCH_THRESHOLD = 0.3
@@ -570,7 +570,7 @@ log.info("Wrote %s", OUTPUT_DIR / "per_group_breakdown.csv")
 #   script's own per-group breakdown exists for.
 # - This script fixes DINOv3-base at 768px and the fg/bg mask-threshold convention every
 #   sibling `fundamental/` script uses — it isolates *head architecture x layer depth*, not
-#   resolution, backbone size, or label threshold (see `resolution_ablation.py` and
-#   `feature_transform_oracle_iou.py` for those axes).
+#   resolution, backbone size, or label threshold (see `resolution_iou.py` and
+#   `feature_transform_iou.py` for those axes).
 
 # %%

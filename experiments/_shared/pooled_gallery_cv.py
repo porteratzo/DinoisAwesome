@@ -3,7 +3,7 @@
 Generalizes `_shared/dataset_pairs.py`'s single ref/query pair (a 1-train/1-eval split) into
 a "5 training images pooled into one gallery, scored against 3 held-out eval images, 5-fold
 cross-validated" companion mode any script can add without touching its own existing 1-1
-pipeline. See `training_set_size_ablation.py` for where this pattern — and its methodological
+pipeline. See `training_set_size_iou.py` for where this pattern — and its methodological
 pitfall — was first worked out: a *fixed* image order (e.g. always images 1-5 for training,
 6-8 for eval) is a dataset-of-origin confound, since abc5's image 1 is abc3's original
 capture and images 3-8 are abc4's (see `scripts/build_abc5_dataset.py`). Every fold here uses
@@ -42,16 +42,16 @@ N_FOLDS_53: int = 5
 # "more data past this point doesn't add information" ceiling, so the cap is split by which
 # cost is actually being bounded rather than one size for everything:
 #
-#   - MAX_BANK_SIZE_TRANSFORM_53 (feature_transform_oracle_iou.py): feeds ZCA/PCA/LDA/
+#   - MAX_BANK_SIZE_TRANSFORM_53 (feature_transform_iou.py): feeds ZCA/PCA/LDA/
 #     Mahalanobis eigendecomposition, which has a real mathematical ceiling at DINOv3-large's
-#     C=1024 feature dim — feature_transform_oracle_iou.py's own docstring notes per-combo
+#     C=1024 feature dim — feature_transform_iou.py's own docstring notes per-combo
 #     pooled counts of a few hundred to ~1500 patches are already comparable to or below that
 #     rank, so more patches past ~4000 mostly cost compute (O(N*C^2) covariance) rather than
 #     improve the fit.
 #   - MAX_BANK_SIZE_DENOISE_53 (noisy_fgbg_cleaning.py): feeds Step 3's HDBSCAN + kNN
 #     consensus, O(N^2) in pool size — a similar diminishing-returns argument (density
 #     estimates saturate), weaker than the rank ceiling above but still real.
-#   - MAX_BANK_SIZE_KNN_53 (augmented_prototype_oracle_iou_knn_fgbg.py, every
+#   - MAX_BANK_SIZE_KNN_53 (augmentation_iou.py, every
 #     scale_composition_*.py 5-3 addition): feeds plain `knn_fgbg` scoring only — a
 #     non-parametric retrieval method with no ceiling analogous to the above; more gallery
 #     patches can genuinely change (usually improve) which top-k matches a query finds, so

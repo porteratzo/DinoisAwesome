@@ -952,7 +952,7 @@ log.info("Wrote %s", OUTPUT_DIR / "comparison_1_1_vs_5_3.csv")
 # This script has no single clean sweep axis to plot latency against (Part 5's scoring loop
 # scores every (fg_scale, bg_composition) pair in one untimed-per-point pass, and restructuring
 # that loop just to isolate per-point timing is out of scope for a purely additive change) — so
-# unlike resolution_ablation.py/training_set_size_ablation.py's latency.png, this just logs and
+# unlike resolution_iou.py/training_set_size_iou.py's latency.png, this just logs and
 # tabulates per-phase totals.
 cache_hits, cache_misses = encoder.total_hits, encoder.total_misses
 cache_total = cache_hits + cache_misses

@@ -59,7 +59,7 @@ DEFAULT_ENCODING_CACHE_DIR = REPO_ROOT / "data" / "encoding_cache"
 ANOMALY_DETECTION_CACHE_ROOT = REPO_ROOT / "outputs" / "anomaly_detection" / "cache"
 # Every multiscale_ablation* output tree (current + resolution/model sweep variants —
 # see multiscale_ablation/run_experiments.py's --resolution/--model flags and
-# resolution_ablation/'s own separate output dirs) shares this same cache layout.
+# resolution_iou/'s own separate output dirs) shares this same cache layout.
 OBJECT_DETECTION_CACHE_ROOTS = [
     p / "cache"
     for p in (REPO_ROOT / "outputs" / "object_detection").glob("multiscale_ablation*")

@@ -272,7 +272,7 @@ for (unit, group), pixel_mask in group_query_masks.items():
 # its own GT that the query being scored never sees. This script has no train/eval split (every
 # combo is one fixed ref/query pair) — the natural reference is the exemplar/ref image itself:
 # its own `ref_mask` is the same GT that built the gallery, so a threshold can be tuned on it and
-# transferred to the query, mirroring resolution_ablation.py's `pick_ref_number`/`ref_raws`
+# transferred to the query, mirroring resolution_iou.py's `pick_ref_number`/`ref_raws`
 # pattern for its own train/eval split. Whole ref images are encoded here (once per unit,
 # alongside the query encodings above) so Part 5 below can score each gallery against its own
 # ref image the same way it scores the query.
@@ -456,7 +456,7 @@ log.info(
 # encode, scoring) traded off against wall-clock cost, which no figure in this script reported
 # before now. `torch.cuda.synchronize()` is called around every timed block (see
 # `_shared/latency.py`) so GPU-async dispatch doesn't understate elapsed time. Unlike
-# resolution_ablation.py/training_set_size_ablation.py, this script has no per-point sweep loop
+# resolution_iou.py/training_set_size_iou.py, this script has no per-point sweep loop
 # that re-runs each phase at multiple configs (every combo/scale is encoded and scored once, in
 # one pass) — so there's no sweep axis to plot latency against, and no accuracy_vs_latency.png;
 # a per-phase log + latency.csv is enough.
@@ -876,7 +876,7 @@ else:
 # - **`latency.csv`** — GPU-synchronized wall-clock cost (see `_shared/latency.py`) per phase
 #   (query/ref whole-image encode, gallery-crop encode, scoring) plus encoding-cache hit rate.
 #   No sweep axis exists in this script to plot latency against (every combo/scale is encoded
-#   and scored once, not per-config like `resolution_ablation.py`'s sweep) — see the per-phase
+#   and scored once, not per-config like `resolution_iou.py`'s sweep) — see the per-phase
 #   log lines instead.
 # - **`size_correlation.csv`/`.png`** — a second, separate object-size check from Part 7's own
 #   size-vs-optimal-t correlation: does the IoU actually *achieved* at a given scale (not which

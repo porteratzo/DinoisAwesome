@@ -41,7 +41,7 @@ logging.basicConfig(
     format="%(levelname)s %(name)s: %(message)s",
     force=True,
 )
-log = logging.getLogger("resolution_ablation.run_experiments")
+log = logging.getLogger("resolution_iou.run_experiments")
 
 import argparse
 import dataclasses

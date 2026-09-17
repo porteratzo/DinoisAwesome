@@ -2,10 +2,10 @@
 # # Fundamental: Augmentation — How Robust Are DINOv3 Patch Embeddings to Common
 # # Image Perturbations?
 #
-# Second experiment in `experiments/fundamental/` (see `scale_crop_similarity.py` for
+# Second experiment in `experiments/fundamental/` (see `scale_crop_sensitivity.py` for
 # the first). That one asked how *crop tightness* moves an object's patch embedding;
 # this one holds the crop fixed and asks how much each of several common perturbations
-# moves it instead — the ones `scale_crop_similarity.py`'s closing markdown flagged as
+# moves it instead — the ones `scale_crop_sensitivity.py`'s closing markdown flagged as
 # follow-ups (rotation, lighting) plus a few more that matter for real factory-floor
 # imagery (abc3 is uncontrolled shop-floor lighting, not a studio).
 #
@@ -29,7 +29,7 @@
 #      six families on one axis (x-axis normalized to a 0..1 "severity fraction" per
 #      family so they're comparable despite different native units).
 #   6. Visualize the augmented crop grid for one representative instance (same
-#      image/class as `scale_crop_similarity.py`, for comparability) alongside the
+#      image/class as `scale_crop_sensitivity.py`, for comparability) alongside the
 #      aggregated drift plot.
 #
 # Not a per-dataset-update rerun: this measures how robust the backbone's own
@@ -102,7 +102,7 @@ IMAGE_STEMS: list[tuple[str, str]] = sorted(
 )
 
 # Reference instance used only for the augmented-crop-grid visualization (a full grid
-# across all instances would be unreadable) — same object as scale_crop_similarity.py,
+# across all instances would be unreadable) — same object as scale_crop_sensitivity.py,
 # for comparability. Drift curves aggregate every instance, not just this one.
 REFERENCE_DATASET = "abc5"
 REFERENCE_IMAGE_STEM = "LHa_1"
@@ -796,7 +796,7 @@ else:
 #   augmentation's typical effect" from "this one draw's effect."
 # - **Occlusion** — progressively mask out a growing fraction of the instance's own
 #   patches (independent of any pixel-level augmentation) — flagged in
-#   `scale_crop_similarity.py` too, and complements this file's perturbation set.
+#   `scale_crop_sensitivity.py` too, and complements this file's perturbation set.
 
 
 # %%

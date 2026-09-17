@@ -17,7 +17,7 @@ Usage:
     python scripts/run_fundamental_suite.py \
         --config experiments/fundamental/suite_config.example.yaml --name layer-sweep-v2
     python scripts/run_fundamental_suite.py \
-        --config my_cfg.yaml --scripts scale_crop_similarity debias_ablation
+        --config my_cfg.yaml --scripts scale_crop_sensitivity debias_ablation
     python scripts/run_fundamental_suite.py --config my_cfg.yaml --name smoke-test --dry-run
     python scripts/run_fundamental_suite.py --list
 """
@@ -52,18 +52,18 @@ RUNS_ROOT = REPO_ROOT / "outputs" / "fundamental_runs"
 # experiment itself, so it's excluded here — same convention as `_shared/`.
 #
 # `drift_vs_iou_correlation.py` is also excluded by default: it's pure post-hoc analysis
-# that reads augmentation_sensitivity.py's and augmented_prototype_oracle_iou_knn_fgbg.py's
+# that reads augmentation_sensitivity.py's and augmentation_iou.py's
 # *own default* CSV output paths (raises FileNotFoundError if they're missing), not this
 # run's redirected RUN_DIR outputs — including it in a fresh isolated run would fail unless
 # you also override its `drift_csv`/`iou_csv` in the cfg to point at this run's own dir.
 SUITE_SCRIPTS: list[str] = [
-    "scale_crop_similarity",
+    "scale_crop_sensitivity",
     "augmentation_sensitivity",
-    "augmented_prototype_oracle_iou_knn_fgbg",
-    "training_set_size_ablation",
-    "resolution_ablation",
+    "augmentation_iou",
+    "training_set_size_iou",
+    "resolution_iou",
     "debias_ablation",
-    "feature_transform_oracle_iou",
+    "feature_transform_iou",
     "noisy_fgbg_cleaning",
     "scale_composition_oracle_iou",
     "scale_composition_adaptive_oracle",

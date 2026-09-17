@@ -1,12 +1,12 @@
 # %% [markdown]
 # # Fundamental: Does Embedding Drift Predict Downstream IoU Loss?
 #
-# `scale_crop_similarity.py` -> `augmentation_sensitivity.py` -> `augmented_prototype_oracle_iou_
+# `scale_crop_sensitivity.py` -> `augmentation_sensitivity.py` -> `augmented_prototype_oracle_iou_
 # knn_fgbg.py` is explicitly framed (see `experiments/README.md`) as a three-script progression:
 # does perturbing an exemplar move its embedding (`augmentation_sensitivity.py`'s
 # `drift_summary.csv`, one row per augmentation family x severity, cosine similarity to the
 # unperturbed crop), and — separately — does perturbing the exemplar *before* pooling it into a
-# gallery change downstream localization (`augmented_prototype_oracle_iou_knn_fgbg.py`'s
+# gallery change downstream localization (`augmentation_iou.py`'s
 # `composed_endpoint.csv`, one row per method x scale x family, oracle IoU delta vs. an
 # unaugmented baseline)? Until now, nothing actually joins those two CSVs and checks whether the
 # first number *predicts* the second — the reader has been left to eyeball two PNGs in different
@@ -50,7 +50,7 @@ from _shared.run_config import apply_overrides, load_run_config, resolve_output_
 _REPO_ROOT = Path(__file__).parent.parent.parent
 load_dotenv(_REPO_ROOT / ".env")
 
-# Read from wherever augmentation_sensitivity.py/augmented_prototype_oracle_iou_knn_fgbg.py wrote
+# Read from wherever augmentation_sensitivity.py/augmentation_iou.py wrote
 # their CSVs — their own *default* location unless overridden. When chaining this into one
 # suite run alongside those two, point these at that run's own RUN_DIR via cfg overrides
 # (`drift_csv`/`iou_csv`), otherwise this reads whatever's already at the global default path
@@ -62,7 +62,7 @@ IOU_CSV = (
     _REPO_ROOT
     / "outputs"
     / "fundamental_abc5"
-    / "augmented_prototype_oracle_iou_knn_fgbg"
+    / "augmentation_iou"
     / "composed_endpoint.csv"
 )
 
@@ -74,7 +74,7 @@ OUTPUT_DIR = resolve_output_dir(
 
 for csv_path, script_name in (
     (DRIFT_CSV, "augmentation_sensitivity.py"),
-    (IOU_CSV, "augmented_prototype_oracle_iou_knn_fgbg.py"),
+    (IOU_CSV, "augmentation_iou.py"),
 ):
     if not csv_path.exists():
         raise FileNotFoundError(
@@ -192,7 +192,7 @@ log.info("Wrote %s", OUTPUT_DIR / "drift_vs_iou_scatter.png")
 # - **`drift_vs_iou_correlation.csv`/`.png`** answer the question the three-script README
 #   progression poses but never itself computes: within each (method, scale) slice, does a
 #   family's worst-case embedding drift (`augmentation_sensitivity.py`) predict its IoU cost
-#   under augmented-prototype matching (`augmented_prototype_oracle_iou_knn_fgbg.py`)? A strong
+#   under augmented-prototype matching (`augmentation_iou.py`)? A strong
 #   negative `pearson_r`/`spearman_r` (more drift -> more negative `mean_delta_vs_baseline`)
 #   would validate embedding drift as a cheap proxy for localization risk, worth checking before
 #   running the full oracle-IoU pipeline on a new augmentation family. A weak or inconsistent

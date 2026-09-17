@@ -6,7 +6,7 @@
 # `mid`, `global` (`_shared.mask_geometry.scale_crop_box`), where `mid` is literally the t=0.5
 # midpoint between `close` (t=1) and `global` (t=0). This experiment generalizes that fixed
 # 3-point sweep into `N_SCALE_STEPS + 1` evenly-spaced crop scales (t = 0, 1/n, 2/n, ..., 1 —
-# same linear interpolation `scale_crop_similarity.py` already uses for its single-instance case
+# same linear interpolation `scale_crop_sensitivity.py` already uses for its single-instance case
 # study, applied here across the whole abc5 dataset for real fg/bg IoU) and asks two questions:
 #
 #   1. **Per-scale**: how does oracle IoU (best patch-mask IoU any single threshold on the raw
@@ -33,8 +33,8 @@
 #     — keep BOTH `global` and `close` in every entry (matches the classic combo's own logic of
 #     "always cover both extremes") and grow the middle from one side or the other.
 #
-# Scored exactly like `augmented_prototype_oracle_iou_knn_fgbg.py` /
-# `feature_transform_oracle_iou.py`: `single_proto` (masked-mean cosine similarity) and
+# Scored exactly like `augmentation_iou.py` /
+# `feature_transform_iou.py`: `single_proto` (masked-mean cosine similarity) and
 # `fg-bg-knn` (per-patch contrastive kNN, `_shared.prototype_ops.knn_fgbg_score`), oracle IoU
 # per (part_type, group, instance) combo, pooled into a dataset-wide mean +/- std.
 
@@ -1141,7 +1141,7 @@ log.info("Wrote %s", OUTPUT_DIR / "comparison_1_1_vs_5_3.csv")
 # This script has no single clean sweep axis to plot latency against (Part 5's scoring loop
 # scores every composition combo in one untimed-per-point pass, and restructuring that loop just
 # to isolate per-point timing is out of scope for a purely additive change) — so unlike
-# resolution_ablation.py/training_set_size_ablation.py's latency.png, this just logs and
+# resolution_iou.py/training_set_size_iou.py's latency.png, this just logs and
 # tabulates per-phase totals (matches scale_composition_bg_ablation.py's own choice for the same
 # reason).
 cache_hits, cache_misses = encoder.total_hits, encoder.total_misses

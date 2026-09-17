@@ -1,7 +1,7 @@
 """Feature-space transform fit/apply helpers: mean-centering, ZCA whitening, PCA
 truncation, LDA projection, and a Euclidean/Mahalanobis-contrastive kNN score — the
 linear-algebra primitives behind
-``experiments/fundamental/feature_transform_oracle_iou.py``.
+``experiments/fundamental/feature_transform_iou.py``.
 
 Every ``fit_*`` function takes RAW (non-L2-normalised) patch tokens and only needs to run
 once per (combo, source); the corresponding apply/transform step is cheap and meant to be

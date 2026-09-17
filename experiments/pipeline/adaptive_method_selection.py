@@ -196,7 +196,7 @@ MAX_BG_BANK_SIZE = 20_000
 
 # Step "2.5" — feature-space transform (see select_transform). "none" vs. bg_zca whitening
 # fit from the train pool's own raw bg tokens, swept over this epsilon grid — matches
-# feature_transform_oracle_iou.py's own EPS_SWEEP, the recipe validated there (bg_zca +
+# feature_transform_iou.py's own EPS_SWEEP, the recipe validated there (bg_zca +
 # knn_fgbg, +0.047 oracle IoU, eps~=1e-3) as the single biggest lever across the whole
 # fundamental/ series.
 FEATURE_TRANSFORM_EPS_SWEEP: list[float] = [1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
@@ -642,7 +642,7 @@ Transform = tuple[torch.Tensor, torch.Tensor]  # (mu, zca whitening matrix)
 
 def apply_transform_to_tokens(tokens: torch.Tensor, transform: Transform) -> torch.Tensor:
     """Applies a fitted (mu, w) affine transform then re-L2-normalises — matches every
-    non-lda/mahalanobis pipeline in feature_transform_oracle_iou.py (fit on raw tokens,
+    non-lda/mahalanobis pipeline in feature_transform_iou.py (fit on raw tokens,
     "+ L2 Norm" as the final step, never before centering/whitening)."""
     mu, w = transform
     return F.normalize(apply_affine(tokens, mu, w), p=2, dim=-1)
@@ -654,7 +654,7 @@ def fit_bg_zca(
     """Fits ZCA whitening from the train pool's own raw bg tokens, pooled across
     *bg_scales* the same way knn's bg gallery is (_bg_gallery_capped, capped at
     MAX_BG_BANK_SIZE, use_raw=True) — the real-train-set analogue of
-    feature_transform_oracle_iou.py's per-combo ``bg_zca`` fit (``eigh(cov(bg))``)."""
+    feature_transform_iou.py's per-combo ``bg_zca`` fit (``eigh(cov(bg))``)."""
     bg_raw = _bg_gallery_capped(scale_protos, bg_scales, MAX_BG_BANK_SIZE, SEED, use_raw=True)
     mu = fit_mean(bg_raw)
     eigvecs, eigvals = fit_cov_eigh(bg_raw, mu)
@@ -1265,7 +1265,7 @@ def select_transform(
     """Searched with scale/method already locked (steps 1-2), against the same single-stage
     val signal those two steps already use. Candidates: no transform vs. bg_zca at each
     FEATURE_TRANSFORM_EPS_SWEEP value, fit from the train pool's own raw bg tokens
-    (fit_bg_zca) — the raw-token, "+ L2 Norm"-last recipe feature_transform_oracle_iou.py
+    (fit_bg_zca) — the raw-token, "+ L2 Norm"-last recipe feature_transform_iou.py
     validated as the single biggest lever across the whole fundamental/ series.
 
     Does not compose with two-stage's blob rescoring: engine.py's find_roi_blobs/

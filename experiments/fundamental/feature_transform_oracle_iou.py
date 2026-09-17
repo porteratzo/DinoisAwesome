@@ -3,7 +3,7 @@
 # # Geometry Improve FG/BG Separability Under kNN/Cosine Matching?
 #
 # Every other fundamental experiment in this directory changes *what* goes into the fg/bg
-# galleries (augmentation severity in `augmented_prototype_oracle_iou_knn_fgbg.py`,
+# galleries (augmentation severity in `augmentation_iou.py`,
 # gallery-cleaning stages in `noisy_fgbg_cleaning.py`). This one holds the galleries fixed —
 # the same close+mid+global multiscale pooling those files already use — and instead sweeps
 # *how the raw embedding geometry itself is reshaped* before matching: mean-centering,
@@ -61,7 +61,7 @@ logging.basicConfig(
     format="%(levelname)s %(name)s: %(message)s",
     force=True,
 )
-log = logging.getLogger("feature_transform_oracle_iou")
+log = logging.getLogger("feature_transform_iou")
 
 from collections import defaultdict
 from pathlib import Path
@@ -216,7 +216,7 @@ apply_overrides(globals(), load_run_config(__file__))
 torch.manual_seed(SEED)
 
 OUTPUT_DIR = resolve_output_dir(
-    _REPO_ROOT / "outputs" / "fundamental_abc5" / "feature_transform_oracle_iou"
+    _REPO_ROOT / "outputs" / "fundamental_abc5" / "feature_transform_iou"
 )
 
 log.info(
@@ -247,7 +247,7 @@ def split_fg_bg_patches_raw(
     bg_exclude_mask_px: np.ndarray | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Split a crop's RAW (non-L2-normalised) patch tokens into (fg, bg) — identical in
-    spirit to augmented_prototype_oracle_iou_knn_fgbg.py's local `split_fg_bg_patches`,
+    spirit to augmentation_iou.py's local `split_fg_bg_patches`,
     except it skips that helper's opening `F.normalize`: every transform pipeline below
     needs raw embedding geometry as its input and L2-normalizes (or deliberately doesn't,
     see the module docstring) as its own final step, never before centering/whitening."""
@@ -598,7 +598,7 @@ for (unit, group), pixel_mask in group_ref_masks.items():
 # %% Part 4 — encode every combo's close/mid crops (RAW), pool per-combo fg/bg galleries
 # bg = close+mid bg patches + this combo's own "global" bg (Part 3.6's full ref-image tokens,
 # minus the whole instance-type group's ref mask) — the same multiscale pooling
-# augmented_prototype_oracle_iou_knn_fgbg.py's Part 3.5 builds, kept raw here instead of
+# augmentation_iou.py's Part 3.5 builds, kept raw here instead of
 # L2-normalized, and always "all" scales regardless of which fg SCALE_COMBOS entry is being
 # scored (see SCALE_COMBOS' docstring above). fg is built per (combo, scale) below and
 # assembled into whichever scale combo a given sweep cell asks for, further down in this part.
@@ -874,8 +874,8 @@ def pipeline_method_summary(
             # Bootstrap CI (Addition 4): percentile bootstrap CI on the mean, alongside the
             # plain std this script already reported — std alone doesn't say whether two
             # pipelines' means are actually distinguishable or both plausible draws from the
-            # same distribution; see _shared/stats.py, mirroring resolution_ablation.py Part 4
-            # / training_set_size_ablation.py Part 6's own identical addition. mean/std/n
+            # same distribution; see _shared/stats.py, mirroring resolution_iou.py Part 4
+            # / training_set_size_iou.py Part 6's own identical addition. mean/std/n
             # themselves are untouched, still from the unchanged mean_std_iou() above.
             _, ci_lo, ci_hi = bootstrap_ci(np.asarray(vals), n_boot=N_BOOTSTRAP, seed=BOOTSTRAP_SEED)
             # Achievable IoU (Addition 1): mean/std across the same (pipeline, param, method)
@@ -1067,7 +1067,7 @@ log.info(
 # GT's own patch-mask coverage, already joined onto every row of `oracle_iou_per_combo.csv`
 # above) lets us check per (scale_combo, pipeline, method), mirroring the pearson/spearman
 # correlation pattern `scale_composition_adaptive_oracle.py` already established for instance
-# size vs. optimal scale (and resolution_ablation.py/training_set_size_ablation.py's own
+# size vs. optimal scale (and resolution_iou.py/training_set_size_iou.py's own
 # copies of it).
 size_correlation_rows = []
 for scale_combo_name in SCALE_COMBOS:
@@ -1288,7 +1288,7 @@ for scale_combo_name, lookup in iou_lookup_by_combo.items():
 # noise? An unpaired bootstrap comparison (see `_shared/stats.py`) of the lowest-vs-highest k's
 # per-combo oracle_iou arrays, per (scale_combo, method) — referenced in this file's own
 # `N_BOOTSTRAP`/`BOOTSTRAP_SEED` parameter comment above ("the PCA_K_SWEEP lowest-vs-highest-k
-# significance check"), mirroring resolution_ablation.py Part 9 / training_set_size_ablation.py
+# significance check"), mirroring resolution_iou.py Part 9 / training_set_size_iou.py
 # Part 6d.
 pca_significance_rows = []
 for scale_combo_name, lookup in iou_lookup_by_combo.items():
@@ -1469,7 +1469,7 @@ else:
 # image? Reuses `score_combo`/`split_fg_bg_patches_raw`/`best_param`/`mean_std_iou` unchanged
 # — only discovery, pooling, and fold/role assignment are new (see
 # `_shared/pooled_gallery_cv.py` for why folds use a fresh random shuffle rather than a fixed
-# image order, which was a real dataset-of-origin confound in `training_set_size_ablation.py`'s
+# image order, which was a real dataset-of-origin confound in `training_set_size_iou.py`'s
 # first version). The existing 1-1 combos/results above are untouched by this section.
 PART_TYPES_53 = PART_TYPES
 discovery_53 = discover_all_instances(DATA_ROOT, "abc5", PART_TYPES_53)

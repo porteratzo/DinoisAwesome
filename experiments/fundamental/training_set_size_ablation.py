@@ -43,7 +43,7 @@ logging.basicConfig(
     format="%(levelname)s %(name)s: %(message)s",
     force=True,
 )
-log = logging.getLogger("training_set_size_ablation")
+log = logging.getLogger("training_set_size_iou")
 
 from collections import defaultdict
 from pathlib import Path
@@ -131,7 +131,7 @@ torch.manual_seed(SEED)
 fold_rng = np.random.default_rng()
 
 OUTPUT_DIR = resolve_output_dir(
-    _REPO_ROOT / "outputs" / "fundamental_abc5" / "training_set_size_ablation"
+    _REPO_ROOT / "outputs" / "fundamental_abc5" / "training_set_size_iou"
 )
 
 log.info(

@@ -41,7 +41,7 @@ logging.basicConfig(
     format="%(levelname)s %(name)s: %(message)s",
     force=True,
 )
-log = logging.getLogger("scale_crop_similarity")
+log = logging.getLogger("scale_crop_sensitivity")
 
 from pathlib import Path
 
@@ -111,7 +111,7 @@ SEED = 0
 apply_overrides(globals(), load_run_config(__file__))
 torch.manual_seed(SEED)
 
-OUTPUT_DIR = resolve_output_dir(_REPO_ROOT / "outputs" / "fundamental" / "scale_crop_similarity")
+OUTPUT_DIR = resolve_output_dir(_REPO_ROOT / "outputs" / "fundamental" / "scale_crop_sensitivity")
 
 log.info(
     "image=%s class=%r  |  DINO%s-%s img_size=%d layer=%d  |  n_scales=%d",

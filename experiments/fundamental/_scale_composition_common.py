@@ -36,7 +36,7 @@ def scale_step_boxes(
     pixel_mask: np.ndarray, t_values: np.ndarray, padding_frac: float
 ) -> list[tuple[int, int, int, int]]:
     """PIL-style crop boxes linearly interpolated from the whole image (t=0) to `close`'s own
-    tight, padded bbox (t=1) — same interpolation scale_crop_similarity.py's own
+    tight, padded bbox (t=1) — same interpolation scale_crop_sensitivity.py's own
     `scale_crop_boxes` uses, generalizing `scale_crop_box`'s fixed global/mid/close named
     points to arbitrary t. Boxes shrink monotonically as t grows, so `close` (t=1, the
     smallest) meeting MIN_CROP_SIZE guarantees every other t does too."""

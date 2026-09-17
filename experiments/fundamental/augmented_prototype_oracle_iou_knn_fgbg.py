@@ -97,7 +97,7 @@ logging.basicConfig(
     format="%(levelname)s %(name)s: %(message)s",
     force=True,
 )
-log = logging.getLogger("augmented_prototype_oracle_iou_knn_fgbg")
+log = logging.getLogger("augmentation_iou")
 
 from collections import defaultdict
 from functools import partial
@@ -208,7 +208,7 @@ apply_overrides(globals(), load_run_config(__file__))
 torch.manual_seed(SEED)
 
 OUTPUT_DIR = resolve_output_dir(
-    _REPO_ROOT / "outputs" / "fundamental_abc5" / "augmented_prototype_oracle_iou_knn_fgbg"
+    _REPO_ROOT / "outputs" / "fundamental_abc5" / "augmentation_iou"
 )
 
 log.info(
@@ -1956,7 +1956,7 @@ log.info("Wrote %s", OUTPUT_DIR / "comparison_1_1_vs_5_3.csv")
 # GT's own patch-mask coverage, computed once in Part 3) lets us check per (method, scale,
 # family), mirroring the pearson/spearman correlation pattern
 # `scale_composition_adaptive_oracle.py` already established for instance size vs. optimal
-# scale (and resolution_ablation.py/training_set_size_ablation.py's own copies of it). Pools
+# scale (and resolution_iou.py/training_set_size_iou.py's own copies of it). Pools
 # across every severity within a (method, scale, family) cell — the question here is whether
 # size predicts IoU at all, not whether that holds at one fixed severity.
 size_corr_df = pd.DataFrame(
@@ -2043,7 +2043,7 @@ log.info(
 # An unpaired bootstrap comparison (see `_shared/stats.py`) of each (method, scale, family)
 # cell's per-combo best-over-severities oracle_iou array against that cell's per-combo baseline
 # (severity-0) oracle_iou array — the significance check `best_over_baseline.csv` leaves the
-# reader to eyeball, mirroring resolution_ablation.py Part 9 / training_set_size_ablation.py
+# reader to eyeball, mirroring resolution_iou.py Part 9 / training_set_size_iou.py
 # Part 6d.
 significance_rows = []
 for method in METHOD_LABELS:
