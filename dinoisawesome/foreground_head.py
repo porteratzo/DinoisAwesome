@@ -144,7 +144,9 @@ class ForegroundHead:
         orig_w, orig_h = pil_img.size
 
         out = self.encoder([pil_img], layers=[self.block_idx], debias=debias)
-        patches = out.patches[0, 0]  # (H, W, D)
+        # float32 regardless of amp (bfloat16) or EncoderWithCache (float16): SVD,
+        # .numpy() and matmuls against float32 references all need it.
+        patches = out.patches[0, 0].float()  # (H, W, D)
         H, W, D = patches.shape
 
         flat = F.normalize(patches.reshape(H * W, D), p=2, dim=1)  # (N, D)

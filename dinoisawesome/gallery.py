@@ -624,6 +624,9 @@ def _cosine_topk(embs: np.ndarray, query: np.ndarray, k: int) -> tuple[np.ndarra
         of row indices into *embs* and *similarities* is a float32 array of the
         corresponding cosine similarity scores, both sorted descending.
     """
+    # float32 before the norm: a float16 sum of squares overflows to inf once a
+    # vector's norm exceeds ~256, which DINO's high-norm artifact tokens reach.
+    embs = embs.astype(np.float32, copy=False)
     q = query.ravel().astype(np.float32)
     sims = (embs @ q) / (np.linalg.norm(embs, axis=1) * np.linalg.norm(q) + 1e-8)
     k = min(k, len(embs))
