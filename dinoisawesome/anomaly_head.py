@@ -206,8 +206,10 @@ class AnomalyHead:
                 df
             )  # (N', D) float32 — N' <= len(df) when masking
         else:
-            embs = self.gallery.load_embeddings(df, self.block_idx)  # (N, D) float32
-        bank = F.normalize(torch.from_numpy(embs), p=2, dim=1)
+            embs = self.gallery.load_embeddings(df, self.block_idx)  # (N, D) float16
+        # Gallery embeddings are stored as float16; score in float32 so the bank
+        # matches float32 query patches (torch matmul does not type-promote).
+        bank = F.normalize(torch.from_numpy(embs).float(), p=2, dim=1)
 
         if self._coreset_ratio is not None:
             n_keep = max(1, int(len(bank) * self._coreset_ratio))
@@ -233,9 +235,11 @@ class AnomalyHead:
         """
         chunks: list[np.ndarray] = []
         for img_id, group in df.groupby("image_id"):
-            grid = self.gallery.load_image_grid(img_id, self.block_idx)  # (H, W, D)
+            grid = np.asarray(
+                self.gallery.load_image_grid(img_id, self.block_idx), dtype=np.float32
+            )  # (H, W, D)
             if self.smoothing:
-                grid = _box_smooth(torch.from_numpy(np.array(grid))).numpy()
+                grid = _box_smooth(torch.from_numpy(grid)).numpy()
             rows = group["row"].values.astype(int)
             cols = group["col"].values.astype(int)
             feats = grid[rows, cols]  # (n_i, D)
@@ -282,7 +286,9 @@ class AnomalyHead:
 
         # layers=[...] keeps multi-layer form → patches: (B, 1, H, W, D)
         out = self.encoder([pil_img], layers=[self.block_idx], debias=debias)
-        patches = out.patches[0, 0]  # (H, W, D)
+        # float32 regardless of amp (bfloat16) or EncoderWithCache (float16): SVD,
+        # .numpy() and matmuls against float32 references all need it.
+        patches = out.patches[0, 0].float()  # (H, W, D)
         if self.smoothing:
             patches = _box_smooth(patches)
         H, W, D = patches.shape

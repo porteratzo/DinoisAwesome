@@ -134,7 +134,9 @@ class PrototypeAnomalyHead:
         # layers=[...] keeps multi-layer form → patches: (B, 1, H, W, D), cls: (B, 1, D)
         out = self.encoder([pil_img], layers=[self.block_idx])
         query_cls = out.cls[0, 0].cpu().float().numpy()
-        patches = out.patches[0, 0]  # (H, W, D)
+        # float32 regardless of amp (bfloat16) or EncoderWithCache (float16): SVD,
+        # .numpy() and matmuls against float32 references all need it.
+        patches = out.patches[0, 0].float()  # (H, W, D)
         H, W, D = patches.shape
 
         top_images = self.gallery.retrieve_images(
