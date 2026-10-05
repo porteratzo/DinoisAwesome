@@ -27,6 +27,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Minimal install for consumers that only need DinoEncoder (e.g. tep_ai) — no
+# experiment tooling (galleries, annotation app, caching) or its pandas/flask/etc deps.
+core = [
+    "torch>=2.1",
+    "torchvision>=0.16",
+    "Pillow>=10.0",
+    "numpy>=1.24",
+]
 xpu = [
     "intel-extension-for-pytorch",
 ]
