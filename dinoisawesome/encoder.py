@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TypeAlias
@@ -143,6 +144,52 @@ class DinoEncoder(nn.Module):  # type: ignore[misc]  # torch's Module stubs reso
                      input list/tensor into chunks of at most this size and concatenates
                      the results, so callers can pass an arbitrarily long list without
                      batching manually or risking a CUDA OOM from one oversized pass.
+        resize_workers: Off by default (0): PIL/PIL-image preprocessing runs serially,
+                     one image at a time. Set to a positive int to resize images across
+                     a persistent `ThreadPoolExecutor` of that many threads instead (PIL's
+                     C-level resize releases the GIL, so this is real parallelism). Not a
+                     free win, and the breakeven point depends on how fast the backbone
+                     itself is: measured end-to-end (preprocessing + backbone) on
+                     dinov3-base, batch sizes 1-4 were a clear loss (0.23x-0.42x) under
+                     amp=True (bf16 backbone, fast — thread-dispatch overhead is a bigger
+                     fraction of a smaller total), vs. roughly breakeven (0.5x-1.2x) under
+                     fp32 (slower backbone dilutes the same fixed overhead). Real wins only
+                     showed up at batch size 16+ (1.3x-1.9x end-to-end under amp=True). It
+                     also claims CPU threads that compete with anything else running on the
+                     same machine — a real cost on a shared research box routinely running
+                     other training/experiment jobs, which is why this stays opt-in rather
+                     than defaulting on. If you do enable it, 4 is the recommended starting
+                     point: on this project's hybrid P-core/E-core development machine, 4
+                     threads measured as fast or faster than using all logical cores (20),
+                     since spreading pure CPU-bound work across E-cores and hyperthread
+                     siblings reduces per-thread throughput rather than adding real
+                     parallelism. Only pass a higher count if you've confirmed it helps on
+                     your own hardware. Composes with `gpu_normalize`: when that's also on,
+                     this only threads the (now normalize-free) resize step.
+
+                     Recommended starting point: 6 (matches this machine's 6 P-cores).
+                     Measured against 4 and 20 at batch 16/32/64: not a clean win over 4 at
+                     every size (4 was faster at 16, 6 was faster at 32 and 64), but both
+                     stayed well ahead of 20 at every size tested except 64, where 20 caught
+                     up. Treat 6 as a reasonable default, not a proven-optimal one — this
+                     machine's results were noisy enough run-to-run that neither 4 nor 6
+                     should be read as precisely tuned.
+        gpu_normalize: Off by default (False): preprocessing uses the per-image
+                     torchvision `Compose([Resize, ToTensor, Normalize])` pipeline, doing
+                     the float conversion and mean/std normalization one image at a time.
+                     Set True to keep resize per-image (CPU, PIL) but do ToTensor+Normalize
+                     as ONE batched op on the GPU after a single stacked transfer instead.
+                     Unlike `resize_workers`, this was a clear win end-to-end once the
+                     backbone stopped dominating total time: under dinov3-base +
+                     amp=True + TF32, 1.65x-5.26x from batch size 8 up (peak 5.26x at
+                     batch 32), vs. a wash (0.8x-1.25x) at batch 1-4 and under a slow
+                     (fp32, non-amp) backbone where preprocessing was too small a slice of
+                     the total to matter either way. Output differs from the per-image path
+                     by float-rounding-level amounts only (cosine similarity >=0.9999 in
+                     every configuration tested) — same algorithm, reordered arithmetic, not
+                     a behavior change. Worth enabling whenever amp=True and batches are
+                     roughly 8+; skip it for small batches or a slow (fp32) backbone where
+                     preprocessing isn't the bottleneck anyway.
     """
 
     def __init__(
@@ -157,6 +204,8 @@ class DinoEncoder(nn.Module):  # type: ignore[misc]  # torch's Module stubs reso
         svd_components: int = 8,
         weights_dir: str | Path | None = None,
         max_batch_size: int = 16,
+        resize_workers: int = 0,
+        gpu_normalize: bool = False,
     ) -> None:
         super().__init__()
 
@@ -177,10 +226,30 @@ class DinoEncoder(nn.Module):  # type: ignore[misc]  # torch's Module stubs reso
         self.layers = layers
         self.amp = amp
         self.device = _resolve_device(device)
+        if self.device.type == "cuda":
+            # TF32 matmuls: ~1.7x faster fp32 forward on Ampere+ (measured on dinov2/dinov3
+            # base, RTX 5070). Verified via cosine similarity against full fp32: min patch-token
+            # similarity stayed >=0.999 across seeds for both v2 and v3, well inside the
+            # perturbation already accepted from amp=True's bf16 path (whose worst-case patch
+            # token dropped as low as ~0.50 on dinov2). This is a process-global torch setting,
+            # not scoped to this instance.
+            torch.set_float32_matmul_precision("high")
         self.patch_size = patch_size
         self.grid_h = img_size // patch_size
         self.grid_w = img_size // patch_size
         self.max_batch_size = max_batch_size
+
+        if resize_workers < 0:
+            raise ValueError(f"resize_workers must be >= 0, got {resize_workers}")
+        self.resize_workers = resize_workers
+        self._resize_executor = (
+            ThreadPoolExecutor(max_workers=resize_workers) if resize_workers > 0 else None
+        )
+
+        self.gpu_normalize = gpu_normalize
+        if gpu_normalize:
+            self._mean_t = torch.tensor(_IMAGENET_MEAN, device=self.device).view(1, 3, 1, 1)
+            self._std_t = torch.tensor(_IMAGENET_STD, device=self.device).view(1, 3, 1, 1)
 
         # An explicit dtype always wins; otherwise amp defaults the effective weight/
         # compute dtype to bfloat16 so amp=True actually halves backbone memory instead
@@ -221,12 +290,12 @@ class DinoEncoder(nn.Module):  # type: ignore[misc]  # torch's Module stubs reso
         self._p_perp: torch.Tensor | None = None
         self._p_perp_key: tuple[torch.device, torch.dtype] | None = None
 
+        self._resize_only = transforms.Resize(
+            (img_size, img_size), interpolation=transforms.InterpolationMode.BICUBIC
+        )
         self.preprocess = transforms.Compose(
             [
-                transforms.Resize(
-                    (img_size, img_size),
-                    interpolation=transforms.InterpolationMode.BICUBIC,
-                ),
+                self._resize_only,
                 # transforms.CenterCrop(img_size),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=_IMAGENET_MEAN, std=_IMAGENET_STD),
@@ -242,6 +311,12 @@ class DinoEncoder(nn.Module):  # type: ignore[misc]  # torch's Module stubs reso
             )
             return ctx
         return contextlib.nullcontext()
+
+    def _resize_to_uint8(self, img: Image.Image) -> np.ndarray:
+        """Resize-only (no ToTensor/Normalize), for the `gpu_normalize` path: returns
+        an (H, W, 3) uint8 array, stacked and normalized as one batched GPU op by the
+        caller instead of per-image."""
+        return np.asarray(self._resize_only(img), dtype=np.uint8)
 
     def _to_tensor_batch(self, images: ImageBatch) -> torch.Tensor:
         """Normalise varied image inputs to a ``(B, 3, H, W)`` float tensor on device.
@@ -276,7 +351,20 @@ class DinoEncoder(nn.Module):  # type: ignore[misc]  # torch's Module stubs reso
             elif not isinstance(images, (list, tuple)):
                 images = [images]
             pil = [img if isinstance(img, Image.Image) else Image.fromarray(img) for img in images]
-            x = torch.stack([self.preprocess(img) for img in pil]).to(self.device)
+            if self.gpu_normalize:
+                if self._resize_executor is not None:
+                    arrs = list(self._resize_executor.map(self._resize_to_uint8, pil))
+                else:
+                    arrs = [self._resize_to_uint8(img) for img in pil]
+                batch_uint8 = torch.from_numpy(np.stack(arrs))
+                x = batch_uint8.to(self.device, non_blocking=True).permute(0, 3, 1, 2)
+                x = (x.float() / 255.0 - self._mean_t) / self._std_t
+            else:
+                if self._resize_executor is not None:
+                    tensors = list(self._resize_executor.map(self.preprocess, pil))
+                else:
+                    tensors = [self.preprocess(img) for img in pil]
+                x = torch.stack(tensors).to(self.device)
 
         if self.model_dtype is not None and not self.amp:
             x = x.to(dtype=self.model_dtype)
